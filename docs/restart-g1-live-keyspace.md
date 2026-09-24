@@ -227,6 +227,26 @@ starved the earlier learned gates of any signal. C is chosen from the R3
 read-count recall curve (any and every support within k records, per space;
 logged from step 2500) together with the reader's measured cost per token.
 
+#### R5 first launch: writer drift against a 218k-record bank (24 September 2026)
+The first R5 launch (`r5-spatial`, `restart_r5_joint_spark.yaml`) trained the
+recurrent core (Muon, 5e-6), the key-slot embedding (1e-4) and the key heads
+(1e-5), with writer replay re-encoding about 64 records per step. Within 120 steps
+the live keys of replayed records fell to about 0.9 cosine against their stored
+keys (key-stability loss 0.10–0.14). Queries followed the live keys: routing loss
+against live keys fell from 6.6 to about 3–5 while loss against stored keys rose
+to 9–16. Unassisted item recall against the bank fell (s1 0.71 → 0.47, s3 0.64
+→ 0.47), while answer NLL dropped quickly (1.55 → 0.85). This is finding 4 again:
+per-step refresh of a few records cannot keep a 218k-record index coherent while
+the writer moves.
+
+R5a therefore freezes the writer and the bank
+(`restart_r5a_frozen_writer_spark.yaml`: frozen backbone apart from the reading-side
+loop bridge, no writer replay). The reader, gates, query heads and bridge learn
+against a coherent R3 key space. Key-side learning (R5b) needs a coherent
+full-bank refresh cadence (about 2.4 hours per 218k re-encode) or a writer
+learning rate small enough that stored keys stay within tolerance between
+refreshes. The key-stability loss is the drift gauge.
+
 #### Moving from teacher distillation to utility-driven keys (owner decision, 24 September 2026)
 Teacher distillation is a bootstrap only. The spaces the system needs will
 differ from the reference embedding spaces, so distillation is removed as early

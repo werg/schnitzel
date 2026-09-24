@@ -1,0 +1,164 @@
+# R5a: reader, gates and query heads learn to use the R4 bank while the writer and
+# the bank stay frozen and coherent (restart plan, R5a). The first R5 launch trained
+# the recurrent core and key slot with per-step writer replay; within 120 steps live
+# keys drifted to about 0.9 cosine from stored ones and unassisted recall fell,
+# because a 218k-record bank cannot be refreshed per step. Key-side learning returns
+# in R5b with a coherent full-bank refresh cadence. Differences from
+# restart_r5_joint_spark.yaml: no writer replay, no live-key routing, no key
+# stability or KoLeo terms (they act only on replayed keys); launch without
+# --train-recurrent-core and without maintenance records.
+model:
+  backend: hf
+  model_id: LiquidAI/LFM2.5-230M
+  revision: 40cb2ad3b3044d5a41eee083a6103c8b523afa45
+  loops: 3
+  recurrence_mode: middle_block
+  recurrent_start: 4
+  recurrent_end: 10
+  recurrent_input_mix: 0.1
+  recurrent_update_mix: 0.1
+  writer_loops: 1
+  backbone_train_scope: recurrent_core
+  tiny_width: 64
+  tiny_layers: 2
+  tiny_heads: 4
+  gradient_checkpointing: true
+  freeze_backbone: true
+memory:
+  key_dim: 64
+  key_interface: direct
+  key_dims:
+  - 256
+  - 256
+  - 256
+  - 256
+  key_slot_position: last
+  write_slots: 64
+  read_slots: 64
+  payload_dims:
+  - 4096
+  - 8192
+  - 16384
+  - 36864
+  payload_layout: joint_tokens
+  space_tokens:
+  - 4
+  - 8
+  - 16
+  - 36
+  neighbors:
+  - 256
+  - 128
+  - 64
+  - 32
+  reader_width: 256
+  reader_rounds: 3
+  reader: mlp
+  chunk_size: 16
+  checkpoint_chunks: true
+  storage_dtype: bfloat16
+  compaction: none
+  compact_records: 2
+  compaction_probability: 0.25
+  compaction_loss_weight: 0.1
+  compaction_warmup: 100
+  compaction_objective: interleaved
+  compaction_grouping: whole
+  compaction_group_size: 4
+  field_memberships: 2
+  compact_task_weight: 1.0
+  behavior_kl_weight: 0.0
+  merge_loss_weight: 0.0
+  read_timing: loop_boundary
+  read_steps: 2
+  stream_reads: false
+  read_top_k: 1
+  noise_std: 0.0
+  quantization_step: 0.0
+  independent_routing_query: false
+  distance_gating: true
+  gate_density_k: 8
+  gate_density_fraction: 0.25
+  gate_floor_mode: additive
+  gate_min_temperature: 0.05
+  gate_max_temperature: 0.5
+  gate_initial_temperature: 0.1
+  gate_max_radius_adjustment: 0.25
+train:
+  seed: 101
+  steps: 1000
+  learning_rate: 0.0001
+  backbone_learning_rate: 5.0e-06
+  optimizer: muon
+  weight_decay: 0.01
+  adam_betas:
+  - 0.9
+  - 0.999
+  adam_eps: 1.0e-08
+  muon_momentum: 0.95
+  muon_ns_steps: 5
+  gradient_accumulation: 1
+  batch_size: 4
+  tokenized_episodes_file: null
+  sampling_policy: shuffled_passes
+  bank_dir: null
+  bank_read_limits: []
+  bank_routing_candidates: 8
+  payload_contrast_weight: 0.0
+  payload_contrast_margin: 0.5
+  bank_payload_contrast_weight: 0.0
+  bank_payload_contrast_margin: 0.5
+  clip_grad_norm: 1.0
+  precision: bf16
+  device: cuda
+  replay: true
+  verify_replay: false
+  live_fraction: 0
+  selected_producers_only: false
+  train_worlds: 128
+  distractors: 2
+  eval_worlds: 16
+  log_every: 10
+  max_source_tokens: 65
+  max_prompt_tokens: 128
+  arm: memory
+  retrieval: learned
+  routing_weight: 0.2
+  routing_logit_scale: 13.5
+  routing_live_weight: 0.0
+  writer_key_learning_rate: 1.0e-05
+  key_stability_weight: 0.0
+  routing_warmup: 39504
+  support_gate_floor: 0.15
+  writer_replay_records_per_site: 0
+  threads: 8
+  cuda_memory_fraction: 0.3
+  min_system_available_bytes: 8589934592
+  stall_timeout_seconds: 300
+  optimization_scope: all
+  checkpoint_every: 500
+  keep_checkpoints: 16
+  max_target_tokens: 65
+  loop_counts: []
+  oracle_anchor_loops: null
+  allow_recurrence_conversion: false
+  reinitialize_reader: false
+  parent_kl_weight: 0.0
+  oracle_anchor_weight: 0.0
+  oracle_alignment_weight: 0.0
+  oracle_distillation_weight: 0.0
+  warmstart_memory_gate: null
+  episodes_file: null
+  evidence_scope: required
+  archive_dir: null
+  archive_keep_checkpoints: 3
+  min_free_disk_bytes: 21474836480
+  wandb_mode: offline
+  wandb_project: sdkb
+  wandb_entity: null
+  exploration_fraction: 0.05
+  spread_variance_weight: 0.02
+  spread_covariance_weight: 0.02
+  koleo_weight: 0.0
+  load_penalty_weight: 0.01
+  gold_force_probability: 1.0
