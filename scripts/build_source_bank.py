@@ -163,7 +163,8 @@ def verify_reproduction(agent, store, rows, writer_ids, generation, *, count: in
             outputs = stored_channel(agent, agent.produce_batch([writer_ids(row)]))
             for space in range(spaces):
                 record = lookup_record(store, row['record_id'], namespace='corpus',
-                                       space=f's{space}', generation=generation)
+                                       space=f's{space}', generation=generation,
+                                       domain=row.get('domain', 'research'))
                 key = outputs[2 * space][0].float().cpu()
                 payload = outputs[2 * space + 1][0].to(record.payload.dtype).float().cpu()
                 stored = record.payload.float()
