@@ -235,11 +235,24 @@ class RecordGradients:
 
 
 class KeyTable:
-    """Trainable unit keys per record and space, in index order, updated sparsely."""
+    """Trainable unit keys per record and space, in index order, updated sparsely.
+
+    ``sphere_adam`` (default): gradients are projected onto each row's tangent
+    plane (only movement along the sphere changes cosine scores), the first
+    moment is kept per row and coordinate, and the second moment is one running
+    scalar per space (mean squared tangent gradient of touched rows). A common
+    scale keeps relative gradient strength: a faintly pulled row moves less than
+    a strongly pulled one, and each row keeps its gradient direction.
+    ``optimizer='adam'`` is per-coordinate Adam, which moves every touched row
+    by about the learning rate regardless of its gradient.
+    """
 
     def __init__(self, record_ids: Sequence[str], keys: Sequence[Tensor], *,
                  learning_rate: float, betas: tuple[float, float] = (0.9, 0.999),
-                 eps: float = 1e-8) -> None:
+                 eps: float = 1e-8, optimizer: str = 'sphere_adam') -> None:
+        if optimizer not in {'sphere_adam', 'adam'}:
+            raise ValueError(f'Unknown key-table optimizer: {optimizer}')
+        self.optimizer = optimizer
         self.ids = [str(record_id) for record_id in record_ids]
         if (self.ids != sorted(self.ids) or len(set(self.ids)) != len(self.ids)
                 or any(tuple(k.shape[:1]) != (len(self.ids),) for k in keys)):
@@ -247,7 +260,9 @@ class KeyTable:
         self.position = {record_id: i for i, record_id in enumerate(self.ids)}
         self.keys = [F.normalize(k.float(), dim=-1) for k in keys]
         self.exp_avg = [torch.zeros_like(k) for k in self.keys]
-        self.exp_avg_sq = [torch.zeros_like(k) for k in self.keys]
+        self.exp_avg_sq = [torch.zeros_like(k) if optimizer == 'adam'
+                           else k.new_zeros(()) for k in self.keys]
+        self.space_steps = [0] * len(self.keys)
         self.counts = torch.zeros(len(self.keys), len(self.ids), dtype=torch.long,
                                   device=self.keys[0].device)
         self.updated = torch.full((len(self.ids),), -1, dtype=torch.long)
@@ -284,14 +299,24 @@ class KeyTable:
             positions = torch.tensor([self.position[r] for r, _ in items],
                                      device=self.keys[space].device)
             grads = torch.stack([g for _, g in items]).float().to(self.keys[space].device)
+            old = self.keys[space][positions]
+            if self.optimizer == 'sphere_adam':
+                grads = grads - (grads * old).sum(-1, keepdim=True) * old
             self.counts[space, positions] += 1
             count = self.counts[space, positions].float()[:, None]
             m = self.exp_avg[space][positions].mul_(beta1).add_(grads, alpha=1 - beta1)
-            v = self.exp_avg_sq[space][positions].mul_(beta2).addcmul_(
-                grads, grads, value=1 - beta2)
-            self.exp_avg[space][positions], self.exp_avg_sq[space][positions] = m, v
-            update = (m / (1 - beta1 ** count)) / ((v / (1 - beta2 ** count)).sqrt() + self.eps)
-            old = self.keys[space][positions]
+            if self.optimizer == 'adam':
+                v = self.exp_avg_sq[space][positions].mul_(beta2).addcmul_(
+                    grads, grads, value=1 - beta2)
+                self.exp_avg_sq[space][positions] = v
+                v = v / (1 - beta2 ** count)
+            else:
+                self.space_steps[space] += 1
+                self.exp_avg_sq[space] = (beta2 * self.exp_avg_sq[space]
+                                          + (1 - beta2) * (grads * grads).mean())
+                v = self.exp_avg_sq[space] / (1 - beta2 ** self.space_steps[space])
+            self.exp_avg[space][positions] = m
+            update = (m / (1 - beta1 ** count)) / (v.sqrt() + self.eps)
             new = F.normalize(old - self.learning_rate * update, dim=-1)
             self.keys[space][positions] = new
             moved.append(F.cosine_similarity(old, new, dim=-1))
@@ -304,7 +329,9 @@ class KeyTable:
         moved = torch.cat(moved)
         return {'table_rows': int(moved.numel()), 'table_records': len(touched),
                 'table_step_cosine_mean': float(moved.mean()),
-                'table_step_cosine_min': float(moved.min())}
+                'table_step_cosine_min': float(moved.min()),
+                'table_step_cosine_p10': float(moved.quantile(0.1)),
+                'table_step_cosine_p90': float(moved.quantile(0.9))}
 
     @torch.no_grad()
     def pull(self, space: int, record_ids: Sequence[str], targets: Tensor,
@@ -332,21 +359,25 @@ class KeyTable:
         index.invalidate()
 
     def state_dict(self) -> dict:
-        return {'ids_sha256': self.ids_digest(),
+        return {'ids_sha256': self.ids_digest(), 'optimizer': self.optimizer,
                 'keys': [k.cpu() for k in self.keys],
                 'exp_avg': [m.cpu() for m in self.exp_avg],
                 'exp_avg_sq': [v.cpu() for v in self.exp_avg_sq],
-                'counts': self.counts.cpu(), 'updated': self.updated.clone()}
+                'counts': self.counts.cpu(), 'updated': self.updated.clone(),
+                'space_steps': list(self.space_steps)}
 
     def load_state_dict(self, state: dict) -> None:
         if state['ids_sha256'] != self.ids_digest():
             raise ValueError('Key table belongs to another bank')
+        if state.get('optimizer', 'adam') != self.optimizer:
+            raise ValueError('Key table optimizer state differs')
         device = self.keys[0].device
         self.keys = [k.to(device) for k in state['keys']]
         self.exp_avg = [m.to(device) for m in state['exp_avg']]
         self.exp_avg_sq = [v.to(device) for v in state['exp_avg_sq']]
         self.counts = state['counts'].to(device)
         self.updated = state['updated'].clone()
+        self.space_steps = list(state.get('space_steps', [0] * len(self.keys)))
 
 
 class GradientSink:

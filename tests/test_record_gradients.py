@@ -263,3 +263,32 @@ def test_writer_pass_gradient_matches_direct_objective(tiny_config, tmp_path):
     assert reference.keys() == actual.keys()
     for name, value in reference.items():
         assert torch.allclose(actual[name], value, atol=1e-5, rtol=1e-4), name
+
+
+def test_sphere_adam_keeps_relative_row_strength_and_tangent_direction():
+    ids = ['a', 'b', 'c']
+    keys = [torch.eye(3)]
+
+    def moved(optimizer):
+        table = KeyTable(ids, [k.clone() for k in keys], learning_rate=0.01, optimizer=optimizer)
+        table.begin_step()
+        rows = table.rows(0, ['a', 'b'])
+        # Row a is pulled 100x harder than row b; both pulls include a radial part.
+        target = torch.tensor([[1.0, 100.0, 0.0], [0.0, 1.0, 0.01]])
+        (-(rows * target).sum()).backward()
+        before = table.keys[0].clone()
+        table.step(1)
+        return (before - table.keys[0]).norm(dim=-1), table
+
+    sphere, table = moved('sphere_adam')
+    assert sphere[0] > 10 * sphere[1] > 0 and sphere[2] == 0
+    # Only the tangent component moves row a: straight toward +y.
+    assert table.keys[0][0, 2] == 0 and table.keys[0][0, 1] > 0
+    adam, _ = moved('adam')
+    assert adam[1] > 0.5 * adam[0]  # per-coordinate Adam moves weak rows about as far
+    restored = KeyTable(ids, [k.clone() for k in keys], learning_rate=0.01)
+    restored.load_state_dict(table.state_dict())
+    assert restored.space_steps == table.space_steps
+    with pytest.raises(ValueError):
+        KeyTable(ids, [k.clone() for k in keys], learning_rate=0.01,
+                 optimizer='adam').load_state_dict(table.state_dict())

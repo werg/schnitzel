@@ -152,6 +152,7 @@ class TrainConfig:
     # commitment term keeps table keys predictable from content.
     key_table: bool = False
     key_table_learning_rate: float = 1.0e-3
+    key_table_optimizer: str = 'sphere_adam'  # or 'adam' (per-coordinate)
     key_prediction_weight: float = 1.0
     key_commitment_weight: float = 0.05  # fraction a row moves toward each prediction
     writer_replay_records_per_site: int = 0
@@ -364,6 +365,7 @@ class Config:
             raise ValueError('Record gradients replace live writer replay and need direct '
                              'keys, distance gating and valid budgets')
         if t.key_table and (not t.record_gradients or t.key_table_learning_rate <= 0
+                            or t.key_table_optimizer not in {'sphere_adam', 'adam'}
                             or t.key_prediction_weight < 0
                             or not 0 <= t.key_commitment_weight <= 1):
             raise ValueError('A key table needs record gradients and valid weights')
