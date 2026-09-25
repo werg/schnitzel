@@ -253,18 +253,25 @@ class GradientSink:
         self.neighborhood.extend(record_ids)
 
     def harvest(self, gradients: RecordGradients, step: int, spaces: int) -> int:
-        records = set(self.state_leaves) | {record_id for record_id, _ in self.payload_leaves}
-        for record_id in records:
-            state = self.state_leaves.get(record_id)
-            state_grad = state.grad if state is not None else None
-            payloads: list[Tensor | None] = []
-            for space in range(spaces):
-                leaves = self.payload_leaves.get((record_id, space), [])
-                grads = [leaf.grad for leaf in leaves if leaf.grad is not None]
-                payloads.append(torch.stack(grads).sum(0) if grads else None)
-            if state_grad is None and all(value is None for value in payloads):
+        """Move this step's cotangents to the accumulator in a few batched transfers."""
+        state_ids = [r for r, leaf in self.state_leaves.items() if leaf.grad is not None]
+        state_grads = (dict(zip(state_ids, torch.stack(
+            [self.state_leaves[r].grad for r in state_ids]).float().cpu(), strict=True))
+                       if state_ids else {})
+        payload_grads: dict[tuple[str, int], Tensor] = {}
+        for space in range(spaces):
+            keys = [key for key, leaves in self.payload_leaves.items()
+                    if key[1] == space and any(leaf.grad is not None for leaf in leaves)]
+            if not keys:
                 continue
-            gradients.add(step, record_id, state_grad, payloads)
+            summed = torch.stack([torch.stack([leaf.grad for leaf in self.payload_leaves[key]
+                                               if leaf.grad is not None]).sum(0)
+                                  for key in keys])
+            payload_grads.update(zip(keys, summed.float().cpu(), strict=True))
+        records = set(state_grads) | {record_id for record_id, _ in payload_grads}
+        for record_id in records:
+            gradients.add(step, record_id, state_grads.get(record_id),
+                          [payload_grads.get((record_id, space)) for space in range(spaces)])
         return len(records)
 
 

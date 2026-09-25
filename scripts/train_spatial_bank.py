@@ -572,17 +572,22 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 if sink is not None:
                     # Accumulate this step's per-record cotangents, then push the
                     # accumulated gradients of a close neighbourhood into the writer.
+                    timer = time.perf_counter()
                     harvested = sink.harvest(record_grads, step, len(limits))
                     flush = record_grads.select(
                         step, sink.neighborhood, budget=config.train.record_flush_budget,
                         extra=config.train.record_flush_extra)
                     cotangents = [record_grads.pop(record_id, step) for record_id in flush]
+                    harvest_seconds = time.perf_counter() - timer
                     with autocast_context(config):
                         writer_backward(agent, lambda record_id: writer_inputs[record_id],
                                         flush, cotangents)
                     record_metrics = {'record_harvested': harvested,
                                       'record_neighborhood': len(set(sink.neighborhood)),
-                                      'record_flushed': len(flush)}
+                                      'record_flushed': len(flush),
+                                      'record_harvest_seconds': harvest_seconds,
+                                      'record_writer_backward_seconds':
+                                          time.perf_counter() - timer - harvest_seconds}
                 finish_phase('writer_backward')
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in agent.parameters() if parameter.requires_grad],
@@ -599,6 +604,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                     training_bank, additional_ids=maintenance_ids,
                     optimizer_step=step + 1) if replay is not None else 0)
                 if sink is not None:
+                    timer = time.perf_counter()
                     with autocast_context(config):
                         flushed_refresh = refresh_records(
                             agent, lambda record_id: writer_inputs[record_id], flush,
@@ -608,9 +614,12 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                             key_cache.stalest(config.train.record_refresh_per_step,
                                               exclude=flush),
                             training_bank, key_cache, step + 1)
+                    refresh_seconds = time.perf_counter() - timer
                     key_cache.sync_index(agent, index)
                     record_grads.evict(step + 1)
                     record_metrics.update(
+                        record_refresh_seconds=refresh_seconds,
+                        record_sync_seconds=time.perf_counter() - timer - refresh_seconds,
                         record_buffer=len(record_grads),
                         **{f'flushed_{k}': v for k, v in flushed_refresh.items()},
                         **{f'stale_{k}': v for k, v in stale_refresh.items()})
