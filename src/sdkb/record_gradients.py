@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 import hashlib
+import time
 
 import numpy as np
 
@@ -514,10 +515,13 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                    key=lambda i: writer_inputs(record_ids[i]).shape[1])
     ordered = [record_ids[i] for i in order]
     cots = None if cotangents is None else [cotangents[i] for i in order]
+    timer = time.perf_counter()
     drift_ids = set(ordered[:: max(1, len(ordered) // drift_sample)][:drift_sample]
                     if drift_sample else ())
     old_values = (dict(zip(sorted(drift_ids), stored_payloads(bank, 0, sorted(drift_ids)),
                            strict=True)) if drift_ids else {})
+    seconds = {'drift_read': time.perf_counter() - timer}
+    timer = time.perf_counter()
     scale = 1 / len(ordered)
     records, states, cosines, drift = [], [], [], []
     for start in range(0, len(ordered), batch_size):
@@ -563,13 +567,19 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                     outputs[2 * space + 1][row].to(dtype).detach(),
                     namespace=bank.index.namespace, space=f's{space}',
                     generation=bank.index.generation))
+    if torch.cuda.is_available() and agent.device.type == 'cuda':
+        torch.cuda.synchronize(agent.device)
+    seconds['encode'] = time.perf_counter() - timer
+    timer = time.perf_counter()
     ages = cache.update(ordered, torch.cat(states), step)
     views = bank.update(records, optimizer_step=step)
+    seconds['publish'] = time.perf_counter() - timer
     cosines = torch.cat(cosines)
     report = {'encoded': len(ordered), 'views': views,
               'key_prediction_cosine_mean': float(cosines.mean()),
               'key_prediction_cosine_min': float(cosines.min()),
-              'age_max': int(ages.max()), 'age_mean': float(ages.float().mean())}
+              'age_max': int(ages.max()), 'age_mean': float(ages.float().mean()),
+              **{f'{name}_seconds': value for name, value in seconds.items()}}
     if drift:
         drift = torch.stack(drift)
         report.update(value_drift_cosine_mean=float(drift.mean()),

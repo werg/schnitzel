@@ -140,6 +140,11 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         raise ValueError('A staged bank refresh needs a fresh warm-start output')
     # Retain enough recovery points for a long unattended trajectory stage.
     config.train.keep_checkpoints = max(config.train.keep_checkpoints, 16)
+    if config.train.record_gradients:
+        # Only the newest record states are kept (each is several GB), so older
+        # checkpoints cannot resume; retaining few also lets checkpoint GC release
+        # the mutable-bank journal (about 70 MB of payload revisions per step).
+        config.train.keep_checkpoints = 3
     config.train.archive_dir = None
     config.train.wandb_group = f"trajectory-spatial-r{loops}"
     config.validate()
@@ -433,7 +438,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                         **({'curriculum': curriculum.state_dict()}
                            if curriculum is not None else {})},
                        output / f'record-state-{step_count:09d}.pt')
-            for old in sorted(output.glob('record-state-*.pt'))[:-2]:
+            for old in sorted(output.glob('record-state-*.pt'))[:-config.train.keep_checkpoints]:
                 old.unlink()
         if bank_load is not None:
             torch.save(bank_load.state_dict(), output / f'bank-load-{step_count:09d}.pt')
