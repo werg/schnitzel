@@ -282,6 +282,12 @@ def test_sphere_adam_keeps_relative_row_strength_and_tangent_direction():
 
     sphere, table = moved('sphere_adam')
     assert sphere[0] > 10 * sphere[1] > 0 and sphere[2] == 0
+    capped = KeyTable(ids, [torch.eye(3)], learning_rate=10.0, max_step=0.1)
+    capped.begin_step()
+    (-(capped.rows(0, ['a']) * torch.tensor([[0.0, 1.0, 0.0]])).sum()).backward()
+    report = capped.step(1)
+    assert report['table_step_degrees_max'] == pytest.approx(
+        float(torch.rad2deg(torch.atan(torch.tensor(0.1)))), abs=1e-3)
     # Only the tangent component moves row a: straight toward +y.
     assert table.keys[0][0, 2] == 0 and table.keys[0][0, 1] > 0
     adam, _ = moved('adam')

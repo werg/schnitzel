@@ -245,7 +245,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         if config.train.key_table:
             settings['record_gradients']['key_table'] = {name: getattr(config.train, name)
                                                          for name in (
-                'key_table_learning_rate', 'key_table_optimizer', 'key_prediction_weight',
+                'key_table_learning_rate', 'key_table_optimizer', 'key_table_max_step',
+                'key_prediction_weight',
                 'key_commitment_weight')}
     if any((spread['exploration_fraction'], spread['spread_variance_weight'],
             spread['spread_covariance_weight'], spread['koleo_weight'],
@@ -413,7 +414,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             key_table = KeyTable(record_ids, [torch.from_numpy(array.keys.copy()).to(
                 config.train.device) for array in index.spaces.values()],
                 learning_rate=config.train.key_table_learning_rate,
-                optimizer=config.train.key_table_optimizer)
+                optimizer=config.train.key_table_optimizer,
+                max_step=config.train.key_table_max_step)
             if resume and start:
                 key_table.load_state_dict(saved['table'])
             key_table.sync_index(index)

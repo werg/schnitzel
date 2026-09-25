@@ -249,7 +249,8 @@ class KeyTable:
 
     def __init__(self, record_ids: Sequence[str], keys: Sequence[Tensor], *,
                  learning_rate: float, betas: tuple[float, float] = (0.9, 0.999),
-                 eps: float = 1e-8, optimizer: str = 'sphere_adam') -> None:
+                 eps: float = 1e-8, optimizer: str = 'sphere_adam',
+                 max_step: float = 0.05) -> None:
         if optimizer not in {'sphere_adam', 'adam'}:
             raise ValueError(f'Unknown key-table optimizer: {optimizer}')
         self.optimizer = optimizer
@@ -267,6 +268,8 @@ class KeyTable:
                                   device=self.keys[0].device)
         self.updated = torch.full((len(self.ids),), -1, dtype=torch.long)
         self.learning_rate, self.betas, self.eps = learning_rate, betas, eps
+        # Trust region: no row moves more than about ``max_step`` radians per step.
+        self.max_step = max_step
         self.leaves: dict[tuple[int, str], Tensor] = {}
 
     def ids_digest(self) -> str:
@@ -317,7 +320,10 @@ class KeyTable:
                 v = self.exp_avg_sq[space] / (1 - beta2 ** self.space_steps[space])
             self.exp_avg[space][positions] = m
             update = (m / (1 - beta1 ** count)) / (v.sqrt() + self.eps)
-            new = F.normalize(old - self.learning_rate * update, dim=-1)
+            step_vector = self.learning_rate * update
+            norms = step_vector.norm(dim=-1, keepdim=True)
+            step_vector = step_vector * (self.max_step / norms.clamp_min(self.max_step))
+            new = F.normalize(old - step_vector, dim=-1)
             self.keys[space][positions] = new
             moved.append(F.cosine_similarity(old, new, dim=-1))
             touched.update(r for r, _ in items)
@@ -327,11 +333,15 @@ class KeyTable:
         if not moved:
             return {'table_rows': 0}
         moved = torch.cat(moved)
+        degrees = torch.rad2deg(torch.arccos(moved.clamp(-1, 1).double())).float()
+        quantiles = degrees.quantile(torch.tensor([0.5, 0.9, 0.99], device=degrees.device))
         return {'table_rows': int(moved.numel()), 'table_records': len(touched),
                 'table_step_cosine_mean': float(moved.mean()),
                 'table_step_cosine_min': float(moved.min()),
-                'table_step_cosine_p10': float(moved.quantile(0.1)),
-                'table_step_cosine_p90': float(moved.quantile(0.9))}
+                'table_step_degrees_p50': float(quantiles[0]),
+                'table_step_degrees_p90': float(quantiles[1]),
+                'table_step_degrees_p99': float(quantiles[2]),
+                'table_step_degrees_max': float(degrees.max())}
 
     @torch.no_grad()
     def pull(self, space: int, record_ids: Sequence[str], targets: Tensor,
