@@ -1,0 +1,343 @@
+"""Error-driven writer learning against a large mutable bank.
+
+Three cooperating pieces keep stored keys coherent while the writer trains:
+
+``KeyStateCache``
+    One writer key-slot state per record. Stored keys are the direct key heads
+    applied to these states, so every retrieved candidate's key is computed
+    live with exact head gradients, and after every optimizer step the whole
+    index is recomputed from the cache. Head updates never leave keys stale.
+
+``RecordGradients``
+    Per-record cotangents with respect to the writer outputs (the key-slot
+    state and each space's payload), accumulated across steps with per-step
+    decay and a last-updated step. The expensive writer backward runs only for
+    a generous close neighbourhood of each step's retrievals, plus a small
+    budget of the largest accumulated gradients elsewhere, using everything
+    accumulated for those records.
+
+``GradientSink``
+    Collects this step's cotangents: consumer reads use leaf tensors for cached
+    states and stored payloads, and their gradients are harvested after the
+    consumer backward.
+
+Accumulated cotangents are applied at the writer's current parameters, so a
+record's older contributions are delayed gradients. This is a deliberate,
+owner-approved estimator, not the exact full-graph replay reference; with a
+decay of zero and a neighbourhood covering every read it reduces to that
+reference for payload and key-state paths (tested).
+"""
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Sequence
+import hashlib
+
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+
+class KeyStateCache:
+    """Writer key-slot states for every bank record, in index order."""
+
+    def __init__(self, record_ids: Sequence[str], states: Tensor, versions: Tensor) -> None:
+        if (states.ndim != 2 or len(record_ids) != len(states)
+                or versions.shape != (len(states),)):
+            raise ValueError('Key-state cache needs one state and version per record')
+        self.ids = [str(record_id) for record_id in record_ids]
+        if self.ids != sorted(self.ids) or len(set(self.ids)) != len(self.ids):
+            raise ValueError('Key-state cache IDs must be sorted and unique')
+        self.position = {record_id: i for i, record_id in enumerate(self.ids)}
+        self.states = states.float()
+        self.versions = versions.long().cpu()
+
+    def ids_digest(self) -> str:
+        return hashlib.sha256('\n'.join(self.ids).encode()).hexdigest()
+
+    def positions(self, record_ids: Iterable[str]) -> Tensor:
+        return torch.tensor([self.position[record_id] for record_id in record_ids],
+                            dtype=torch.long)
+
+    def keys(self, agent, positions: Tensor | None = None) -> tuple[Tensor, ...]:
+        states = self.states if positions is None else self.states[positions.to(
+            self.states.device)]
+        return agent.writer_space_keys(states.to(agent.device))
+
+    @torch.no_grad()
+    def sync_index(self, agent, index, *, chunk: int = 65536) -> None:
+        """Recompute every stored key from cached states with the current heads."""
+        for space, array in enumerate(index.spaces.values()):
+            if array.ids.tolist() != self.ids:
+                raise ValueError('Key-state cache and index record order differ')
+            parts = []
+            for start in range(0, len(self.ids), chunk):
+                states = self.states[start:start + chunk].to(agent.device)
+                head = agent.writer_key_heads[space]
+                parts.append(F.normalize(agent._fp32_head(head, states, 'writer'),
+                                         dim=-1).float().cpu())
+            array.keys[:] = torch.cat(parts).numpy()
+        index.invalidate()
+
+    def update(self, record_ids: Sequence[str], states: Tensor, step: int) -> Tensor:
+        """Replace states; return each record's age in steps before the update."""
+        positions = self.positions(record_ids)
+        ages = step - self.versions[positions]
+        self.states[positions.to(self.states.device)] = states.float().to(self.states.device)
+        self.versions[positions] = step
+        return ages
+
+    def stalest(self, count: int, exclude: Iterable[str] = ()) -> list[str]:
+        if count <= 0:
+            return []
+        order = torch.argsort(self.versions, stable=True)
+        skip = set(exclude)
+        chosen = []
+        for position in order.tolist():
+            record_id = self.ids[position]
+            if record_id not in skip:
+                chosen.append(record_id)
+                if len(chosen) == count:
+                    break
+        return chosen
+
+    def state_dict(self) -> dict:
+        return {'ids_sha256': self.ids_digest(), 'states': self.states.cpu(),
+                'versions': self.versions.clone()}
+
+    @classmethod
+    def from_state_dict(cls, record_ids: Sequence[str], state: dict,
+                        device: torch.device | str = 'cpu') -> 'KeyStateCache':
+        cache = cls(record_ids, state['states'].to(device), state['versions'])
+        if cache.ids_digest() != state['ids_sha256']:
+            raise ValueError('Key-state cache belongs to another bank')
+        return cache
+
+
+class RecordGradients:
+    """Decayed per-record cotangents for the writer's key-slot state and payloads."""
+
+    def __init__(self, decay: float, *, capacity: int = 16384,
+                 payload_dtype: torch.dtype = torch.bfloat16) -> None:
+        if not 0 <= decay < 1 or capacity < 1:
+            raise ValueError('Invalid record-gradient decay or capacity')
+        self.decay, self.capacity, self.payload_dtype = decay, capacity, payload_dtype
+        self.state: dict[str, Tensor] = {}
+        self.payload: dict[str, list[Tensor | None]] = {}
+        self.updated: dict[str, int] = {}
+        self.norm_sq: dict[str, float] = {}  # at the record's last update step
+
+    def __len__(self) -> int:
+        return len(self.updated)
+
+    def _decayed(self, record_id: str, step: int) -> float:
+        return self.decay ** (step - self.updated[record_id])
+
+    def _bring_to(self, record_id: str, step: int) -> None:
+        factor = self._decayed(record_id, step)
+        if factor != 1.0:
+            self.state[record_id] = self.state[record_id] * factor
+            self.payload[record_id] = [None if value is None else
+                                       (value.float() * factor).to(self.payload_dtype)
+                                       for value in self.payload[record_id]]
+            self.norm_sq[record_id] *= factor * factor
+        self.updated[record_id] = step
+
+    def add(self, step: int, record_id: str, state: Tensor | None,
+            payloads: Sequence[Tensor | None]) -> None:
+        if record_id in self.updated:
+            self._bring_to(record_id, step)
+        else:
+            self.state[record_id] = torch.zeros(0)
+            self.payload[record_id] = [None] * len(payloads)
+            self.updated[record_id] = step
+            self.norm_sq[record_id] = 0.0
+        if state is not None:
+            current = self.state[record_id]
+            state = state.detach().float().cpu()
+            self.state[record_id] = state if not current.numel() else current + state
+        merged = []
+        for old, new in zip(self.payload[record_id], payloads, strict=True):
+            if new is None:
+                merged.append(old)
+            else:
+                new = new.detach().float().cpu()
+                merged.append((new if old is None else old.float() + new).to(self.payload_dtype))
+        self.payload[record_id] = merged
+        total = self.state[record_id].pow(2).sum() if self.state[record_id].numel() else 0.0
+        for value in merged:
+            if value is not None:
+                total = total + value.float().pow(2).sum()
+        self.norm_sq[record_id] = float(total)
+
+    def norm(self, record_id: str, step: int) -> float:
+        return self.norm_sq[record_id] ** 0.5 * self._decayed(record_id, step)
+
+    def evict(self, step: int) -> int:
+        excess = len(self.updated) - self.capacity
+        if excess <= 0:
+            return 0
+        ranked = sorted(self.updated, key=lambda record_id: self.norm(record_id, step))
+        for record_id in ranked[:excess]:
+            self.pop(record_id)
+        return excess
+
+    def select(self, step: int, neighborhood: Iterable[str], *, budget: int,
+               extra: int = 0) -> list[str]:
+        """Records to flush: the neighbourhood by accumulated norm, then the largest
+        accumulated gradients elsewhere."""
+        near = [record_id for record_id in dict.fromkeys(neighborhood)
+                if record_id in self.updated]
+        near.sort(key=lambda record_id: -self.norm(record_id, step))
+        chosen = near[:budget]
+        if extra > 0:
+            taken = set(chosen)
+            rest = sorted((record_id for record_id in self.updated if record_id not in taken),
+                          key=lambda record_id: -self.norm(record_id, step))
+            chosen.extend(rest[:extra])
+        return chosen
+
+    def pop(self, record_id: str, step: int | None = None
+            ) -> tuple[Tensor | None, list[Tensor | None]]:
+        if step is not None:
+            self._bring_to(record_id, step)
+        state = self.state.pop(record_id)
+        payloads = self.payload.pop(record_id)
+        self.updated.pop(record_id)
+        self.norm_sq.pop(record_id)
+        return (state if state.numel() else None), payloads
+
+    def state_dict(self) -> dict:
+        return {'decay': self.decay, 'capacity': self.capacity,
+                'ids': list(self.updated), 'updated': [self.updated[i] for i in self.updated],
+                'norm_sq': [self.norm_sq[i] for i in self.updated],
+                'state': [self.state[i] for i in self.updated],
+                'payload': [self.payload[i] for i in self.updated]}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state['decay'] != self.decay:
+            raise ValueError('Record-gradient decay changed')
+        self.state = dict(zip(state['ids'], state['state'], strict=True))
+        self.payload = dict(zip(state['ids'], state['payload'], strict=True))
+        self.updated = dict(zip(state['ids'], state['updated'], strict=True))
+        self.norm_sq = dict(zip(state['ids'], state['norm_sq'], strict=True))
+
+
+class GradientSink:
+    """Leaf tensors for one step's consumer reads, harvested after backward."""
+
+    def __init__(self, agent, cache: KeyStateCache) -> None:
+        self.agent, self.cache = agent, cache
+        self.state_leaves: dict[str, Tensor] = {}
+        self.payload_leaves: dict[tuple[str, int], list[Tensor]] = {}
+        self.neighborhood: list[str] = []
+
+    def candidate_keys(self, space: int, record_ids: Sequence[str]) -> Tensor:
+        """Live keys for candidates from cached states; exact head and state gradients."""
+        missing = [record_id for record_id in dict.fromkeys(record_ids)
+                   if record_id not in self.state_leaves]
+        if missing:
+            states = self.cache.states[self.cache.positions(missing).to(
+                self.cache.states.device)].to(self.agent.device)
+            for record_id, state in zip(missing, states, strict=True):
+                self.state_leaves[record_id] = state.detach().clone().requires_grad_(True)
+        states = torch.stack([self.state_leaves[record_id] for record_id in record_ids])
+        head = self.agent.writer_key_heads[space]
+        return F.normalize(self.agent._fp32_head(head, states, 'writer'), dim=-1)
+
+    def payload(self, space: int, record_id: str, value: Tensor) -> Tensor:
+        leaf = value.detach().float().to(self.agent.device).requires_grad_(True)
+        self.payload_leaves.setdefault((record_id, space), []).append(leaf)
+        return leaf
+
+    def near(self, record_ids: Iterable[str]) -> None:
+        self.neighborhood.extend(record_ids)
+
+    def harvest(self, gradients: RecordGradients, step: int, spaces: int) -> int:
+        records = set(self.state_leaves) | {record_id for record_id, _ in self.payload_leaves}
+        for record_id in records:
+            state = self.state_leaves.get(record_id)
+            state_grad = state.grad if state is not None else None
+            payloads: list[Tensor | None] = []
+            for space in range(spaces):
+                leaves = self.payload_leaves.get((record_id, space), [])
+                grads = [leaf.grad for leaf in leaves if leaf.grad is not None]
+                payloads.append(torch.stack(grads).sum(0) if grads else None)
+            if state_grad is None and all(value is None for value in payloads):
+                continue
+            gradients.add(step, record_id, state_grad, payloads)
+        return len(records)
+
+
+def writer_backward(agent, writer_inputs: Callable[[str], Tensor], record_ids: Sequence[str],
+                    cotangents: Sequence[tuple[Tensor | None, list[Tensor | None]]], *,
+                    batch_size: int = 16, scale: float = 1.0) -> None:
+    """Run the writer for these records and push accumulated cotangents into it."""
+    spaces = len(agent.config.memory.payload_dims)
+    dtype = getattr(torch, agent.config.memory.storage_dtype)
+    for start in range(0, len(record_ids), batch_size):
+        batch = record_ids[start:start + batch_size]
+        cots = cotangents[start:start + batch_size]
+        outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
+                                      with_key_state=True)
+        targets, grads = [], []
+        key_state = outputs[-1]
+        state_rows = [index for index, (state, _) in enumerate(cots) if state is not None]
+        if state_rows:
+            rows = torch.tensor(state_rows, device=agent.device)
+            targets.append(key_state.float()[rows])
+            grads.append(torch.stack([cots[i][0] for i in state_rows]).to(agent.device) * scale)
+        for space in range(spaces):
+            rows_s = [index for index, (_, payloads) in enumerate(cots)
+                      if payloads[space] is not None]
+            if not rows_s:
+                continue
+            rows = torch.tensor(rows_s, device=agent.device)
+            # The stored payload passes through storage precision, as consumer reads did.
+            payload = outputs[2 * space + 1].to(dtype).float()[rows]
+            targets.append(payload)
+            grads.append(torch.stack([cots[i][1][space].float() for i in rows_s])
+                         .to(agent.device) * scale)
+        if targets:
+            torch.autograd.backward(targets, grads)
+
+
+
+@torch.no_grad()
+def refresh_records(agent, writer_inputs: Callable[[str], Tensor], record_ids: Sequence[str],
+                    bank, cache: KeyStateCache, step: int, *, batch_size: int = 32,
+                    ) -> dict[str, float | int]:
+    """Re-encode records with the current writer, forward only, and publish them.
+
+    Updates cached key-slot states and versions, commits keys and payloads to the
+    mutable bank journal, and reports drift: the cosine between each record's
+    previous stored s0 key (under the current heads) and its new one.
+    """
+    from .store import StoredRecord
+    if not record_ids:
+        return {'refreshed': 0}
+    spaces = len(agent.config.memory.payload_dims)
+    dtype = getattr(torch, agent.config.memory.storage_dtype)
+    ordered = sorted(record_ids, key=lambda record_id: writer_inputs(record_id).shape[1])
+    positions = cache.positions(ordered)
+    old_keys = cache.keys(agent, positions)[0].float()
+    records, states = [], []
+    for start in range(0, len(ordered), batch_size):
+        batch = ordered[start:start + batch_size]
+        outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
+                                      with_key_state=True)
+        states.append(outputs[-1].float())
+        for row, record_id in enumerate(batch):
+            for space in range(spaces):
+                records.append(StoredRecord(
+                    record_id, outputs[2 * space][row].detach().float(),
+                    outputs[2 * space + 1][row].to(dtype).detach(),
+                    namespace=bank.index.namespace, space=f's{space}',
+                    generation=bank.index.generation))
+    states = torch.cat(states)
+    new_keys = agent.writer_space_keys(states)[0].float()
+    cosine = F.cosine_similarity(old_keys, new_keys, dim=-1).cpu()
+    ages = cache.update(ordered, states, step)
+    views = bank.update(records, optimizer_step=step)
+    return {'refreshed': len(ordered), 'refreshed_views': views,
+            'drift_cosine_mean': float(cosine.mean()), 'drift_cosine_min': float(cosine.min()),
+            'refreshed_age_max': int(ages.max()), 'refreshed_age_mean': float(ages.float().mean())}

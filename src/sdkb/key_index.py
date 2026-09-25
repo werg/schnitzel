@@ -7,6 +7,7 @@ Spatial training may patch these arrays from its checkpointed mutable overlay.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import threading
 from collections.abc import Sequence
 
 import numpy as np
@@ -70,6 +71,7 @@ class PublishedKeyIndex:
         if len(self.spaces) != len(self._space_names):
             raise ValueError('Published spaces must be distinct')
         self.key_bytes = sum(array.keys.nbytes for array in self.spaces.values())
+        self.invalidate()
 
     def upsert(self, space: str, record_id: str, key: bytes, key_dim: int, *,
                domain: str, created_at: int, source_id: str = '',
@@ -109,6 +111,7 @@ class PublishedKeyIndex:
             array.source_ids = array.source_ids[order]
             array.deleted = array.deleted[order]
         self.key_bytes = sum(item.keys.nbytes for item in self.spaces.values())
+        self.invalidate()
 
     def upsert_many(self, space: str, rows: Sequence[tuple]) -> None:
         """Apply a journal snapshot with one vectorized existing-ID patch."""
@@ -170,11 +173,69 @@ class PublishedKeyIndex:
             array.source_ids, array.deleted = (
                 array.source_ids[order], array.deleted[order])
         self.key_bytes = sum(item.keys.nbytes for item in self.spaces.values())
+        self.invalidate()
 
     def set_deleted(self, record_ids: set[str], deleted: bool) -> None:
         for array in self.spaces.values():
             if record_ids:
                 array.deleted[np.isin(array.ids, tuple(record_ids))] = deleted
+        self.invalidate()
+
+    def use_device(self, device: str | torch.device | None) -> None:
+        """Serve exact searches from device-resident mirrors (None: NumPy reference).
+
+        Same scores and eligibility as the NumPy scan, so the selected set is
+        identical except for the order among exactly tied scores.
+        """
+        self._device = None if device is None else torch.device(device)
+        self.invalidate()
+
+    def invalidate(self) -> None:
+        """Mark device mirrors stale after any change to the resident arrays."""
+        self._mirrors = {}
+
+    def _mirror(self, space: str) -> dict:
+        lock = self.__dict__.setdefault('_mirror_lock', threading.Lock())
+        with lock:
+            mirror = self._mirrors.get(space)
+            if mirror is None:
+                array = self.spaces[space]
+                names, codes = np.unique(array.domains.astype(str), return_inverse=True)
+                mirror = {
+                    'keys': torch.from_numpy(array.keys).to(self._device, torch.float32),
+                    'codes': torch.from_numpy(codes.astype(np.int64)).to(self._device),
+                    'names': {name: code for code, name in enumerate(names.tolist())},
+                    'times': torch.from_numpy(array.times).to(self._device),
+                    'deleted': torch.from_numpy(array.deleted.astype(bool)).to(self._device),
+                    'position': None,
+                }
+                self._mirrors[space] = mirror
+            return mirror
+
+    def _search_device(self, space: str, q: np.ndarray, top_k: int, domains, query_times,
+                       excluded) -> list[list[tuple[str, float]]]:
+        array, mirror = self.spaces[space], self._mirror(space)
+        queries = torch.from_numpy(q).to(self._device)
+        scores = queries @ mirror['keys'].T
+        codes = torch.tensor([mirror['names'].get(domain, -1) for domain in domains],
+                             device=self._device)
+        times = torch.tensor(list(query_times), device=self._device)
+        eligible = ((mirror['codes'][None] == codes[:, None])
+                    & (mirror['times'][None] < times[:, None]) & ~mirror['deleted'][None])
+        for row, omitted in enumerate(excluded):
+            if omitted:
+                positions = np.flatnonzero(np.isin(array.ids, tuple(omitted)))
+                eligible[row, torch.from_numpy(positions).to(self._device)] = False
+        scores = scores.masked_fill(~eligible, float('-inf'))
+        k = min(top_k, scores.shape[1])
+        values, indices = scores.topk(k, dim=1) if k else (scores[:, :0], scores[:, :0].long())
+        values, indices = values.cpu().numpy(), indices.cpu().numpy()
+        results = []
+        for row in range(len(domains)):
+            keep = np.isfinite(values[row])
+            results.append([(str(array.ids[i]), float(v))
+                            for i, v in zip(indices[row][keep], values[row][keep], strict=True)])
+        return results
 
     def keys_for_ids(self, space: str, record_ids: Sequence[str], *, domain: str,
                      query_time: int) -> Tensor:
@@ -234,6 +295,15 @@ class PublishedKeyIndex:
         if q.shape[1] != array.keys.shape[1]:
             raise ValueError('Key dimensions incompatible with query generation')
         q /= np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-12)
+        if getattr(self, '_device', None) is not None:
+            return tuple(
+                ReadPlan(namespace, space, generation, domain, query_time,
+                         tuple(Selection(record_id, score) for record_id, score in found),
+                         self.bank_cursor)
+                for domain, query_time, found in zip(
+                    domains, query_times,
+                    self._search_device(space, q, top_k, domains, query_times, excluded),
+                    strict=True))
         scores = q @ array.keys.T
         plans = []
         for row, (domain, query_time, omitted) in enumerate(

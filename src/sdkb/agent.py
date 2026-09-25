@@ -313,7 +313,8 @@ class SDKBAgent(nn.Module):
         return tuple(output)
 
     def produce_batch(self, source_ids: list[Tensor], *,
-                      payload_rows: Tensor | None = None) -> tuple[Tensor, ...]:
+                      payload_rows: Tensor | None = None,
+                      with_key_state: bool = False) -> tuple[Tensor, ...]:
         """Write variable-length sources in one padded native-backbone call.
 
         Padding follows every source's write slots, so causal source and slot
@@ -355,6 +356,9 @@ class SDKBAgent(nn.Module):
             else:
                 payload = canonical.new_zeros(len(source_ids), dim)
             output.extend((key, payload))
+        if with_key_state:
+            # The writer's key-slot hidden state, which direct key heads consume.
+            output.append(key_state)
         return tuple(output)
 
     def produce_from_write_states(self, states: Tensor) -> tuple[Tensor, ...]:

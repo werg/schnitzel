@@ -136,6 +136,16 @@ class TrainConfig:
     load_penalty_weight: float = 0.0
     load_decay: float = 0.999
     load_threshold: float = 4.0
+    # Error-driven writer learning against a large bank (record_gradients.py):
+    # live keys from cached key-slot states, decayed per-record cotangents, writer
+    # backward for a close neighbourhood of each step's reads, rolling refresh.
+    record_gradients: bool = False
+    record_gradient_decay: float = 0.9
+    record_neighborhood_fraction: float = 0.25  # of each space's read limit, plus gold
+    record_flush_budget: int = 256  # writer backward records per step
+    record_flush_extra: int = 32  # largest accumulated gradients outside the neighbourhood
+    record_refresh_per_step: int = 256  # forward-only re-encodes, stalest first
+    record_gradient_capacity: int = 16384
     writer_replay_records_per_site: int = 0
     threads: int = 4
     cuda_memory_fraction: float | None = None
@@ -336,6 +346,15 @@ class Config:
                     t.koleo_weight, t.load_penalty_weight))
                 or not 0 < t.load_decay < 1 or t.load_threshold <= 1):
             raise ValueError('Invalid gold forcing, exploration or spreading settings')
+        if t.record_gradients and (
+                t.writer_replay_records_per_site or t.routing_live_weight
+                or not r.distance_gating or r.key_interface != 'direct'
+                or not 0 <= t.record_gradient_decay < 1
+                or not 0 < t.record_neighborhood_fraction <= 1
+                or min(t.record_flush_budget, t.record_gradient_capacity) < 1
+                or min(t.record_flush_extra, t.record_refresh_per_step) < 0):
+            raise ValueError('Record gradients replace live writer replay and need direct '
+                             'keys, distance gating and valid budgets')
         if t.writer_replay_records_per_site and not r.distance_gating:
             raise ValueError('Continuous record replay requires distance gating')
         if len(r.payload_dims) > 1 and r.compaction != "none":

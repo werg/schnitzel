@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from .agent import SDKBAgent
 from .bank_replay import BankWriterReplay
 from .key_geometry import BankLoad, koleo_loss, variance_covariance_loss
+from .record_gradients import GradientSink
 from .recurrence import SpatialReadSite
 from .routing import cosine_scores, cosine_similarities, union_support_loss
 from .routing_curriculum import (RoutingCandidateIndex, lexical_alignment_loss,
@@ -328,7 +329,8 @@ def _consume_wave(agent: SDKBAgent, index: BatchKeyIndexBackend,
                   writer_replay: BankWriterReplay | None = None,
                   live: Mapping[str, tuple[Tensor, ...]] | None = None,
                   routing_teacher: RoutingCandidateIndex | None = None,
-                  load: BankLoad | None = None) -> None:
+                  load: BankLoad | None = None,
+                  sink: GradientSink | None = None) -> None:
     memory = agent.config.memory
     train = agent.config.train
     replay_budget = agent.config.train.writer_replay_records_per_site
@@ -360,6 +362,12 @@ def _consume_wave(agent: SDKBAgent, index: BatchKeyIndexBackend,
                 f"s{space}", candidate_ids, domain=item["domain"],
                 query_time=item["query_time"],
             ).to(agent.device)
+            if sink is not None:
+                # Same values as the synchronized index, now differentiable in the
+                # key heads and in each record's cached writer key-slot state.
+                stored_keys = sink.candidate_keys(space, candidate_ids)
+                sink.near(found[:max(1, round(train.record_neighborhood_fraction * limit))]
+                          + required)
             keys = torch.stack([
                 live[record_id][2 * space][0] if record_id in live else stored_keys[position]
                 for position, record_id in enumerate(candidate_ids)
@@ -422,6 +430,7 @@ def _consume_wave(agent: SDKBAgent, index: BatchKeyIndexBackend,
             state.selected_counts[space] += len(values)
             row_values = torch.stack([
                 (live[record_id][2 * space + 1][0] if record_id in live
+                 else sink.payload(space, record_id, value) if sink is not None
                  else value.to(device=agent.device, dtype=torch.float32))
                 for record_id, value in zip(selected_ids, values, strict=True)
             ])
@@ -828,7 +837,8 @@ def spatial_bank_pipeline_forward(
         pad_token_id: int = 0,
         writer_replay: BankWriterReplay | None = None,
         routing_teacher: RoutingCandidateIndex | None = None,
-        load: BankLoad | None = None) -> SpatialForwardResult:
+        load: BankLoad | None = None,
+        sink: GradientSink | None = None) -> SpatialForwardResult:
     """Overlap retained microbatch graphs with CPU search and serialized payload I/O.
 
     GPU continuations execute in deterministic round-robin order. Retrieval workers
@@ -912,7 +922,8 @@ def spatial_bank_pipeline_forward(
                 live = writer_replay.capture(record_ids)
             for index_in_step, state, wave, loaded in wavefront:
                 _consume_wave(agent, index, state, wave, loaded, limits=limits,
-                              live=live, routing_teacher=routing_teacher, load=load)
+                              live=live, routing_teacher=routing_teacher, load=load,
+                              sink=sink)
                 following = _issue_wave(agent, state)
                 if following is None:
                     results.append((index_in_step, _finish_batch(agent, state)))

@@ -22,6 +22,8 @@ from sdkb.checkpoints import (resolve_checkpoint, restore_checkpoint, save_check
                               stop_on_signal)
 from sdkb.config import load_config
 from sdkb.key_geometry import BankLoad
+from sdkb.record_gradients import (GradientSink, KeyStateCache, RecordGradients,
+                                   refresh_records, writer_backward)
 from sdkb.key_index import PublishedKeyIndex
 from sdkb.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
@@ -69,7 +71,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           min_host_available_gib: float = 0.0,
           host_pressure_wait_seconds: float = 600.0,
           gold_force: tuple[float, float, int] | None = None,
-          spreading: dict | None = None) -> dict:
+          spreading: dict | None = None,
+          key_states_path: Path | None = None,
+          device_search: bool = False) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -214,6 +218,15 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     spread = {name: getattr(config.train, name) for name in (
         'exploration_fraction', 'spread_variance_weight', 'spread_covariance_weight',
         'koleo_weight', 'load_penalty_weight', 'load_decay', 'load_threshold')}
+    if config.train.record_gradients:
+        if not pipeline or sources_path is None:
+            raise ValueError('Record gradients require --sources and the overlapped pipeline')
+        if key_states_path is None:
+            raise ValueError('Record gradients need the bank key-state cache')
+        settings['record_gradients'] = {name: getattr(config.train, name) for name in (
+            'record_gradient_decay', 'record_neighborhood_fraction', 'record_flush_budget',
+            'record_flush_extra', 'record_refresh_per_step', 'record_gradient_capacity')}
+        settings['record_gradients']['key_states_sha256'] = file_sha256(key_states_path)
     if any((spread['exploration_fraction'], spread['spread_variance_weight'],
             spread['spread_covariance_weight'], spread['koleo_weight'],
             spread['load_penalty_weight'])):
@@ -259,7 +272,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     for name, parameter in agent.named_parameters():
         if name.startswith(("write_slots", "key_head.", "value_head.",
                             "address_maps.", "writer_key_heads.", "codecs.")):
-            parameter.requires_grad_(bool(config.train.writer_replay_records_per_site))
+            parameter.requires_grad_(bool(config.train.writer_replay_records_per_site
+                                          or config.train.record_gradients))
     agent.train()
     initialization = None
     if not resume:
@@ -345,9 +359,44 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 raise ValueError('Retrieval-load state is missing for the resumed step')
             bank_load.load_state_dict(torch.load(saved, weights_only=True))
 
+    key_cache = record_grads = None
+    if device_search or config.train.record_gradients:
+        # Exact scan on the device; same eligibility and scores as the NumPy reference.
+        index.use_device(config.train.device)
+    if config.train.record_gradients:
+        from safetensors.torch import load_file as load_tensors
+        record_ids = [str(record_id) for record_id in next(iter(index.spaces.values())).ids]
+        record_grads = RecordGradients(config.train.record_gradient_decay,
+                                       capacity=config.train.record_gradient_capacity)
+        if resume and start:
+            saved = torch.load(output / f'record-state-{start:09d}.pt', weights_only=False)
+            key_cache = KeyStateCache.from_state_dict(record_ids, saved['cache'],
+                                                      config.train.device)
+            record_grads.load_state_dict(saved['grads'])
+        else:
+            tensors = load_tensors(str(key_states_path))
+            key_cache = KeyStateCache(record_ids, tensors['states'].to(config.train.device),
+                                      tensors['versions'])
+            # The cache must reproduce the published keys under the starting heads.
+            sample = torch.randperm(len(record_ids), generator=torch.Generator().manual_seed(
+                config.train.seed))[:256]
+            with torch.no_grad():
+                derived = key_cache.keys(agent, sample)
+            for space, array in enumerate(index.spaces.values()):
+                stored = torch.from_numpy(array.keys[sample.numpy()])
+                if float(torch.nn.functional.cosine_similarity(
+                        derived[space].float().cpu(), stored, dim=-1).min()) < 0.999:
+                    raise ValueError('Key-state cache does not reproduce the bank keys')
+        key_cache.sync_index(agent, index)
+
     def save_all(step_count):
         save_checkpoint(agent, optimizer, output, step_count, rng, cache,
                         fingerprint, keep=config.train.keep_checkpoints)
+        if key_cache is not None:
+            torch.save({'cache': key_cache.state_dict(), 'grads': record_grads.state_dict()},
+                       output / f'record-state-{step_count:09d}.pt')
+            for old in sorted(output.glob('record-state-*.pt'))[:-2]:
+                old.unlink()
         if bank_load is not None:
             torch.save(bank_load.state_dict(), output / f'bank-load-{step_count:09d}.pt')
             for old in sorted(output.glob('bank-load-*.pt'))[:-config.train.keep_checkpoints]:
@@ -490,6 +539,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                         phase_seconds[f'profile_{name}_seconds'] = now - phase_tick
                     phase_tick = now
 
+                sink = GradientSink(agent, key_cache) if key_cache is not None else None
                 replay = (BankWriterReplay(
                               agent, writer_inputs,
                               checkpoint_backward=not retain_writer_replay_activations)
@@ -504,6 +554,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                             writer_replay=replay,
                             routing_teacher=routing_teacher,
                             load=bank_load,
+                            sink=sink,
                         )
                     else:
                         result = spatial_bank_forward(
@@ -516,6 +567,21 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 finish_phase('consumer_backward')
                 if replay is not None:
                     replay.backward()
+                record_metrics = {}
+                if sink is not None:
+                    # Accumulate this step's per-record cotangents, then push the
+                    # accumulated gradients of a close neighbourhood into the writer.
+                    harvested = sink.harvest(record_grads, step, len(limits))
+                    flush = record_grads.select(
+                        step, sink.neighborhood, budget=config.train.record_flush_budget,
+                        extra=config.train.record_flush_extra)
+                    cotangents = [record_grads.pop(record_id, step) for record_id in flush]
+                    with autocast_context(config):
+                        writer_backward(agent, lambda record_id: writer_inputs[record_id],
+                                        flush, cotangents)
+                    record_metrics = {'record_harvested': harvested,
+                                      'record_neighborhood': len(set(sink.neighborhood)),
+                                      'record_flushed': len(flush)}
                 finish_phase('writer_backward')
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in agent.parameters() if parameter.requires_grad],
@@ -531,6 +597,23 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 refreshed_views = (replay.refresh(
                     training_bank, additional_ids=maintenance_ids,
                     optimizer_step=step + 1) if replay is not None else 0)
+                if sink is not None:
+                    with autocast_context(config):
+                        flushed_refresh = refresh_records(
+                            agent, lambda record_id: writer_inputs[record_id], flush,
+                            training_bank, key_cache, step + 1)
+                        stale_refresh = refresh_records(
+                            agent, lambda record_id: writer_inputs[record_id],
+                            key_cache.stalest(config.train.record_refresh_per_step,
+                                              exclude=flush),
+                            training_bank, key_cache, step + 1)
+                    key_cache.sync_index(agent, index)
+                    record_grads.evict(step + 1)
+                    record_metrics.update(
+                        record_buffer=len(record_grads),
+                        **{f'flushed_{k}': v for k, v in flushed_refresh.items()},
+                        **{f'stale_{k}': v for k, v in stale_refresh.items()})
+                    del sink
                 finish_phase('refresh')
                 loss_value = float(result.loss.detach())
                 nll_value = float(result.nll.detach())
@@ -556,6 +639,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                     "replayed_records": replayed_records,
                     "maintenance_records": len(maintenance_ids),
                     "refreshed_record_views": refreshed_views,
+                    **record_metrics,
                     "gold_force_probability": force_probability(step),
                     **({"retrieval_load": bank_load.statistics()}
                        if bank_load is not None else {}),
@@ -639,6 +723,10 @@ if __name__ == "__main__":
     parser.add_argument("--load-penalty-weight", type=float)
     parser.add_argument("--load-decay", type=float)
     parser.add_argument("--load-threshold", type=float)
+    parser.add_argument("--key-states", type=Path,
+                        help="bank key-state cache (cache_bank_key_states.py) for record gradients")
+    parser.add_argument("--device-search", action="store_true",
+                        help="exact key search on the training device")
     args = parser.parse_args()
     print(json.dumps(train(
         args.config, args.data, args.bank, args.output, args.init_from,
@@ -672,4 +760,6 @@ if __name__ == "__main__":
         spreading={name: getattr(args, name) for name in (
             'exploration_fraction', 'spread_variance_weight', 'spread_covariance_weight',
             'koleo_weight', 'load_penalty_weight', 'load_decay', 'load_threshold')},
+        key_states_path=args.key_states,
+        device_search=args.device_search,
     ), indent=2))
