@@ -278,6 +278,62 @@ eligibility and scores as the NumPy reference; an ANN index is deferred until th
 bank reaches millions of records and keys change more slowly.
 Config: `configs/restart_r5b_record_gradients_spark.yaml`.
 
+**R5b result (stopped at step 63).** At the R5 learning rates, the key a record
+would get from the current writer moved fast. By the record's age in steps, the
+cosine between its cached key and its current key was:
+
+| Age (steps) | Mean cosine | Minimum cosine |
+| ---: | ---: | ---: |
+| 10 | .995 | .986 |
+| 20 | .964 | .844 |
+| 40 | .865 | .573 |
+| 60 | .836 | .468 |
+
+At about 550 refreshes per step, the average record in a 218k bank would be
+about 400 steps old. Every key was a function of the shared, training decoder,
+so no affordable refresh rate kept the index coherent. The profile at about
+40 s per step:
+
+| Phase | Time |
+| --- | ---: |
+| Forward | 3 s |
+| Consumer backward | 4 s |
+| Writer backward, 288 records | 12 s |
+| Refresh, 544 records | 21 s |
+
+#### R5c: terminal per-record keys (owner design, 25 September 2026)
+Keys are treated like an embedding table, not as a decoder output that is
+backpropagated into. Implemented as `KeyTable` and `writer_pass` in
+`src/sdkb/record_gradients.py`:
+
+1. **Terminal keys.** Search and gates use one trainable unit key per record and
+   space, initialized from the published R4 keys. Retrieval, gold-contrast and
+   spreading gradients update only the rows touched in a step, with a per-row
+   Adam and a last-updated step. The whole table is written to the index after
+   every step. Decoder training never moves a key, so the index is exact on the
+   full bank.
+2. **The decoder learns to produce the keys.** Whenever a record is encoded
+   (a gradient flush or a stalest-first refresh), the decoder's predicted keys
+   regress onto the table rows (`key_prediction_weight`). New records at
+   inference still take their keys from the decoder.
+3. **Commitment.** Each encode moves the record's rows a fixed fraction toward
+   the prediction (`key_commitment_weight`, 0.05). The move is an
+   interpolation, not a gradient, so its size does not depend on the adaptive
+   step. It keeps rows reproducible from content.
+4. **Payloads as in R5b.** Payload cotangents accumulate and flush. Each encode
+   carries its record's payload cotangents and key loss in a single backward,
+   before the optimizer step, and republishes the payloads, which are therefore
+   one step old. Flushed records no longer need a second forward pass.
+
+Gauges:
+- `*_key_prediction_cosine_*`: how well the decoder reproduces the table.
+- `*_value_drift_cosine_*`: s0 payload drift since the last publish.
+- `table_step_cosine_*`: how far touched rows move per step.
+
+Owner direction: if values drift too far on the full bank, shrink the bank. A
+smaller bank then needs ramp stages back to the target size.
+Config: `configs/restart_r5c_key_table_spark.yaml`.
+
 #### Moving from teacher distillation to utility-driven keys (owner decision, 24 September 2026)
 Teacher distillation is a bootstrap only. The spaces the system needs will
 differ from the reference embedding spaces, so distillation is removed as early

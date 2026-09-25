@@ -21,6 +21,14 @@ Three cooperating pieces keep stored keys coherent while the writer trains:
     states and stored payloads, and their gradients are harvested after the
     consumer backward.
 
+``KeyTable``
+    Optional terminal keys: one trainable key per record and space, used by
+    search and gates in place of head-derived keys. Retrieval gradients update
+    only touched rows (per-row Adam); decoder drift never moves the index. The
+    decoder learns to predict each row whenever it encodes that record
+    (``writer_pass``), and a small commitment pull moves rows toward the
+    prediction so keys stay reproducible for records the table never saw.
+
 Accumulated cotangents are applied at the writer's current parameters, so a
 record's older contributions are delayed gradients. This is a deliberate,
 owner-approved estimator, not the exact full-graph replay reference; with a
@@ -31,6 +39,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 import hashlib
+
+import numpy as np
 
 import torch
 from torch import Tensor
@@ -222,17 +232,134 @@ class RecordGradients:
         self.norm_sq = dict(zip(state['ids'], state['norm_sq'], strict=True))
 
 
+class KeyTable:
+    """Trainable unit keys per record and space, in index order, updated sparsely."""
+
+    def __init__(self, record_ids: Sequence[str], keys: Sequence[Tensor], *,
+                 learning_rate: float, betas: tuple[float, float] = (0.9, 0.999),
+                 eps: float = 1e-8) -> None:
+        self.ids = [str(record_id) for record_id in record_ids]
+        if (self.ids != sorted(self.ids) or len(set(self.ids)) != len(self.ids)
+                or any(tuple(k.shape[:1]) != (len(self.ids),) for k in keys)):
+            raise ValueError('Key table needs sorted unique IDs and one key per record')
+        self.position = {record_id: i for i, record_id in enumerate(self.ids)}
+        self.keys = [F.normalize(k.float(), dim=-1) for k in keys]
+        self.exp_avg = [torch.zeros_like(k) for k in self.keys]
+        self.exp_avg_sq = [torch.zeros_like(k) for k in self.keys]
+        self.counts = torch.zeros(len(self.keys), len(self.ids), dtype=torch.long,
+                                  device=self.keys[0].device)
+        self.updated = torch.full((len(self.ids),), -1, dtype=torch.long)
+        self.learning_rate, self.betas, self.eps = learning_rate, betas, eps
+        self.leaves: dict[tuple[int, str], Tensor] = {}
+
+    def ids_digest(self) -> str:
+        return hashlib.sha256('\n'.join(self.ids).encode()).hexdigest()
+
+    def begin_step(self) -> None:
+        self.leaves = {}
+
+    def rows(self, space: int, record_ids: Sequence[str], device=None) -> Tensor:
+        """Differentiable rows; one leaf per record and space for the whole step."""
+        missing = [r for r in dict.fromkeys(record_ids) if (space, r) not in self.leaves]
+        if missing:
+            positions = torch.tensor([self.position[r] for r in missing],
+                                     device=self.keys[space].device)
+            for record_id, row in zip(missing, self.keys[space][positions], strict=True):
+                self.leaves[(space, record_id)] = row.detach().clone().requires_grad_(True)
+        rows = torch.stack([self.leaves[(space, r)] for r in record_ids])
+        return rows if device is None else rows.to(device)
+
+    @torch.no_grad()
+    def step(self, step: int) -> dict[str, float | int]:
+        """Adam on touched rows only, then renormalize; report how far rows moved."""
+        beta1, beta2 = self.betas
+        moved, touched = [], set()
+        for space in range(len(self.keys)):
+            items = [(r, leaf.grad) for (s, r), leaf in self.leaves.items()
+                     if s == space and leaf.grad is not None]
+            if not items:
+                continue
+            positions = torch.tensor([self.position[r] for r, _ in items],
+                                     device=self.keys[space].device)
+            grads = torch.stack([g for _, g in items]).float().to(self.keys[space].device)
+            self.counts[space, positions] += 1
+            count = self.counts[space, positions].float()[:, None]
+            m = self.exp_avg[space][positions].mul_(beta1).add_(grads, alpha=1 - beta1)
+            v = self.exp_avg_sq[space][positions].mul_(beta2).addcmul_(
+                grads, grads, value=1 - beta2)
+            self.exp_avg[space][positions], self.exp_avg_sq[space][positions] = m, v
+            update = (m / (1 - beta1 ** count)) / ((v / (1 - beta2 ** count)).sqrt() + self.eps)
+            old = self.keys[space][positions]
+            new = F.normalize(old - self.learning_rate * update, dim=-1)
+            self.keys[space][positions] = new
+            moved.append(F.cosine_similarity(old, new, dim=-1))
+            touched.update(r for r, _ in items)
+        if touched:
+            self.updated[torch.tensor([self.position[r] for r in touched])] = step
+        self.leaves = {}
+        if not moved:
+            return {'table_rows': 0}
+        moved = torch.cat(moved)
+        return {'table_rows': int(moved.numel()), 'table_records': len(touched),
+                'table_step_cosine_mean': float(moved.mean()),
+                'table_step_cosine_min': float(moved.min())}
+
+    @torch.no_grad()
+    def pull(self, space: int, record_ids: Sequence[str], targets: Tensor,
+             weight: float) -> None:
+        """Commitment: move rows a fixed fraction toward the decoder's prediction.
+
+        An interpolation rather than a gradient, so its size does not depend on
+        the adaptive step of rows that retrieval never touches.
+        """
+        if not weight:
+            return
+        positions = torch.tensor([self.position[r] for r in record_ids],
+                                 device=self.keys[space].device)
+        rows = self.keys[space][positions]
+        self.keys[space][positions] = F.normalize(
+            rows + weight * (F.normalize(targets.float(), dim=-1).to(rows.device) - rows),
+            dim=-1)
+
+    @torch.no_grad()
+    def sync_index(self, index) -> None:
+        for space, array in enumerate(index.spaces.values()):
+            if array.ids.tolist() != self.ids:
+                raise ValueError('Key table and index record order differ')
+            array.keys[:] = self.keys[space].float().cpu().numpy()
+        index.invalidate()
+
+    def state_dict(self) -> dict:
+        return {'ids_sha256': self.ids_digest(),
+                'keys': [k.cpu() for k in self.keys],
+                'exp_avg': [m.cpu() for m in self.exp_avg],
+                'exp_avg_sq': [v.cpu() for v in self.exp_avg_sq],
+                'counts': self.counts.cpu(), 'updated': self.updated.clone()}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state['ids_sha256'] != self.ids_digest():
+            raise ValueError('Key table belongs to another bank')
+        device = self.keys[0].device
+        self.keys = [k.to(device) for k in state['keys']]
+        self.exp_avg = [m.to(device) for m in state['exp_avg']]
+        self.exp_avg_sq = [v.to(device) for v in state['exp_avg_sq']]
+        self.counts = state['counts'].to(device)
+        self.updated = state['updated'].clone()
+
+
 class GradientSink:
     """Leaf tensors for one step's consumer reads, harvested after backward."""
 
-    def __init__(self, agent, cache: KeyStateCache) -> None:
-        self.agent, self.cache = agent, cache
+    def __init__(self, agent, cache: KeyStateCache, table: KeyTable | None = None) -> None:
+        self.agent, self.cache, self.table = agent, cache, table
         self.state_leaves: dict[str, Tensor] = {}
         self.payload_leaves: dict[tuple[str, int], list[Tensor]] = {}
         self.neighborhood: list[str] = []
 
     def candidate_keys(self, space: int, record_ids: Sequence[str]) -> Tensor:
         """Live keys for candidates from cached states; exact head and state gradients."""
+        if self.table is not None:
+            return self.table.rows(space, record_ids, self.agent.device)
         missing = [record_id for record_id in dict.fromkeys(record_ids)
                    if record_id not in self.state_leaves]
         if missing:
@@ -348,3 +475,102 @@ def refresh_records(agent, writer_inputs: Callable[[str], Tensor], record_ids: S
     return {'refreshed': len(ordered), 'refreshed_views': views,
             'drift_cosine_mean': float(cosine.mean()), 'drift_cosine_min': float(cosine.min()),
             'refreshed_age_max': int(ages.max()), 'refreshed_age_mean': float(ages.float().mean())}
+
+
+def stored_payloads(bank, space: int, record_ids: Sequence[str]) -> list[Tensor]:
+    """Currently published payloads of one space, read through the mutable bank."""
+    from .store import ReadPlan, Selection
+    array = bank.index.spaces[f's{space}']
+    plans = []
+    for record_id in record_ids:
+        position = int(np.flatnonzero(array.ids == record_id)[0])
+        plans.append(ReadPlan(bank.index.namespace, f's{space}', bank.index.generation,
+                              str(array.domains[position]), int(array.times[position]) + 1,
+                              (Selection(record_id, 0.0),)))
+    return [values[0] for values in bank.fetch_many(plans)]
+
+
+def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Sequence[str],
+                cotangents: Sequence[tuple[Tensor | None, list[Tensor | None]]] | None,
+                table: KeyTable, bank, cache: KeyStateCache, step: int, *,
+                prediction_weight: float, commitment_weight: float, batch_size: int = 16,
+                drift_sample: int = 0) -> dict[str, float | int]:
+    """Encode records with gradient: key prediction, payload cotangents, publish.
+
+    For each record the decoder's predicted keys regress onto the (fixed) table
+    rows, and the rows move a small fraction toward the prediction (commitment).
+    Accumulated payload cotangents, when given, flow into the writer in the same
+    backward. The encoded payloads are then published with the table keys, so a
+    flush and a refresh share one forward. Parameter gradients accumulate for the
+    caller's optimizer step; table-row gradients for ``table.step``.
+    """
+    from .store import StoredRecord
+    if not record_ids:
+        return {'encoded': 0}
+    spaces = len(agent.config.memory.payload_dims)
+    dtype = getattr(torch, agent.config.memory.storage_dtype)
+    order = sorted(range(len(record_ids)),
+                   key=lambda i: writer_inputs(record_ids[i]).shape[1])
+    ordered = [record_ids[i] for i in order]
+    cots = None if cotangents is None else [cotangents[i] for i in order]
+    drift_ids = set(ordered[:: max(1, len(ordered) // drift_sample)][:drift_sample]
+                    if drift_sample else ())
+    old_values = (dict(zip(sorted(drift_ids), stored_payloads(bank, 0, sorted(drift_ids)),
+                           strict=True)) if drift_ids else {})
+    scale = 1 / len(ordered)
+    records, states, cosines, drift = [], [], [], []
+    for start in range(0, len(ordered), batch_size):
+        batch = ordered[start:start + batch_size]
+        outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
+                                      with_key_state=True)
+        key_state = outputs[-1]
+        predicted = agent.writer_space_keys(key_state)
+        loss = key_state.new_zeros((), dtype=torch.float32)
+        published_keys = []
+        for space in range(spaces):
+            positions = torch.tensor([table.position[r] for r in batch],
+                                     device=table.keys[space].device)
+            rows = table.keys[space][positions].to(agent.device)
+            pred = predicted[space].float()
+            cosine = F.cosine_similarity(pred, rows, dim=-1)
+            loss = loss + scale / spaces * prediction_weight * (1 - cosine).sum()
+            cosines.append(cosine.detach())
+            table.pull(space, batch, pred.detach(), commitment_weight)
+            published_keys.append(table.keys[space][positions].detach().to(agent.device))
+        targets, grads = [loss], [torch.ones_like(loss)]
+        if cots is not None:
+            batch_cots = cots[start:start + batch_size]
+            for space in range(spaces):
+                rows_s = [i for i, (_, payloads) in enumerate(batch_cots)
+                          if payloads[space] is not None]
+                if not rows_s:
+                    continue
+                index = torch.tensor(rows_s, device=agent.device)
+                targets.append(outputs[2 * space + 1].to(dtype).float()[index])
+                grads.append(torch.stack([batch_cots[i][1][space].float() for i in rows_s])
+                             .to(agent.device))
+        torch.autograd.backward(targets, grads)
+        states.append(key_state.detach().float())
+        for row, record_id in enumerate(batch):
+            if record_id in old_values:
+                drift.append(F.cosine_similarity(
+                    outputs[1][row].detach().float().flatten(),
+                    old_values[record_id].to(agent.device).float().flatten(), dim=0))
+            for space in range(spaces):
+                records.append(StoredRecord(
+                    record_id, published_keys[space][row],
+                    outputs[2 * space + 1][row].to(dtype).detach(),
+                    namespace=bank.index.namespace, space=f's{space}',
+                    generation=bank.index.generation))
+    ages = cache.update(ordered, torch.cat(states), step)
+    views = bank.update(records, optimizer_step=step)
+    cosines = torch.cat(cosines)
+    report = {'encoded': len(ordered), 'views': views,
+              'key_prediction_cosine_mean': float(cosines.mean()),
+              'key_prediction_cosine_min': float(cosines.min()),
+              'age_max': int(ages.max()), 'age_mean': float(ages.float().mean())}
+    if drift:
+        drift = torch.stack(drift)
+        report.update(value_drift_cosine_mean=float(drift.mean()),
+                      value_drift_cosine_min=float(drift.min()))
+    return report

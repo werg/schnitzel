@@ -146,6 +146,14 @@ class TrainConfig:
     record_flush_extra: int = 32  # largest accumulated gradients outside the neighbourhood
     record_refresh_per_step: int = 256  # forward-only re-encodes, stalest first
     record_gradient_capacity: int = 16384
+    # Terminal per-record key table (record_gradients.KeyTable): search and gates use
+    # trainable table keys, updated only where touched; the decoder regresses its
+    # predicted keys onto the table whenever it encodes a record, and a small
+    # commitment term keeps table keys predictable from content.
+    key_table: bool = False
+    key_table_learning_rate: float = 1.0e-3
+    key_prediction_weight: float = 1.0
+    key_commitment_weight: float = 0.05  # fraction a row moves toward each prediction
     writer_replay_records_per_site: int = 0
     threads: int = 4
     cuda_memory_fraction: float | None = None
@@ -355,6 +363,10 @@ class Config:
                 or min(t.record_flush_extra, t.record_refresh_per_step) < 0):
             raise ValueError('Record gradients replace live writer replay and need direct '
                              'keys, distance gating and valid budgets')
+        if t.key_table and (not t.record_gradients or t.key_table_learning_rate <= 0
+                            or t.key_prediction_weight < 0
+                            or not 0 <= t.key_commitment_weight <= 1):
+            raise ValueError('A key table needs record gradients and valid weights')
         if t.writer_replay_records_per_site and not r.distance_gating:
             raise ValueError('Continuous record replay requires distance gating')
         if len(r.payload_dims) > 1 and r.compaction != "none":

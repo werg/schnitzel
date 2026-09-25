@@ -23,7 +23,7 @@ from sdkb.checkpoints import (resolve_checkpoint, restore_checkpoint, save_check
 from sdkb.config import load_config
 from sdkb.key_geometry import BankLoad
 from sdkb.record_gradients import (GradientSink, KeyStateCache, RecordGradients,
-                                   refresh_records, writer_backward)
+                                   KeyTable, refresh_records, writer_backward, writer_pass)
 from sdkb.key_index import PublishedKeyIndex
 from sdkb.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
@@ -227,6 +227,10 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             'record_gradient_decay', 'record_neighborhood_fraction', 'record_flush_budget',
             'record_flush_extra', 'record_refresh_per_step', 'record_gradient_capacity')}
         settings['record_gradients']['key_states_sha256'] = file_sha256(key_states_path)
+        if config.train.key_table:
+            settings['record_gradients']['key_table'] = {name: getattr(config.train, name)
+                                                         for name in (
+                'key_table_learning_rate', 'key_prediction_weight', 'key_commitment_weight')}
     if any((spread['exploration_fraction'], spread['spread_variance_weight'],
             spread['spread_covariance_weight'], spread['koleo_weight'],
             spread['load_penalty_weight'])):
@@ -359,7 +363,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 raise ValueError('Retrieval-load state is missing for the resumed step')
             bank_load.load_state_dict(torch.load(saved, weights_only=True))
 
-    key_cache = record_grads = None
+    key_cache = record_grads = key_table = None
     if str(config.train.device).startswith('cuda') or device_search:
         # Exact scan on the training device: same scores, eligibility and tie
         # order as the NumPy scan, without per-query CPU work.
@@ -388,13 +392,23 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 if float(torch.nn.functional.cosine_similarity(
                         derived[space].float().cpu(), stored, dim=-1).min()) < 0.999:
                     raise ValueError('Key-state cache does not reproduce the bank keys')
-        key_cache.sync_index(agent, index)
+        if config.train.key_table:
+            # Terminal keys start as the published keys; decoder drift never moves them.
+            key_table = KeyTable(record_ids, [torch.from_numpy(array.keys.copy()).to(
+                config.train.device) for array in index.spaces.values()],
+                learning_rate=config.train.key_table_learning_rate)
+            if resume and start:
+                key_table.load_state_dict(saved['table'])
+            key_table.sync_index(index)
+        else:
+            key_cache.sync_index(agent, index)
 
     def save_all(step_count):
         save_checkpoint(agent, optimizer, output, step_count, rng, cache,
                         fingerprint, keep=config.train.keep_checkpoints)
         if key_cache is not None:
-            torch.save({'cache': key_cache.state_dict(), 'grads': record_grads.state_dict()},
+            torch.save({'cache': key_cache.state_dict(), 'grads': record_grads.state_dict(),
+                        **({'table': key_table.state_dict()} if key_table is not None else {})},
                        output / f'record-state-{step_count:09d}.pt')
             for old in sorted(output.glob('record-state-*.pt'))[:-2]:
                 old.unlink()
@@ -540,7 +554,10 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                         phase_seconds[f'profile_{name}_seconds'] = now - phase_tick
                     phase_tick = now
 
-                sink = GradientSink(agent, key_cache) if key_cache is not None else None
+                if key_table is not None:
+                    key_table.begin_step()
+                sink = (GradientSink(agent, key_cache, key_table)
+                        if key_cache is not None else None)
                 replay = (BankWriterReplay(
                               agent, writer_inputs,
                               checkpoint_backward=not retain_writer_replay_activations)
@@ -580,14 +597,37 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                     cotangents = [record_grads.pop(record_id, step) for record_id in flush]
                     harvest_seconds = time.perf_counter() - timer
                     with autocast_context(config):
-                        writer_backward(agent, lambda record_id: writer_inputs[record_id],
-                                        flush, cotangents)
+                        if key_table is None:
+                            writer_backward(agent, lambda record_id: writer_inputs[record_id],
+                                            flush, cotangents)
+                        else:
+                            # Terminal keys: one encode per record trains key prediction,
+                            # pushes payload cotangents and republishes the payloads.
+                            # Values are published from the pre-update writer (age 1).
+                            passes = {
+                                'flushed': writer_pass(
+                                    agent, lambda record_id: writer_inputs[record_id],
+                                    flush, cotangents, key_table, training_bank, key_cache,
+                                    step + 1, prediction_weight=config.train.key_prediction_weight,
+                                    commitment_weight=config.train.key_commitment_weight,
+                                    drift_sample=16),
+                                'stale': writer_pass(
+                                    agent, lambda record_id: writer_inputs[record_id],
+                                    key_cache.stalest(config.train.record_refresh_per_step,
+                                                      exclude=flush),
+                                    None, key_table, training_bank, key_cache, step + 1,
+                                    prediction_weight=config.train.key_prediction_weight,
+                                    commitment_weight=config.train.key_commitment_weight,
+                                    drift_sample=16)}
                     record_metrics = {'record_harvested': harvested,
                                       'record_neighborhood': len(set(sink.neighborhood)),
                                       'record_flushed': len(flush),
                                       'record_harvest_seconds': harvest_seconds,
                                       'record_writer_backward_seconds':
                                           time.perf_counter() - timer - harvest_seconds}
+                if key_table is not None:
+                    record_metrics.update({f'{name}_{key}': value for name, report
+                                           in passes.items() for key, value in report.items()})
                 finish_phase('writer_backward')
                 gradient_norm = torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in agent.parameters() if parameter.requires_grad],
@@ -596,6 +636,15 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 optimizer.step()
                 if bank_load is not None:
                     bank_load.commit()
+                if key_table is not None:
+                    record_metrics.update(key_table.step(step + 1))
+                    timer = time.perf_counter()
+                    key_table.sync_index(index)
+                    record_grads.evict(step + 1)
+                    record_metrics.update(record_sync_seconds=time.perf_counter() - timer,
+                                          record_buffer=len(record_grads))
+                    del sink
+                    sink = None
                 finish_phase('optimizer')
                 maintenance_ids = (() if replay is None else training_bank.maintenance_ids(
                     maintenance_records_per_step, exclude=replay.record_ids,

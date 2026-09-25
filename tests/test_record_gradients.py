@@ -7,8 +7,8 @@ import torch
 from sdkb.agent import SDKBAgent
 from sdkb.data import make_episode
 from sdkb.key_index import PublishedKeyIndex
-from sdkb.record_gradients import (GradientSink, KeyStateCache, RecordGradients,
-                                   refresh_records, writer_backward)
+from sdkb.record_gradients import (GradientSink, KeyStateCache, KeyTable, RecordGradients,
+                                   refresh_records, writer_backward, writer_pass)
 from sdkb.spatial_data import pack_spatial_trajectory
 from sdkb.spatial_training import spatial_bank_pipeline_forward
 from sdkb.store import DiskStore, StoredRecord
@@ -164,3 +164,102 @@ def test_pipeline_sink_collects_key_state_and_payload_cotangents(tiny_config, tm
                     [grads.pop(r, 0) for r in flush])
     assert agent.write_slots.grad is not None
     assert before is None or not torch.equal(before, agent.write_slots.grad)
+
+
+def test_key_table_updates_only_touched_rows_and_round_trips():
+    ids = ['a', 'b', 'c']
+    table = KeyTable(ids, [torch.eye(3), torch.eye(3)], learning_rate=0.1)
+    table.begin_step()
+    rows = table.rows(0, ['b', 'a', 'b'])
+    (rows @ torch.tensor([0.0, 0.0, -1.0])).sum().backward()
+    before = [k.clone() for k in table.keys]
+    report = table.step(4)
+    assert report['table_records'] == 2 and report['table_rows'] == 2
+    assert torch.equal(table.keys[0][2], before[0][2]) and torch.equal(table.keys[1], before[1])
+    assert table.keys[0][0, 2] > 0 and table.keys[0][1, 2] > 0  # moved toward +z
+    assert torch.allclose(table.keys[0].norm(dim=-1), torch.ones(3))
+    assert table.updated.tolist() == [4, 4, -1] and table.counts[0].tolist() == [1, 1, 0]
+    table.pull(1, ['c'], torch.tensor([[1.0, 0.0, 0.0]]), 0.5)
+    assert torch.allclose(table.keys[1][2], torch.nn.functional.normalize(
+        torch.tensor([0.5, 0.0, 0.5]), dim=0))
+    restored = KeyTable(ids, [torch.eye(3), torch.eye(3)], learning_rate=0.1)
+    restored.load_state_dict(table.state_dict())
+    assert all(torch.equal(a, b) for a, b in zip(restored.keys, table.keys, strict=True))
+    with pytest.raises(ValueError):
+        KeyTable(['x'], [torch.eye(1)], learning_rate=0.1).load_state_dict(table.state_dict())
+
+
+def test_pipeline_reads_table_keys_and_writer_pass_trains_prediction(tiny_config, tmp_path):
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    episodes, writer_inputs, store, index, cache = _bank(agent, tmp_path)
+    ids = cache.ids
+    table = KeyTable(ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
+                     learning_rate=0.05)
+    rows = [pack_spatial_trajectory(StableChatTokenizer(), [episode], read_slots=2,
+                                    generation='g1') for episode in episodes]
+    bank = TrainingBank(store, DiskStore(tmp_path / 'cache.sqlite'), index)
+    table.begin_step()
+    sink = GradientSink(agent, cache, table)
+    result = spatial_bank_pipeline_forward(
+        agent, bank, index, copy.deepcopy(rows), limits=(2,), routing_candidates=3,
+        microbatch_size=1, inflight=2, sink=sink)
+    agent.zero_grad(set_to_none=True)
+    result.loss.backward()
+    # Terminal keys: retrieval trains table rows, never the decoder's key path.
+    assert agent.writer_key_heads[0].weight.grad is None
+    assert any(leaf.grad is not None for leaf in table.leaves.values())
+    grads = RecordGradients(0.9)
+    sink.harvest(grads, 0, 1)
+    assert not sink.state_leaves and any(grads.payload[r][0] is not None for r in grads.updated)
+    flush = sorted(grads.updated)[:2]
+    before_rows = table.keys[0].clone()
+    # Perturb the heads so predictions differ from the table and the loss is live.
+    with torch.no_grad():
+        agent.writer_key_heads[0].bias.add_(0.3)
+    report = writer_pass(agent, lambda r: writer_inputs[r], flush,
+                         [grads.pop(r, 0) for r in flush], table, bank, cache, 1,
+                         prediction_weight=1.0, commitment_weight=0.0, drift_sample=2)
+    assert report['encoded'] == 2 and report['key_prediction_cosine_mean'] < 0.999
+    assert 'value_drift_cosine_mean' in report
+    assert agent.writer_key_heads[0].weight.grad.abs().sum() > 0
+    assert torch.equal(table.keys[0], before_rows)  # commitment off: rows fixed by the pass
+    touched = dict(table.leaves)
+    stepped = table.step(1)
+    assert stepped['table_rows'] > 0
+    moved = {ids[i] for i in np.flatnonzero((table.keys[0] != before_rows).any(-1).numpy())}
+    assert moved == {r for (_, r), leaf in touched.items() if leaf.grad is not None}
+    table.sync_index(index)
+    assert np.allclose(index.spaces['s0'].keys, table.keys[0].numpy())
+    # The pass republished payloads and advanced the records' versions.
+    assert all(cache.versions[cache.position[r]] == 1 for r in flush)
+
+
+def test_writer_pass_gradient_matches_direct_objective(tiny_config, tmp_path):
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
+    ids = cache.ids[:3]
+    table = KeyTable(cache.ids, [torch.nn.functional.normalize(
+        torch.randn(len(cache.ids), index.spaces['s0'].keys.shape[1]), dim=-1)],
+        learning_rate=0.05)
+    weight = torch.randn(tiny_config.memory.payload_dims[0])
+    positions = torch.tensor([cache.position[r] for r in ids])
+
+    agent.zero_grad(set_to_none=True)
+    outputs = agent.produce_batch([writer_inputs[r] for r in ids], with_key_state=True)
+    predicted = agent.writer_space_keys(outputs[-1])[0].float()
+    loss = 2.0 * (1 - torch.nn.functional.cosine_similarity(
+        predicted, table.keys[0][positions], dim=-1)).mean()
+    payload = outputs[1].to(torch.bfloat16).float()
+    (loss + (payload @ weight).sum()).backward()
+    reference = {n: p.grad.clone() for n, p in agent.named_parameters() if p.grad is not None}
+
+    agent.zero_grad(set_to_none=True)
+    bank = TrainingBank(store, DiskStore(tmp_path / 'cache.sqlite'), index)
+    writer_pass(agent, lambda r: writer_inputs[r], ids,
+                [(None, [weight.expand(tiny_config.memory.payload_dims[0]).clone()])
+                 for _ in ids], table, bank, cache, 1, prediction_weight=2.0,
+                commitment_weight=0.0)
+    actual = {n: p.grad for n, p in agent.named_parameters() if p.grad is not None}
+    assert reference.keys() == actual.keys()
+    for name, value in reference.items():
+        assert torch.allclose(actual[name], value, atol=1e-5, rtol=1e-4), name
