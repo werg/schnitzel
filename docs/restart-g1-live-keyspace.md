@@ -247,6 +247,37 @@ full-bank refresh cadence (about 2.4 hours per 218k re-encode) or a writer
 learning rate small enough that stored keys stay within tolerance between
 refreshes. The key-stability loss is the drift gauge.
 
+#### R5b: error-driven writer learning with coherent keys (owner design, 25 September 2026)
+Owner direction: refresh through actual error flow rather than by lowering
+learning rates, and save computation by routing the writer backward
+selectively. Implemented in `src/sdkb/record_gradients.py`:
+
+1. **Key-state cache.** Each record's writer key-slot state is cached
+   (`scripts/cache_bank_key_states.py`, fp32, about 0.9 GB for 218k records).
+   Stored keys are the direct heads applied to these states. Candidate keys are
+   computed live, so the heads get exact gradients from every retrieved record.
+   After every optimizer step the whole index is recomputed, so head updates
+   never leave keys stale.
+2. **Decayed per-record gradients.** Consumer reads use leaf tensors for cached
+   states and stored payloads. Their cotangents accumulate per record, with
+   per-step decay and a last-updated step. The writer backward runs for a
+   generous close neighbourhood of each step's reads (a quarter of each read
+   limit, plus gold), using everything accumulated for those records. A small
+   extra budget flushes the largest accumulated gradients outside the
+   neighbourhood, so large signals do not just decay away.
+3. **Rolling refresh.** A forward-only rolling refresh re-encodes the stalest
+   records each step. Each refresh reports the cosine between a record's old and
+   new keys, which serves as the drift gauge.
+
+Accumulated cotangents are applied at the writer's current parameters, so older
+contributions are delayed gradients: a deliberate estimator, not the full-graph
+replay reference. With one step of cotangents the writer backward equals direct
+backpropagation (tested). Key search can run exactly on the device
+(`--device-search`, on by default with record gradients) with the same
+eligibility and scores as the NumPy reference; an ANN index is deferred until the
+bank reaches millions of records and keys change more slowly.
+Config: `configs/restart_r5b_record_gradients_spark.yaml`.
+
 #### Moving from teacher distillation to utility-driven keys (owner decision, 24 September 2026)
 Teacher distillation is a bootstrap only. The spaces the system needs will
 differ from the reference embedding spaces, so distillation is removed as early

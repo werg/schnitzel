@@ -387,7 +387,8 @@ def _consume_wave(agent: SDKBAgent, index: BatchKeyIndexBackend,
                         stored_keys[position].float()[None])[0]
                     for position, record_id in enumerate(candidate_ids)
                     if record_id in live)
-            if train.koleo_weight and any(record_id in live for record_id in candidate_ids):
+            if train.koleo_weight and (sink is not None or any(
+                    record_id in live for record_id in candidate_ids)):
                 state.koleo_terms.append(koleo_loss(keys))
             if load is not None:
                 if train.load_penalty_weight:
