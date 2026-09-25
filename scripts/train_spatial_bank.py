@@ -360,8 +360,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             bank_load.load_state_dict(torch.load(saved, weights_only=True))
 
     key_cache = record_grads = None
-    if device_search or config.train.record_gradients:
-        # Exact scan on the device; same eligibility and scores as the NumPy reference.
+    if str(config.train.device).startswith('cuda') or device_search:
+        # Exact scan on the training device: same scores, eligibility and tie
+        # order as the NumPy scan, without per-query CPU work.
         index.use_device(config.train.device)
     if config.train.record_gradients:
         from safetensors.torch import load_file as load_tensors
@@ -726,7 +727,7 @@ if __name__ == "__main__":
     parser.add_argument("--key-states", type=Path,
                         help="bank key-state cache (cache_bank_key_states.py) for record gradients")
     parser.add_argument("--device-search", action="store_true",
-                        help="exact key search on the training device")
+                        help="exact key search on the device even when training on CPU")
     args = parser.parse_args()
     print(json.dumps(train(
         args.config, args.data, args.bank, args.output, args.init_from,

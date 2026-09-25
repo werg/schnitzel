@@ -123,6 +123,14 @@ def test_device_search_matches_numpy_reference(tiny_config, tmp_path):
         assert [s.record_id for s in a.selections] == [s.record_id for s in b.selections]
         assert np.allclose([s.score for s in a.selections], [s.score for s in b.selections],
                            atol=1e-5)
+    # Exact ties resolve by record ID on both paths.
+    index.use_device(None)
+    index.spaces['s0'].keys[:] = index.spaces['s0'].keys[0]
+    tied_reference = index.search_batch(queries, **kwargs)
+    index.use_device('cpu')
+    tied_device = index.search_batch(queries, **kwargs)
+    assert ([[s.record_id for s in plan.selections] for plan in tied_reference]
+            == [[s.record_id for s in plan.selections] for plan in tied_device])
     excluded = index.search_batch(queries[:1], top_k=5, namespace='corpus', space='s0',
                                   generation='g1', domains=('research',), query_times=(10,),
                                   exclude_ids=(frozenset({reference[0].selections[0].record_id}),))

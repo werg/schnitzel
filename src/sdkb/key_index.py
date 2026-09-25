@@ -181,11 +181,13 @@ class PublishedKeyIndex:
                 array.deleted[np.isin(array.ids, tuple(record_ids))] = deleted
         self.invalidate()
 
-    def use_device(self, device: str | torch.device | None) -> None:
-        """Serve exact searches from device-resident mirrors (None: NumPy reference).
+    tie_margin = 64
 
-        Same scores and eligibility as the NumPy scan, so the selected set is
-        identical except for the order among exactly tied scores.
+    def use_device(self, device: str | torch.device | None) -> None:
+        """Serve exact searches from device-resident mirrors (None: NumPy scan).
+
+        Same scores, eligibility and tie order (score, then record ID) as the
+        NumPy scan, which remains the CPU path and the test oracle.
         """
         self._device = None if device is None else torch.device(device)
         self.invalidate()
@@ -227,14 +229,18 @@ class PublishedKeyIndex:
                 positions = np.flatnonzero(np.isin(array.ids, tuple(omitted)))
                 eligible[row, torch.from_numpy(positions).to(self._device)] = False
         scores = scores.masked_fill(~eligible, float('-inf'))
-        k = min(top_k, scores.shape[1])
+        # Take a margin beyond k, then order exactly like the reference: score
+        # descending, ties by record ID, so both paths return the same plans.
+        k = min(top_k + self.tie_margin, scores.shape[1])
         values, indices = scores.topk(k, dim=1) if k else (scores[:, :0], scores[:, :0].long())
         values, indices = values.cpu().numpy(), indices.cpu().numpy()
         results = []
         for row in range(len(domains)):
             keep = np.isfinite(values[row])
+            chosen, found = indices[row][keep], values[row][keep]
+            order = np.lexsort((array.ids[chosen], -found))[:top_k]
             results.append([(str(array.ids[i]), float(v))
-                            for i, v in zip(indices[row][keep], values[row][keep], strict=True)])
+                            for i, v in zip(chosen[order], found[order], strict=True)])
         return results
 
     def keys_for_ids(self, space: str, record_ids: Sequence[str], *, domain: str,
