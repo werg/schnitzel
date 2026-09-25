@@ -6,6 +6,10 @@
 # encodes a record (flush or refresh), and a small commitment pull keeps rows
 # predictable from content. Payload cotangents still accumulate and flush as in
 # R5b; values are republished from each encode. Launch like R5b.
+# Balance (R5d4): the most-pulled rows rotate by up to the step cap each step,
+# and each encode pulls a row by the commitment fraction toward the decoder's
+# prediction, so row/prediction divergence settles near cap / commitment. At
+# 2.9 degrees and 0.05 it reached 50-70 degrees; 1 degree and 0.25 targets ~4.
 model:
   backend: hf
   model_id: LiquidAI/LFM2.5-230M
@@ -171,4 +175,5 @@ train:
   key_table: true
   key_table_learning_rate: 0.01
   key_prediction_weight: 1.0
-  key_commitment_weight: 0.05
+  key_commitment_weight: 0.25
+  key_table_max_step: 0.0175
