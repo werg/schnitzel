@@ -17,6 +17,7 @@ from safetensors.torch import load_model
 import torch
 
 from sdkb.agent import SDKBAgent
+from sdkb.bank_curriculum import BankCurriculum
 from sdkb.bank_replay import BankWriterReplay
 from sdkb.checkpoints import (resolve_checkpoint, restore_checkpoint, save_checkpoint,
                               stop_on_signal)
@@ -73,7 +74,10 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           gold_force: tuple[float, float, int] | None = None,
           spreading: dict | None = None,
           key_states_path: Path | None = None,
-          device_search: bool = False) -> dict:
+          device_search: bool = False,
+          curriculum_sizes: tuple[int, ...] = (),
+          curriculum_min_steps: int = 300,
+          curriculum_max_steps: int = 3000) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -227,6 +231,12 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             'record_gradient_decay', 'record_neighborhood_fraction', 'record_flush_budget',
             'record_flush_extra', 'record_refresh_per_step', 'record_gradient_capacity')}
         settings['record_gradients']['key_states_sha256'] = file_sha256(key_states_path)
+    if curriculum_sizes:
+        if not config.train.key_table:
+            raise ValueError('A bank curriculum needs the key table')
+        settings['curriculum'] = {'sizes': list(curriculum_sizes),
+                                  'min_steps': curriculum_min_steps,
+                                  'max_steps': curriculum_max_steps}
         if config.train.key_table:
             settings['record_gradients']['key_table'] = {name: getattr(config.train, name)
                                                          for name in (
@@ -402,13 +412,26 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             key_table.sync_index(index)
         else:
             key_cache.sync_index(agent, index)
+    curriculum = None
+    if curriculum_sizes:
+        curriculum = BankCurriculum(
+            curriculum_sizes, [[record_id for site in data[row]['sites']
+                                for record_id in site['required_ids']]
+                               for row in range(len(data))],
+            record_ids, seed=config.train.seed, min_steps=curriculum_min_steps,
+            max_steps=curriculum_max_steps)
+        if resume and start:
+            curriculum.load_state_dict(saved['curriculum'])
+        index.restrict(curriculum.active)
 
     def save_all(step_count):
         save_checkpoint(agent, optimizer, output, step_count, rng, cache,
                         fingerprint, keep=config.train.keep_checkpoints)
         if key_cache is not None:
             torch.save({'cache': key_cache.state_dict(), 'grads': record_grads.state_dict(),
-                        **({'table': key_table.state_dict()} if key_table is not None else {})},
+                        **({'table': key_table.state_dict()} if key_table is not None else {}),
+                        **({'curriculum': curriculum.state_dict()}
+                           if curriculum is not None else {})},
                        output / f'record-state-{step_count:09d}.pt')
             for old in sorted(output.glob('record-state-*.pt'))[:-2]:
                 old.unlink()
@@ -524,7 +547,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                            force=True)
                         save_all(completed)
                     break
-                rows = [data[sampler.index(step * batch_size + offset)]
+                rows = [data[curriculum.row(step, offset, batch_size) if curriculum is not None
+                             else sampler.index(step * batch_size + offset)]
                         for offset in range(batch_size)]
                 for row in rows:
                     row['training_step'] = step
@@ -614,7 +638,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                 'stale': writer_pass(
                                     agent, lambda record_id: writer_inputs[record_id],
                                     key_cache.stalest(config.train.record_refresh_per_step,
-                                                      exclude=flush),
+                                                      exclude=flush,
+                                                      active=None if curriculum is None
+                                                      else curriculum.active),
                                     None, key_table, training_bank, key_cache, step + 1,
                                     prediction_weight=config.train.key_prediction_weight,
                                     commitment_weight=config.train.key_commitment_weight,
@@ -706,6 +732,23 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                     "bank_journal_cursor": training_bank.cursor,
                     **cache_metrics, **phase_seconds,
                 }
+                if curriculum is not None:
+                    def _mean(*names):
+                        values = [row[name] for name in names if name in row]
+                        return sum(values) / len(values) if values else None
+                    recall = result_metrics.get('learned_positive_item_recall')
+                    advanced = curriculum.observe(
+                        completed,
+                        prediction_cosine=_mean('flushed_key_prediction_cosine_mean',
+                                                'stale_key_prediction_cosine_mean'),
+                        value_cosine=_mean('flushed_value_drift_cosine_mean',
+                                           'stale_value_drift_cosine_mean'),
+                        recall=sum(recall) / len(recall) if recall else None)
+                    if advanced:
+                        index.restrict(curriculum.active)
+                        print(json.dumps({'event': 'curriculum_advance', 'step': completed,
+                                          **curriculum.report()}), flush=True)
+                    row.update(curriculum.report())
                 if torch.cuda.is_available() and str(config.train.device).startswith('cuda'):
                     row.update(
                         cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(
@@ -786,6 +829,11 @@ if __name__ == "__main__":
                         help="bank key-state cache (cache_bank_key_states.py) for record gradients")
     parser.add_argument("--device-search", action="store_true",
                         help="exact key search on the device even when training on CPU")
+    parser.add_argument("--curriculum-sizes", nargs="+", type=int,
+                        help="nested active bank sizes ending with 0 (full bank), "
+                             "e.g. 8000 16000 32000 64000 128000 0")
+    parser.add_argument("--curriculum-min-steps", type=int, default=300)
+    parser.add_argument("--curriculum-max-steps", type=int, default=3000)
     args = parser.parse_args()
     print(json.dumps(train(
         args.config, args.data, args.bank, args.output, args.init_from,
@@ -821,4 +869,7 @@ if __name__ == "__main__":
             'koleo_weight', 'load_penalty_weight', 'load_decay', 'load_threshold')},
         key_states_path=args.key_states,
         device_search=args.device_search,
+        curriculum_sizes=tuple(args.curriculum_sizes or ()),
+        curriculum_min_steps=args.curriculum_min_steps,
+        curriculum_max_steps=args.curriculum_max_steps,
     ), indent=2))

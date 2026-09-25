@@ -330,9 +330,33 @@ Gauges:
 - `*_value_drift_cosine_*`: s0 payload drift since the last publish.
 - `table_step_cosine_*`: how far touched rows move per step.
 
-Owner direction: if values drift too far on the full bank, shrink the bank. A
-smaller bank then needs ramp stages back to the target size.
-Config: `configs/restart_r5c_key_table_spark.yaml`.
+Config: `configs/restart_r5c_key_table_spark.yaml`. The first R5c launch on the
+full bank was stopped at step 4 because the owner had asked for a smaller bank.
+It had also been slowed by memory contention on the shared machine.
+
+#### R5d: stabilize the key space on a small bank, then scale up (owner decision, 25 September 2026)
+Owner direction: start with a smaller bank and smaller reads, stabilize the key
+space, then keep scaling up to the full bank. Implemented in
+`src/sdkb/bank_curriculum.py` and in `PublishedKeyIndex.restrict`:
+
+- **Read limits: 64/32/16/8** for s0–s3. Tokens per record stay [4,8,16,36],
+  so retrieval is about 256 tokens per space.
+- **Nested active banks, 8k → 16k → 32k → 64k → 128k → full (218k).**
+  - Each stage holds the gold records of a seeded prefix of trajectories
+    (about half the stage) plus a seeded random fill of other records.
+  - Training rows come only from trajectories whose gold records are all
+    active.
+  - Search, exploration proposals and the stalest-first refresh are restricted
+    to the active subset, so the refresh cycles an 8k bank in about 15 steps.
+  - The restriction is a curriculum, not an authorization boundary.
+- **Stage advance.** After at least 300 steps (`--curriculum-min-steps`), a
+  stage advances once all three hold:
+  - key-prediction cosine EMA ≥ 0.98;
+  - value-drift cosine EMA ≥ 0.99;
+  - the unassisted recall EMA moved by less than 0.01 over 100 steps.
+
+  It advances regardless at `--curriculum-max-steps` (3000). The stage and its
+  EMAs are checkpointed with the record state.
 
 #### Moving from teacher distillation to utility-driven keys (owner decision, 24 September 2026)
 Teacher distillation is a bootstrap only. The spaces the system needs will

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import torch
@@ -196,6 +196,27 @@ class PublishedKeyIndex:
         """Mark device mirrors stale after any change to the resident arrays."""
         self._mirrors = {}
 
+    def restrict(self, record_ids: Iterable[str] | None) -> None:
+        """Limit search and proposals to an active training subset (None: all).
+
+        A curriculum restriction, not an authorization boundary: eligibility by
+        domain, time and deletion still applies inside the subset.
+        """
+        self._active = None if record_ids is None else frozenset(map(str, record_ids))
+        self._active_masks = {}
+        self.invalidate()
+
+    def _active_mask(self, space: str) -> np.ndarray | None:
+        active = getattr(self, '_active', None)
+        if active is None:
+            return None
+        array = self.spaces[space]
+        masks = self.__dict__.setdefault('_active_masks', {})
+        mask = masks.get(space)
+        if mask is None or len(mask) != len(array.ids):
+            mask = masks[space] = np.isin(array.ids, np.asarray(sorted(active)))
+        return mask
+
     def _mirror(self, space: str) -> dict:
         lock = self.__dict__.setdefault('_mirror_lock', threading.Lock())
         with lock:
@@ -208,7 +229,10 @@ class PublishedKeyIndex:
                     'codes': torch.from_numpy(codes.astype(np.int64)).to(self._device),
                     'names': {name: code for code, name in enumerate(names.tolist())},
                     'times': torch.from_numpy(array.times).to(self._device),
-                    'deleted': torch.from_numpy(array.deleted.astype(bool)).to(self._device),
+                    'deleted': torch.from_numpy(array.deleted.astype(bool)
+                                                | (False if self._active_mask(space) is None
+                                                   else ~self._active_mask(space))
+                                                ).to(self._device),
                     'position': None,
                 }
                 self._mirrors[space] = mirror
@@ -264,13 +288,15 @@ class PublishedKeyIndex:
         if space not in self.spaces:
             raise ValueError('Unknown key space')
         array = self.spaces[space]
+        active = self._active_mask(space)
         result = []
         for record_id in record_ids:
             position = int(np.searchsorted(array.ids, record_id))
             if (position < len(array.ids) and array.ids[position] == record_id
                     and array.domains[position] == domain
                     and array.times[position] < query_time
-                    and not array.deleted[position]):
+                    and not array.deleted[position]
+                    and (active is None or active[position])):
                 result.append(record_id)
         return tuple(result)
 
@@ -315,6 +341,8 @@ class PublishedKeyIndex:
         for row, (domain, query_time, omitted) in enumerate(
                 zip(domains, query_times, excluded, strict=True)):
             eligible = (array.domains == domain) & (array.times < query_time) & ~array.deleted
+            if self._active_mask(space) is not None:
+                eligible &= self._active_mask(space)
             if omitted:
                 eligible &= ~np.isin(array.ids, tuple(omitted))
             indices = np.flatnonzero(eligible)

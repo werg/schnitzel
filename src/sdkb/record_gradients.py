@@ -96,7 +96,8 @@ class KeyStateCache:
         self.versions[positions] = step
         return ages
 
-    def stalest(self, count: int, exclude: Iterable[str] = ()) -> list[str]:
+    def stalest(self, count: int, exclude: Iterable[str] = (),
+                active: frozenset[str] | None = None) -> list[str]:
         if count <= 0:
             return []
         order = torch.argsort(self.versions, stable=True)
@@ -104,7 +105,7 @@ class KeyStateCache:
         chosen = []
         for position in order.tolist():
             record_id = self.ids[position]
-            if record_id not in skip:
+            if record_id not in skip and (active is None or record_id in active):
                 chosen.append(record_id)
                 if len(chosen) == count:
                     break
