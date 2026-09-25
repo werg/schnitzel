@@ -325,15 +325,17 @@ class KeyTable:
             step_vector = step_vector * (self.max_step / norms.clamp_min(self.max_step))
             new = F.normalize(old - step_vector, dim=-1)
             self.keys[space][positions] = new
-            moved.append(F.cosine_similarity(old, new, dim=-1))
+            # Angle from the chord, exact for small steps where arccos of a float32
+            # cosine rounds to zero.
+            moved.append(2 * torch.arcsin(((new - old).norm(dim=-1) / 2).clamp(max=1)))
             touched.update(r for r, _ in items)
         if touched:
             self.updated[torch.tensor([self.position[r] for r in touched])] = step
         self.leaves = {}
         if not moved:
             return {'table_rows': 0}
-        moved = torch.cat(moved)
-        degrees = torch.rad2deg(torch.arccos(moved.clamp(-1, 1).double())).float()
+        degrees = torch.rad2deg(torch.cat(moved))
+        moved = torch.cos(torch.deg2rad(degrees))
         quantiles = degrees.quantile(torch.tensor([0.5, 0.9, 0.99], device=degrees.device))
         return {'table_rows': int(moved.numel()), 'table_records': len(touched),
                 'table_step_cosine_mean': float(moved.mean()),

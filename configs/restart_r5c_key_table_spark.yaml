@@ -169,6 +169,6 @@ train:
   record_refresh_per_step: 256
   record_gradient_capacity: 16384
   key_table: true
-  key_table_learning_rate: 0.001
+  key_table_learning_rate: 0.01
   key_prediction_weight: 1.0
   key_commitment_weight: 0.05
