@@ -89,7 +89,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           archive_dir: Path | None = None,
           record_budget: dict | None = None,
           writer_batch_size: int = 16,
-          writer_checkpointing: bool = True) -> dict:
+          writer_checkpointing: bool = True,
+          curriculum_value_cosine: float = 0.99) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -332,9 +333,20 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 fingerprint_settings['record_gradients'].pop(name, None)
         settings['adjustable_origin'] = origin
         settings['schedule_changes'] = schedule_changes
+    if curriculum_sizes:
+        # A stage-advance threshold, not part of the run's identity; changes are logged.
+        prior_threshold = 0.99
+        if resume and (output / 'spatial-inputs.json').exists():
+            prior_threshold = json.loads((output / 'spatial-inputs.json').read_text()).get(
+                'curriculum_value_cosine', 0.99)
+        if prior_threshold != curriculum_value_cosine:
+            settings.setdefault('schedule_changes', []).append(
+                {'setting': 'curriculum_value_cosine', 'from': prior_threshold,
+                 'to': curriculum_value_cosine})
+        settings['curriculum_value_cosine'] = curriculum_value_cosine
     fingerprint = _fingerprint(data, bank_manifest_path, {
         key: value for key, value in fingerprint_settings.items()
-        if key not in ('adjustable_origin', 'schedule_changes')})
+        if key not in ('adjustable_origin', 'schedule_changes', 'curriculum_value_cosine')})
 
     if resume:
         if init_from is not None:
@@ -506,7 +518,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                 for record_id in site['required_ids']]
                                for row in range(len(data))],
             record_ids, seed=config.train.seed, min_steps=curriculum_min_steps,
-            max_steps=curriculum_max_steps)
+            max_steps=curriculum_max_steps, value_cosine=curriculum_value_cosine)
         if resume and start:
             curriculum.load_state_dict(saved['curriculum'])
         index.restrict(curriculum.active)
@@ -933,6 +945,8 @@ if __name__ == "__main__":
                              "e.g. 8000 16000 32000 64000 128000 0")
     parser.add_argument("--curriculum-min-steps", type=int, default=300)
     parser.add_argument("--curriculum-max-steps", type=int, default=3000)
+    parser.add_argument("--curriculum-value-cosine", type=float, default=0.99,
+                        help="value-drift EMA a stage needs before it advances")
     parser.add_argument("--record-refresh-per-step", type=int)
     parser.add_argument("--record-refresh-backward", action=argparse.BooleanOptionalAction,
                         default=None)
@@ -984,6 +998,7 @@ if __name__ == "__main__":
         curriculum_sizes=tuple(args.curriculum_sizes or ()),
         curriculum_min_steps=args.curriculum_min_steps,
         curriculum_max_steps=args.curriculum_max_steps,
+        curriculum_value_cosine=args.curriculum_value_cosine,
         payload_cache_gib=args.payload_cache_gib,
         archive_dir=args.archive_dir,
         writer_batch_size=args.writer_batch_size,
