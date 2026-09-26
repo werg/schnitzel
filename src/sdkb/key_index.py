@@ -175,11 +175,31 @@ class PublishedKeyIndex:
         self.key_bytes = sum(item.keys.nbytes for item in self.spaces.values())
         self.invalidate()
 
+    @staticmethod
+    def _positions_of(ids: np.ndarray, record_ids) -> np.ndarray:
+        """Positions of the given IDs in a sorted unique ID array (absent IDs skipped).
+
+        ``np.isin`` on object (string) arrays is quadratic-like in practice: 218k
+        IDs against a 32k active set took about nine minutes.
+        """
+        wanted = np.asarray(sorted(record_ids), dtype=object)
+        if not len(wanted) or not len(ids):
+            return np.zeros(0, dtype=np.int64)
+        positions = np.searchsorted(ids, wanted)
+        inside = positions < len(ids)
+        positions, wanted = positions[inside], wanted[inside]
+        return positions[ids[positions] == wanted]
+
+    def _membership(self, ids: np.ndarray, record_ids) -> np.ndarray:
+        mask = np.zeros(len(ids), dtype=bool)
+        mask[self._positions_of(ids, record_ids)] = True
+        return mask
+
     def set_deleted(self, record_ids: set[str], deleted: bool) -> None:
         if not record_ids:
             return
         for array in self.spaces.values():
-            array.deleted[np.isin(array.ids, tuple(record_ids))] = deleted
+            array.deleted[self._positions_of(array.ids, record_ids)] = deleted
         self.invalidate()
 
     def patch_keys(self, space: str, positions: np.ndarray, keys: np.ndarray) -> None:
@@ -249,7 +269,7 @@ class PublishedKeyIndex:
         masks = self.__dict__.setdefault('_active_masks', {})
         mask = masks.get(space)
         if mask is None or len(mask) != len(array.ids):
-            mask = masks[space] = np.isin(array.ids, np.asarray(sorted(active)))
+            mask = masks[space] = self._membership(array.ids, active)
         return mask
 
     def _mirror(self, space: str) -> dict:
@@ -285,7 +305,7 @@ class PublishedKeyIndex:
                     & (mirror['times'][None] < times[:, None]) & ~mirror['deleted'][None])
         for row, omitted in enumerate(excluded):
             if omitted:
-                positions = np.flatnonzero(np.isin(array.ids, tuple(omitted)))
+                positions = self._positions_of(array.ids, omitted)
                 eligible[row, torch.from_numpy(positions).to(self._device)] = False
         scores = scores.masked_fill(~eligible, float('-inf'))
         # Take a margin beyond k, then order exactly like the reference: score
@@ -379,7 +399,7 @@ class PublishedKeyIndex:
             if self._active_mask(space) is not None:
                 eligible &= self._active_mask(space)
             if omitted:
-                eligible &= ~np.isin(array.ids, tuple(omitted))
+                eligible &= ~self._membership(array.ids, omitted)
             indices = np.flatnonzero(eligible)
             order = np.lexsort((array.ids[indices], -scores[row, indices]))[:top_k]
             chosen = indices[order]
