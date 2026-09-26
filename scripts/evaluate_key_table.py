@@ -46,6 +46,7 @@ from functools import lru_cache
 import json
 from pathlib import Path
 import random
+import shutil
 import sqlite3
 import statistics
 import tempfile
@@ -130,10 +131,19 @@ def _memory_use(results: dict) -> dict:
     return report
 
 
-def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
+def evaluate(*args, scratch: Path | None = None, **kwargs) -> dict:
+    """Run ``_evaluate`` with a scratch journal snapshot that is always removed."""
+    workdir = Path(tempfile.mkdtemp(prefix='keytable-eval-', dir=scratch))
+    try:
+        return _evaluate(*args, workdir=workdir, **kwargs)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
              step: int | None, keys: str, limits: tuple[int, ...], sources: Path | None,
              batch_size: int = 4, max_rows: int | None = None,
-             scratch: Path | None = None, conditions: tuple[str, ...] = ('normal',),
+             workdir: Path, conditions: tuple[str, ...] = ('normal',),
              seed: int = 0) -> dict:
     if output.exists():
         raise ValueError('Evaluation output must be fresh')
@@ -155,7 +165,6 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
     bank_state = json.loads((checkpoint / 'bank-state.json').read_text())
 
     # Exact checkpoint bank: snapshot the live journal, then roll it back.
-    workdir = Path(tempfile.mkdtemp(prefix='keytable-eval-', dir=scratch))
     snapshot = workdir / 'journal.sqlite'
     with sqlite3.connect(f"file:{run / 'training_cache.sqlite'}?mode=ro", uri=True) as src, \
             sqlite3.connect(snapshot) as dst:
@@ -459,9 +468,6 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
         with (output / f'sites{suffix}.jsonl').open('w', encoding='utf-8') as handle:
             for row in rows:
                 handle.write(json.dumps(row) + '\n')
-    for path in workdir.glob('*'):
-        path.unlink()
-    workdir.rmdir()
     return result
 
 
