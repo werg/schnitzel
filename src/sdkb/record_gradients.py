@@ -628,15 +628,19 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                              .to(agent.device))
         torch.autograd.backward(targets, grads)
         states.append(key_state.detach().float())
+        # One device-to-host copy per space and batch; per-record copies each wait
+        # for the device stream, which dominated publishing on a shared GPU.
+        host_keys = [keys.float().cpu() for keys in published_keys]
+        host_payloads = [outputs[2 * space + 1].detach().to(dtype).cpu()
+                         for space in range(spaces)]
         for row, record_id in enumerate(batch):
             if record_id in old_values:
                 drift.append(F.cosine_similarity(
-                    outputs[1][row].detach().float().flatten(),
-                    old_values[record_id].to(agent.device).float().flatten(), dim=0))
+                    host_payloads[0][row].float().flatten(),
+                    old_values[record_id].float().flatten(), dim=0))
             for space in range(spaces):
                 records.append(StoredRecord(
-                    record_id, published_keys[space][row],
-                    outputs[2 * space + 1][row].to(dtype).detach(),
+                    record_id, host_keys[space][row], host_payloads[space][row],
                     namespace=bank.index.namespace, space=f's{space}',
                     generation=bank.index.generation))
     if torch.cuda.is_available() and agent.device.type == 'cuda':
