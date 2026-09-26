@@ -47,8 +47,10 @@ import json
 from pathlib import Path
 import random
 import shutil
+import signal
 import sqlite3
 import statistics
+import sys
 import tempfile
 
 import numpy as np
@@ -147,6 +149,8 @@ def _memory_use(results: dict) -> dict:
 def evaluate(*args, scratch: Path | None = None, **kwargs) -> dict:
     """Run ``_evaluate`` with a scratch journal snapshot that is always removed."""
     workdir = Path(tempfile.mkdtemp(prefix='keytable-eval-', dir=scratch))
+    # SIGTERM (kill, pkill) must also reach the cleanup below.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     try:
         return _evaluate(*args, workdir=workdir, **kwargs)
     finally:
