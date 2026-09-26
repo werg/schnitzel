@@ -18,7 +18,26 @@ Key modes:
     keep their table keys and journal payloads.
 
 Reports per-space unassisted recall and support ranks, and the answer NLL on the
-trajectories' supervised tokens.
+trajectories' supervised tokens, overall and per site (answer tokens only).
+
+Memory-use interventions (``--conditions``), all on the same rows and bank:
+
+``no_read``
+    Every read returns the reader's learned null (all gates zero).
+``zero_payload``
+    Same selections and gates; payload values zeroed.
+``shuffled_payload``
+    Same selections, keys and gates; each payload replaced by that of another
+    causally eligible record of the same domain. Isolates stored content.
+``gold_removed`` / ``random_removed``
+    Gold records are made ineligible, versus an information-matched control that
+    removes as many delivered non-gold records as gold records were delivered.
+``oracle_gold``
+    Eligible gold records are placed first in every space (an upper bound).
+
+``memory_use`` reports each condition's answer-NLL change against ``normal``,
+split by whether normal search delivered any gold record. A model that ignores
+memory shows no change under ``no_read`` or ``shuffled_payload``.
 """
 from __future__ import annotations
 
@@ -26,6 +45,7 @@ import argparse
 from functools import lru_cache
 import json
 from pathlib import Path
+import random
 import sqlite3
 import statistics
 import tempfile
@@ -60,12 +80,66 @@ def _checkpoint(run: Path, step: int | None) -> Path:
     return candidates[-1]
 
 
+CONDITIONS = ('normal', 'no_read', 'zero_payload', 'shuffled_payload', 'gold_removed',
+              'random_removed', 'oracle_gold')
+
+
+def _answer_end(row: dict, site: int) -> int:
+    """End (exclusive, label positions) of a site's answer: its write turn or the next site."""
+    call_id = row['sites'][site]['call_id']
+    for write in row.get('write_sites', ()):
+        if call_id in write['parent_read_call_ids']:
+            return write['call_position']
+    if site + 1 < len(row['sites']):
+        return row['sites'][site + 1]['query_position']
+    return len(row['input_ids'])
+
+
+def _mean_nll(rows) -> float:
+    rows = list(rows)
+    tokens = sum(r['answer_tokens'] for r in rows)
+    return sum(r['answer_nll_sum'] for r in rows) / max(tokens, 1)
+
+
+def _memory_use(results: dict) -> dict:
+    """Answer-NLL effects of the interventions, per site, relative to controls."""
+    by_site = {name: {r['call_id'] + r['episode_id']: r for r in rows}
+               for name, (rows, _, _) in results.items()}
+    base = by_site.get('normal')
+    if base is None:
+        return {}
+    report = {}
+    delivered = [key for key, row in base.items() if any(row['delivered_gold'])]
+    missed = [key for key, row in base.items() if not any(row['delivered_gold'])]
+    for name, sites in by_site.items():
+        if name == 'normal':
+            continue
+        entry = {'nll_minus_normal': _mean_nll(sites.values()) - _mean_nll(base.values())}
+        for label, keys in (('gold_delivered', delivered), ('gold_missed', missed)):
+            if keys:
+                entry[f'{label}_nll_minus_normal'] = (_mean_nll(sites[k] for k in keys)
+                                                      - _mean_nll(base[k] for k in keys))
+                entry[f'{label}_sites'] = len(keys)
+        worse = [sites[k]['answer_nll_sum'] / max(sites[k]['answer_tokens'], 1)
+                 - base[k]['answer_nll_sum'] / max(base[k]['answer_tokens'], 1) for k in base]
+        entry['fraction_sites_worse_by_0.1'] = sum(d > 0.1 for d in worse) / len(worse)
+        report[name] = entry
+    if 'gold_removed' in by_site and 'random_removed' in by_site:
+        report['gold_minus_matched_removal'] = (_mean_nll(by_site['gold_removed'].values())
+                                                - _mean_nll(by_site['random_removed'].values()))
+    return report
+
+
 def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
              step: int | None, keys: str, limits: tuple[int, ...], sources: Path | None,
              batch_size: int = 4, max_rows: int | None = None,
-             scratch: Path | None = None) -> dict:
+             scratch: Path | None = None, conditions: tuple[str, ...] = ('normal',),
+             seed: int = 0) -> dict:
     if output.exists():
         raise ValueError('Evaluation output must be fresh')
+    if (not conditions or set(conditions) - set(CONDITIONS)
+            or len(set(conditions)) != len(conditions)):
+        raise ValueError(f'Conditions must be distinct values from {CONDITIONS}')
     if keys not in {'table', 'decoder'} or (keys == 'decoder' and sources is None):
         raise ValueError('Decoder keys need the source manifest')
     checkpoint = _checkpoint(run, step)
@@ -150,11 +224,49 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
     def forbidden_writer(*_args, **_kwargs):
         raise AssertionError('Evaluation must not encode sources while reading')
     agent.produce = agent.produce_batch = forbidden_writer
-    site_rows = []
-    nll_sum, nll_tokens = 0.0, 0
 
-    for start in range(0, count, batch_size):
-        rows_batch = [data[i] for i in range(start, min(start + batch_size, count))]
+    def run_condition(condition: str) -> tuple[list[dict], float, int]:
+        site_rows: list[dict] = []
+        nll_sum, nll_tokens = 0.0, 0
+        for start in range(0, count, batch_size):
+            rows_batch = [data[i] for i in range(start, min(start + batch_size, count))]
+            nll_parts = _condition_batch(condition, rows_batch, site_rows)
+            nll_sum += nll_parts[0]
+            nll_tokens += nll_parts[1]
+        return site_rows, nll_sum, nll_tokens
+
+    def _selection(condition, item, array, field, eligible, limit, rng):
+        """Chosen record IDs for one site and space under an intervention."""
+        gold = set(item['required_ids'])
+        if condition in {'gold_removed', 'random_removed'}:
+            removed = set()
+            if condition == 'gold_removed':
+                removed = gold
+            else:
+                # Information-matched control: drop as many delivered records as
+                # gold records the unmodified search delivered, but only non-gold ones.
+                order = np.lexsort((array.ids, -field))
+                delivered = [str(array.ids[i]) for i in order[:limit] if eligible[i]]
+                hits = sum(record_id in gold for record_id in delivered)
+                others = [record_id for record_id in delivered if record_id not in gold]
+                removed = set(rng.sample(others, min(hits, len(others))))
+            if removed:
+                positions = [int(np.searchsorted(array.ids, r)) for r in removed]
+                eligible = eligible.copy()
+                eligible[positions] = False
+                field = np.where(eligible, field, -np.inf)
+        order = np.lexsort((array.ids, -field))
+        found = [str(array.ids[i]) for i in order[:limit] if eligible[i]]
+        candidates = [str(array.ids[i]) for i in order[:max(limit, 256)] if eligible[i]]
+        if condition == 'oracle_gold':
+            present = [r for r in item['required_ids']
+                       if eligible[int(np.searchsorted(array.ids, r))]]
+            found = (present + [r for r in found if r not in gold])[:limit]
+            candidates = found + [r for r in candidates if r not in set(found)]
+            candidates = candidates[:max(limit, 256)]
+        return found, candidates, eligible
+
+    def _condition_batch(condition, rows_batch, site_rows):
         for row in rows_batch:
             validate_spatial_row(row)
         maximum = max(len(row['input_ids']) for row in rows_batch)
@@ -174,49 +286,77 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
             torch.tensor([row['sites'][s]['workspace_start'] for row in rows_batch],
                          device=agent.device),
             levels[s]) for s in range(len(levels)))
+        batch_sites: dict[tuple[int, int], dict] = {}
 
         def provider(level, active, query, routing_query):
             indices = [s for s, value in enumerate(levels) if value == level]
-            metadata = [rows_batch[r]['sites'][s] for s in indices
-                        for r in range(len(rows_batch))]
+            keys_order = [(r, s) for s in indices for r in range(len(rows_batch))]
+            metadata = [rows_batch[r]['sites'][s] for r, s in keys_order]
             payloads, weights = [], []
             per_site = [{'call_id': item['call_id'], 'episode_id': item['episode_id'],
-                         'level': level, 'required_ids': item['required_ids'],
-                         'support_ranks': []} for item in metadata]
+                         'domain': item['domain'], 'level': level,
+                         'required_ids': item['required_ids'], 'support_ranks': [],
+                         'delivered_gold': []} for item in metadata]
             for space, limit in enumerate(limits):
                 name = f's{space}'
                 array = index.spaces[name]
                 address = agent.routing_address(routing_query, space)
                 q = F.normalize(address.detach().float(), dim=-1).cpu().numpy()
                 scores = q @ array.keys.T
-                chosen_plans, candidate_rows = [], []
+                chosen_plans, candidate_rows, substitute_plans = [], [], []
                 for row_index, item in enumerate(metadata):
+                    rng = random.Random(f"{seed}:{condition}:{item['call_id']}:{space}")
                     eligible = ((array.domains == item['domain'])
                                 & (array.times < item['query_time']) & ~array.deleted)
                     field = np.where(eligible, scores[row_index], -np.inf)
-                    order = np.lexsort((array.ids, -field))
-                    found = [str(array.ids[i]) for i in order[:limit] if eligible[i]]
                     ranks = []
                     for record_id in item['required_ids']:
                         at = int(np.searchsorted(array.ids, record_id))
                         ranks.append(int((field > field[at]).sum()) + 1)
                     per_site[row_index]['support_ranks'].append(ranks)
+                    found, candidates, eligible = _selection(
+                        condition, item, array, field, eligible, limit, rng)
+                    per_site[row_index]['delivered_gold'].append(
+                        sum(r in set(item['required_ids']) for r in found))
                     chosen_plans.append(ReadPlan(index.namespace, name, index.generation,
                                                  item['domain'], item['query_time'],
                                                  tuple(Selection(r, 0.0) for r in found)))
-                    candidate_rows.append([str(array.ids[i]) for i in order[:max(limit, 256)]
-                                           if eligible[i]])
-                values = bank.fetch_many(chosen_plans)
+                    candidate_rows.append(candidates)
+                    if condition == 'shuffled_payload':
+                        # Same selections, keys and gates; each payload replaced by
+                        # that of another causally eligible record of the domain.
+                        pool = np.flatnonzero(eligible)
+                        taken = set(found)
+                        substitutes = []
+                        for _ in found:
+                            while True:
+                                other = str(array.ids[pool[rng.randrange(len(pool))]])
+                                if other not in taken or len(pool) <= len(taken):
+                                    break
+                            taken.add(other)
+                            substitutes.append(other)
+                        substitute_plans.append(ReadPlan(
+                            index.namespace, name, index.generation, item['domain'],
+                            item['query_time'], tuple(Selection(r, 0.0) for r in substitutes)))
+                values = bank.fetch_many(substitute_plans or chosen_plans)
                 values = [[overlay.get((name, selection.record_id), value)
                            for selection, value in zip(plan.selections, row, strict=True)]
-                          for plan, row in zip(chosen_plans, values, strict=True)]
-                width = max(map(len, values))
+                          for plan, row in zip(substitute_plans or chosen_plans, values,
+                                               strict=True)]
+                width = max(1, max(map(len, values)))
                 device_rows, row_weights = [], []
                 for row_index, (value, candidates) in enumerate(zip(values, candidate_rows,
                                                                     strict=True)):
-                    stacked = torch.stack([v.to(agent.device, torch.float32) for v in value])
+                    if value:
+                        stacked = torch.stack([v.to(agent.device, torch.float32)
+                                               for v in value])
+                    else:
+                        stacked = torch.zeros(0, agent.config.memory.payload_dims[space],
+                                              device=agent.device)
+                    if condition == 'zero_payload':
+                        stacked = torch.zeros_like(stacked)
                     device_rows.append(F.pad(stacked, (0, 0, 0, width - stacked.shape[0])))
-                    if config.memory.distance_gating:
+                    if config.memory.distance_gating and value:
                         candidate_keys = index.keys_for_ids(
                             name, candidates, domain=metadata[row_index]['domain'],
                             query_time=metadata[row_index]['query_time']).to(agent.device)
@@ -230,18 +370,55 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
                         weight = local[0]
                     else:
                         weight = query.new_ones(len(value))
+                    if condition == 'no_read':
+                        weight = torch.zeros_like(weight)  # the reader's learned null read
                     row_weights.append(torch.cat((weight, query.new_zeros(width - len(value)))))
                 payloads.append(torch.stack(device_rows))
                 weights.append(torch.stack(row_weights))
-            site_rows.extend(per_site)
+            for key, row in zip(keys_order, per_site, strict=True):
+                batch_sites[key] = row
             return agent._read_padded_batch(payloads, weights, query)
 
         with torch.no_grad(), autocast_context(config):
             hidden = agent.spatial_recurrent_hidden(input_ids, attention, sites, provider)
             supervised = labels >= 0
             logits = agent.backbone.logits(hidden[supervised]).float()
-            nll_sum += float(F.cross_entropy(logits, labels[supervised], reduction='sum'))
-            nll_tokens += int(supervised.sum())
+            losses = F.cross_entropy(logits, labels[supervised], reduction='none')
+        positions = supervised.nonzero().cpu()
+        losses = losses.cpu()
+        for row_index, row in enumerate(rows_batch):
+            mine = positions[:, 0] == row_index
+            where, values = positions[mine, 1], losses[mine]
+            for s, site in enumerate(row['sites']):
+                end = _answer_end(row, s)
+                inside = (where >= site['workspace_start']) & (where < end)
+                record = batch_sites[(row_index, s)]
+                record['answer_nll_sum'] = float(values[inside].sum())
+                record['answer_tokens'] = int(inside.sum())
+                site_rows.append(record)
+        return float(losses.sum()), int(losses.numel())
+
+    results = {}
+    for condition in conditions:
+        site_rows, nll_sum, nll_tokens = run_condition(condition)
+        results[condition] = (site_rows, nll_sum, nll_tokens)
+    site_rows, nll_sum, nll_tokens = results[conditions[0]]
+
+    def summary(rows, total_sum, total_tokens):
+        answer_sum = sum(r['answer_nll_sum'] for r in rows)
+        answer_tokens = sum(r['answer_tokens'] for r in rows)
+        domains = {}
+        for r in rows:
+            entry = domains.setdefault(r['domain'], [0.0, 0])
+            entry[0] += r['answer_nll_sum']
+            entry[1] += r['answer_tokens']
+        return {'answer_nll': total_sum / max(total_tokens, 1),
+                'site_answer_nll': answer_sum / max(answer_tokens, 1),
+                'site_answer_tokens': answer_tokens,
+                'site_answer_nll_by_domain': {d: v[0] / max(v[1], 1)
+                                              for d, v in sorted(domains.items())},
+                'delivered_gold_any': sum(any(r['delivered_gold']) for r in rows)
+                / max(len(rows), 1)}
 
     spaces = []
     for space, limit in enumerate(limits):
@@ -259,7 +436,7 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
     result = {
         'protocol': ('Unassisted packed memory.search over the full bank at the checkpoint '
                      'journal cursor; exact eligible ranks; no supplied supports; '
-                     f'keys={keys}.'),
+                     f'keys={keys}. Recall and ranks are from the first condition.'),
         'run': str(run), 'checkpoint': checkpoint.name, 'step': step,
         'model_sha256': file_sha256(checkpoint / 'model.safetensors'),
         'bank_cursor': bank_state['cursor'], 'data': str(data_path),
@@ -267,16 +444,21 @@ def evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
         'gold_records': len(gold), 'limits': list(limits), 'keys': keys,
         'spaces': spaces, 'union_any_support_recall': union,
         'answer_nll': nll_sum / max(nll_tokens, 1), 'answer_tokens': nll_tokens,
+        'conditions': {name: summary(*value) for name, value in results.items()},
     }
+    if len(results) > 1:
+        result['memory_use'] = _memory_use(results)
     if agreement:
         agreement = torch.cat(agreement)
         result['decoder_table_key_cosine'] = {'mean': float(agreement.mean()),
                                               'min': float(agreement.min())}
     output.mkdir(parents=True)
     atomic_json(output / 'eval.json', result)
-    with (output / 'sites.jsonl').open('w', encoding='utf-8') as handle:
-        for row in site_rows:
-            handle.write(json.dumps(row) + '\n')
+    for name, (rows, _, _) in results.items():
+        suffix = '' if name == conditions[0] else f'-{name}'
+        with (output / f'sites{suffix}.jsonl').open('w', encoding='utf-8') as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + '\n')
     for path in workdir.glob('*'):
         path.unlink()
     workdir.rmdir()
@@ -296,8 +478,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--max-rows', type=int)
     parser.add_argument('--scratch', type=Path)
+    parser.add_argument('--conditions', nargs='+', default=['normal'], choices=CONDITIONS,
+                        help='interventions; the first is the reference for recall and sites.jsonl')
+    parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
     print(json.dumps(evaluate(args.run, args.bank, args.data, args.output, step=args.step,
                               keys=args.keys, limits=tuple(args.limits),
                               sources=args.sources, batch_size=args.batch_size,
-                              max_rows=args.max_rows, scratch=args.scratch), indent=2))
+                              max_rows=args.max_rows, scratch=args.scratch,
+                              conditions=tuple(args.conditions), seed=args.seed), indent=2))
