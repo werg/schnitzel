@@ -85,6 +85,19 @@ CONDITIONS = ('normal', 'no_read', 'zero_payload', 'shuffled_payload', 'gold_rem
               'random_removed', 'oracle_gold')
 
 
+def _answer_positions(where: torch.Tensor, start: int, end: int) -> torch.Tensor:
+    """Mask of a site's answer label positions: the first contiguous supervised run
+    after its read workspace. Later supervised tokens (the memory.write turn, which
+    repeats the query and answer) are excluded."""
+    inside = (where >= start) & (where < end)
+    positions = where[inside]
+    if len(positions) == 0:
+        return inside
+    breaks = (positions[1:] - positions[:-1] != 1).nonzero()
+    last = positions[int(breaks[0])] if len(breaks) else positions[-1]
+    return inside & (where <= last)
+
+
 def _answer_end(row: dict, site: int) -> int:
     """End (exclusive, label positions) of a site's answer: its write turn or the next site."""
     call_id = row['sites'][site]['call_id']
@@ -399,8 +412,7 @@ def _evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
             mine = positions[:, 0] == row_index
             where, values = positions[mine, 1], losses[mine]
             for s, site in enumerate(row['sites']):
-                end = _answer_end(row, s)
-                inside = (where >= site['workspace_start']) & (where < end)
+                inside = _answer_positions(where, site['workspace_start'], _answer_end(row, s))
                 record = batch_sites[(row_index, s)]
                 record['answer_nll_sum'] = float(values[inside].sum())
                 record['answer_tokens'] = int(inside.sum())
