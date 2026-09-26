@@ -356,3 +356,37 @@ def test_training_bank_finiteness_check_matches_torch():
         broken = values.clone()
         broken[7] = bad
         assert not TrainingBank._finite(broken) and not TrainingBank._finite(broken.float())
+
+
+def test_vectorized_stalest_matches_reference_order():
+    ids = [f'r{i:03d}' for i in range(200)]
+    cache = KeyStateCache(ids, torch.zeros(200, 2), torch.randint(0, 5, (200,)))
+    active = frozenset(ids[::3])
+    exclude = set(ids[:30])
+    reference = [ids[i] for i in torch.argsort(cache.versions, stable=True).tolist()
+                 if ids[i] not in exclude and ids[i] in active][:17]
+    assert cache.stalest(17, exclude=exclude, active=active) == reference
+    assert cache.stalest(5) == [ids[i] for i in torch.argsort(cache.versions,
+                                                              stable=True)[:5].tolist()]
+
+
+def test_writer_pass_without_recompute_matches_gradients(tiny_config, tmp_path):
+    tiny_config.model.gradient_checkpointing = True
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent.train()
+    _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
+    table = KeyTable(cache.ids, [torch.nn.functional.normalize(
+        torch.randn(len(cache.ids), index.spaces['s0'].keys.shape[1]), dim=-1)],
+        learning_rate=0.05)
+    bank = TrainingBank(store, DiskStore(tmp_path / 'cache.sqlite'), index)
+    grads = []
+    for checkpointing in (True, False):
+        agent.zero_grad(set_to_none=True)
+        writer_pass(agent, lambda r: writer_inputs[r], cache.ids[:3], None, table, bank, cache,
+                    1, prediction_weight=1.0, commitment_weight=0.0, batch_size=2,
+                    checkpointing=checkpointing)
+        grads.append({n: p.grad.clone() for n, p in agent.named_parameters()
+                      if p.grad is not None})
+    assert grads[0].keys() == grads[1].keys()
+    for name in grads[0]:
+        assert torch.allclose(grads[0][name], grads[1][name], atol=1e-5, rtol=1e-4), name

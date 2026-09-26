@@ -87,7 +87,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           curriculum_max_steps: int = 3000,
           payload_cache_gib: float = 0.0,
           archive_dir: Path | None = None,
-          record_budget: dict | None = None) -> dict:
+          record_budget: dict | None = None,
+          writer_batch_size: int = 16,
+          writer_checkpointing: bool = True) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -556,13 +558,13 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                     raise ValueError('Episode query identity changed')
                 queries[episode_id] = episode['query']
 
-    @lru_cache(maxsize=256)
+    @lru_cache(maxsize=16384)
     def ingestion_prefixes(document_id, parts, mode, domain):
         return grouped_ingestion_prefixes(
             document_id, parts, generation=writer_prompt_generation(bank_manifest),
             scope={'domain': domain}, mode=mode)
 
-    @lru_cache(maxsize=2048)
+    @lru_cache(maxsize=65536)
     def writer_tokens(record_id):
         row = source_rows[record_id]
         document_id, parts, mode = source_groups[record_id]
@@ -721,7 +723,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                     flush, cotangents, key_table, training_bank, key_cache,
                                     step + 1, prediction_weight=config.train.key_prediction_weight,
                                     commitment_weight=config.train.key_commitment_weight,
-                                    drift_sample=16),
+                                    drift_sample=16, batch_size=writer_batch_size,
+                                    checkpointing=writer_checkpointing),
                                 'stale': writer_pass(
                                     agent, lambda record_id: writer_inputs[record_id],
                                     key_cache.stalest(config.train.record_refresh_per_step,
@@ -731,7 +734,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                     None, key_table, training_bank, key_cache, step + 1,
                                     prediction_weight=config.train.key_prediction_weight,
                                     commitment_weight=config.train.key_commitment_weight,
-                                    drift_sample=16,
+                                    drift_sample=16, batch_size=writer_batch_size,
+                                    checkpointing=writer_checkpointing,
                                     backward=config.train.record_refresh_backward)}
                     record_metrics = {'record_harvested': harvested,
                                       'record_neighborhood': len(set(sink.neighborhood)),
@@ -934,6 +938,10 @@ if __name__ == "__main__":
                         default=None)
     parser.add_argument("--record-flush-budget", type=int)
     parser.add_argument("--record-flush-extra", type=int)
+    parser.add_argument("--writer-batch-size", type=int, default=16)
+    parser.add_argument("--writer-checkpointing", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="recompute writer activations in the record-gradient backward")
     parser.add_argument("--archive-dir", type=Path,
                         help="copy completed checkpoints here in the background")
     parser.add_argument("--payload-cache-gib", type=float, default=0.0,
@@ -978,6 +986,8 @@ if __name__ == "__main__":
         curriculum_max_steps=args.curriculum_max_steps,
         payload_cache_gib=args.payload_cache_gib,
         archive_dir=args.archive_dir,
+        writer_batch_size=args.writer_batch_size,
+        writer_checkpointing=args.writer_checkpointing,
         record_budget={name: getattr(args, name) for name in (
             'record_refresh_per_step', 'record_refresh_backward', 'record_flush_budget',
             'record_flush_extra')},

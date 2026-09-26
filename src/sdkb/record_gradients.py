@@ -101,16 +101,20 @@ class KeyStateCache:
                 active: frozenset[str] | None = None) -> list[str]:
         if count <= 0:
             return []
-        order = torch.argsort(self.versions, stable=True)
-        skip = set(exclude)
-        chosen = []
-        for position in order.tolist():
-            record_id = self.ids[position]
-            if record_id not in skip and (active is None or record_id in active):
-                chosen.append(record_id)
-                if len(chosen) == count:
-                    break
-        return chosen
+        eligible = torch.ones(len(self.ids), dtype=torch.bool)
+        if active is not None:
+            if getattr(self, '_active_key', None) is not active:
+                self._active_mask = torch.zeros(len(self.ids), dtype=torch.bool)
+                self._active_mask[self.positions(sorted(active))] = True
+                self._active_key = active
+            eligible &= self._active_mask
+        skip = [record_id for record_id in exclude if record_id in self.position]
+        if skip:
+            eligible[self.positions(skip)] = False
+        positions = eligible.nonzero().squeeze(1)
+        # Oldest first; ties keep index (record-ID) order, as the stable sort did.
+        order = torch.argsort(self.versions[positions], stable=True)[:count]
+        return [self.ids[i] for i in positions[order].tolist()]
 
     def state_dict(self) -> dict:
         return {'ids_sha256': self.ids_digest(), 'states': self.states.cpu(),
@@ -568,7 +572,8 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                 cotangents: Sequence[tuple[Tensor | None, list[Tensor | None]]] | None,
                 table: KeyTable, bank, cache: KeyStateCache, step: int, *,
                 prediction_weight: float, commitment_weight: float, batch_size: int = 16,
-                drift_sample: int = 0, backward: bool = True) -> dict[str, float | int]:
+                drift_sample: int = 0, backward: bool = True,
+                checkpointing: bool = True) -> dict[str, float | int]:
     """Encode records with gradient: key prediction, payload cotangents, publish.
 
     For each record the decoder's predicted keys regress onto the (fixed) table
@@ -576,7 +581,9 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
     Accumulated payload cotangents, when given, flow into the writer in the same
     backward. With ``backward=False`` (a refresh without cotangents) the pass is
     forward-only: it republishes payloads and applies the commitment pull, and
-    reports key-prediction agreement without training it. The encoded payloads are then published with the table keys, so a
+    reports key-prediction agreement without training it. ``checkpointing=False``
+    retains writer activations instead of recomputing them in backward (short
+    source documents fit easily). The encoded payloads are then published with the table keys, so a
     flush and a refresh share one forward. Parameter gradients accumulate for the
     caller's optimizer step; table-row gradients for ``table.step``.
     """
@@ -587,6 +594,7 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
         raise ValueError('A forward-only writer pass cannot apply cotangents')
     spaces = len(agent.config.memory.payload_dims)
     dtype = getattr(torch, agent.config.memory.storage_dtype)
+    from .bank_replay import _checkpointing
     grad_mode = torch.enable_grad() if backward else torch.no_grad()
     order = sorted(range(len(record_ids)),
                    key=lambda i: writer_inputs(record_ids[i]).shape[1])
@@ -603,7 +611,7 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
     records, states, cosines, drift = [], [], [], []
     for start in range(0, len(ordered), batch_size):
         batch = ordered[start:start + batch_size]
-        with grad_mode:
+        with grad_mode, _checkpointing(agent, enabled=checkpointing):
             outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
                                           with_key_state=True)
             key_state = outputs[-1]
