@@ -77,7 +77,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           device_search: bool = False,
           curriculum_sizes: tuple[int, ...] = (),
           curriculum_min_steps: int = 300,
-          curriculum_max_steps: int = 3000) -> dict:
+          curriculum_max_steps: int = 3000,
+          payload_cache_gib: float = 0.0) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -369,6 +370,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         spaces=tuple(bank_manifest["spaces"]), expected_sources=bank_manifest["sources"],
     )
     training_bank = TrainingBank(store, cache, index)
+    if payload_cache_gib > 0:
+        # Hot payloads stay in host memory; bank reads otherwise hit disk randomly.
+        training_bank.enable_payload_cache(int(payload_cache_gib * 1024 ** 3))
     bank_load = None
     if config.train.exploration_fraction or config.train.load_penalty_weight:
         bank_load = BankLoad(next(iter(index.spaces.values())).ids, len(limits),
@@ -741,6 +745,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                        if bank_load is not None else {}),
                     "bank_active_views": training_bank.sizes()['views'],
                     "bank_journal_cursor": training_bank.cursor,
+                    "payload_cache_hits": training_bank.payload_cache_hits,
+                    "payload_cache_misses": training_bank.payload_cache_misses,
                     **cache_metrics, **phase_seconds,
                 }
                 if curriculum is not None:
@@ -847,6 +853,8 @@ if __name__ == "__main__":
                              "e.g. 8000 16000 32000 64000 128000 0")
     parser.add_argument("--curriculum-min-steps", type=int, default=300)
     parser.add_argument("--curriculum-max-steps", type=int, default=3000)
+    parser.add_argument("--payload-cache-gib", type=float, default=0.0,
+                        help="host-memory cache for bank payloads (write-through LRU)")
     args = parser.parse_args()
     print(json.dumps(train(
         args.config, args.data, args.bank, args.output, args.init_from,
@@ -885,4 +893,5 @@ if __name__ == "__main__":
         curriculum_sizes=tuple(args.curriculum_sizes or ()),
         curriculum_min_steps=args.curriculum_min_steps,
         curriculum_max_steps=args.curriculum_max_steps,
+        payload_cache_gib=args.payload_cache_gib,
     ), indent=2))

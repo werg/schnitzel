@@ -6,9 +6,11 @@ stored tensors only; source trajectories are used solely by explicit writer jobs
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 import hashlib
 import json
+import threading
 import time
 import uuid
 
@@ -29,9 +31,64 @@ class TrainingBank:
                  index: PublishedKeyIndex) -> None:
         self.base, self.cache, self.index = base, journal, index
         self._spaces = tuple(index.spaces)
+        # Optional write-through payload cache (``enable_payload_cache``).
+        self._payloads: OrderedDict[tuple[str, str], tuple[int, torch.Tensor]] = OrderedDict()
+        self._payload_bytes = 0
+        self._payload_limit = 0
+        self._payload_lock = threading.Lock()
+        self.payload_cache_hits = self.payload_cache_misses = 0
         self._ensure_schema()
         self._migrate_overlay()
         self._reload_index()
+
+    def enable_payload_cache(self, max_bytes: int) -> None:
+        """Keep recently read or published payloads in host memory (LRU, byte cap).
+
+        Every publish writes through, so a cached entry is always its record's
+        newest revision; it serves any read whose snapshot cursor is at or after
+        the entry's revision. Rollback clears the cache. Reads still check the
+        record's authorization scope against the index.
+        """
+        with self._payload_lock:
+            self._payload_limit = max(0, int(max_bytes))
+            self._evict_payloads()
+
+    def _evict_payloads(self) -> None:
+        while self._payload_bytes > self._payload_limit and self._payloads:
+            _, (_, value) = self._payloads.popitem(last=False)
+            self._payload_bytes -= value.numel() * value.element_size()
+
+    def _remember_payload(self, space: str, record_id: str, cursor: int,
+                          value: torch.Tensor) -> None:
+        if not self._payload_limit:
+            return
+        value = value.detach().cpu()
+        with self._payload_lock:
+            old = self._payloads.pop((space, record_id), None)
+            if old is not None:
+                if old[0] > cursor:
+                    self._payloads[(space, record_id)] = old
+                    return
+                self._payload_bytes -= old[1].numel() * old[1].element_size()
+            self._payloads[(space, record_id)] = (cursor, value)
+            self._payload_bytes += value.numel() * value.element_size()
+            self._evict_payloads()
+
+    def _cached_payload(self, space: str, record_id: str, cursor: int) -> torch.Tensor | None:
+        with self._payload_lock:
+            entry = self._payloads.get((space, record_id))
+            if entry is None or entry[0] > cursor:
+                return None
+            self._payloads.move_to_end((space, record_id))
+            return entry[1]
+
+    def _authorized(self, plan: ReadPlan, record_id: str) -> bool:
+        array = self.index.spaces[plan.space]
+        position = int(np.searchsorted(array.ids, record_id))
+        return (position < len(array.ids) and array.ids[position] == record_id
+                and array.domains[position] == plan.domain
+                and array.times[position] < plan.query_time
+                and not array.deleted[position])
 
     @staticmethod
     def _tables(db) -> set[str]:
@@ -474,6 +531,9 @@ class TrainingBank:
             self.index.upsert(space, record_id, key, key_dim, domain=domain,
                               created_at=created_at, source_id=_source_id, deleted=False)
         self.index.set_deleted(set(invalidated), True)
+        if self._payload_limit:
+            for record in rows:
+                self._remember_payload(record.space, record.record_id, cursor, record.payload)
         self.index.bank_cursor = cursor
         return len(encoded)
 
@@ -492,15 +552,28 @@ class TrainingBank:
             if (cursor != 0 and cursor < floor) or cursor > current:
                 raise ValueError('Read plan names an unavailable mutable-bank cursor')
             invalidated = self._invalidated(db, cursor)
+            authorized = {(plan.space, selection.record_id): plan
+                          for plan in plans for selection in plan.selections}
             for space, record_id in requested:
                 if record_id in invalidated:
                     raise KeyError(f'Invalidated compact record: {record_id}')
-                row = db.execute('''SELECT payload FROM mutable_bank_revisions
+                cached = (self._cached_payload(space, record_id, cursor)
+                          if self._payload_limit else None)
+                if cached is not None and self._authorized(
+                        authorized[(space, record_id)], record_id):
+                    overlay[(space, record_id)] = cached
+                    self.payload_cache_hits += 1
+                    continue
+                self.payload_cache_misses += 1
+                row = db.execute('''SELECT payload,cursor FROM mutable_bank_revisions
                     WHERE namespace=? AND record_id=? AND space=? AND cursor<=?
                     ORDER BY cursor DESC LIMIT 1''',
                     (self.index.namespace, record_id, space, cursor)).fetchone()
                 if row is not None:
                     overlay[(space, record_id)] = load(row[0])['payload']
+                    if cursor == current:
+                        self._remember_payload(space, record_id, int(row[1]),
+                                               overlay[(space, record_id)])
 
         result = []
         for plan in plans:
@@ -511,6 +584,11 @@ class TrainingBank:
                 plan.query_time, missing, plan.bank_cursor)) if missing else []
             fallback = {selection.record_id: value
                         for selection, value in zip(missing, base_values, strict=True)}
+            if cursor == current:
+                # No journal revision exists at or before the newest cursor, so the
+                # base payload is the record's newest revision.
+                for record_id, value in fallback.items():
+                    self._remember_payload(plan.space, record_id, 0, value)
             values = [overlay.get((plan.space, selection.record_id),
                                   fallback.get(selection.record_id))
                       for selection in plan.selections]
@@ -642,6 +720,9 @@ class TrainingBank:
             if (cursor != 0 and cursor < floor) or cursor > current:
                 raise ValueError('Mutable-bank cursor is outside retained journal history')
             db.execute('DELETE FROM mutable_bank_revisions WHERE cursor>?', (cursor,))
+            with self._payload_lock:
+                self._payloads.clear()
+                self._payload_bytes = 0
             DiskStore._rollback_mutable_events(db, cursor)
             db.execute('DELETE FROM mutable_bank_commits WHERE cursor>?', (cursor,))
             db.execute('DELETE FROM mutable_bank_status WHERE cursor>?', (cursor,))

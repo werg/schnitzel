@@ -315,3 +315,34 @@ def test_legacy_checkpoint_reuses_and_rolls_back_completed_migration(tiny_config
     assert bank.cursor == 2
     assert restore_checkpoint(agent, optimizer, run, random.Random(3), 'data') == 4
     assert cache.mutable_bank_state()['cursor'] == migrated_cursor
+
+
+def test_payload_cache_serves_newest_revisions_under_snapshot_and_scope(tmp_path):
+    base = DiskStore(tmp_path / 'base.sqlite')
+    for record_id in ('a', 'b'):
+        base.put(StoredRecord(record_id, torch.tensor([1., 0.]), torch.tensor([1., 2.]),
+                              namespace='corpus', space='s0', generation='g', created_at=1))
+    index = PublishedKeyIndex(base, namespace='corpus', generation='g', spaces=('s0',),
+                              expected_sources=2)
+    bank = TrainingBank(base, DiskStore(tmp_path / 'cache.sqlite'), index)
+    bank.enable_payload_cache(1 << 20)
+    plan = ReadPlan('corpus', 's0', 'g', 'research', 2, (Selection('a', 0.), Selection('b', 0.)))
+    first = bank.fetch_many((plan,))[0]  # base payloads, now cached
+    bank.update([StoredRecord('a', torch.tensor([0., 1.]), torch.tensor([7., 8.]), space='s0')])
+    misses = bank.payload_cache_misses
+    values = bank.fetch_many((plan,))[0]
+    assert bank.payload_cache_misses == misses  # both served from memory
+    torch.testing.assert_close(values[0], torch.tensor([7., 8.]))
+    torch.testing.assert_close(values[1], first[1])
+    # An older snapshot never sees the newer cached revision.
+    old = ReadPlan('corpus', 's0', 'g', 'research', 2, (Selection('a', 0.),), bank_cursor=0)
+    torch.testing.assert_close(bank.fetch_many((old,))[0][0], torch.tensor([1., 2.]))
+    # Cached payloads still respect the record's authorization scope.
+    with pytest.raises(KeyError):
+        bank.fetch_many((ReadPlan('corpus', 's0', 'g', 'other', 2, (Selection('b', 0.),)),))
+    with pytest.raises(KeyError):
+        bank.fetch_many((ReadPlan('corpus', 's0', 'g', 'research', 1, (Selection('b', 0.),)),))
+    bank.rollback(0)
+    torch.testing.assert_close(bank.fetch_many((plan,))[0][0], torch.tensor([1., 2.]))
+    bank.enable_payload_cache(8)  # evicts down to the byte cap
+    assert bank._payload_bytes <= 8
