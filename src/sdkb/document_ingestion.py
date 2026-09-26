@@ -143,15 +143,19 @@ def source_ingestion_groups(rows: list[dict], *, maximum_parts: int = 4) -> dict
     """Assign source rows to stable bounded article groups and presentation modes."""
     if maximum_parts < 1 or maximum_parts > 8:
         raise ValueError('Source ingestion groups support 1..8 parts')
-    articles: dict[str, list[dict]] = {}
+    # Only passages created at the same time share a group: holistic mode shows
+    # every part while encoding each one, which would leak later passages into
+    # the payloads of earlier ones. Time-1 groups keep their original identities.
+    articles: dict[tuple[str, int], list[dict]] = {}
     for row in rows:
         title = row.get('provenance', {}).get('article_title') or row['record_id']
-        articles.setdefault(str(title), []).append(row)
+        articles.setdefault((str(title), int(row.get('created_at', 1))), []).append(row)
     result = {}
-    for title, article_rows in articles.items():
+    for (title, created_at), article_rows in articles.items():
+        label = title if created_at == 1 else f'{title}@{created_at}'
         for start in range(0, len(article_rows), maximum_parts):
             group = article_rows[start:start + maximum_parts]
-            document_id = f'{title}#{start // maximum_parts}'
+            document_id = f'{label}#{start // maximum_parts}'
             mode = ('holistic' if int(hashlib.sha256(document_id.encode()).hexdigest(), 16) % 2
                     else 'streaming')
             parts = tuple((row['record_id'], row['text']) for row in group)

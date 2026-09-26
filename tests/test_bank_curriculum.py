@@ -101,3 +101,16 @@ def test_index_eligible_mask_matches_eligible_ids(tiny_config, tmp_path):
         index.eligible_ids('s0', cache.ids, domain='research', query_time=10))
     index.restrict(None)
     assert index.eligible_mask('s0', domain='research', query_time=10).sum() > mask.sum()
+
+
+def test_index_eligible_mask_cache_is_bounded_and_correct(tiny_config, tmp_path, monkeypatch):
+    import sdkb.key_index as key_index
+    monkeypatch.setattr(key_index, 'ELIGIBLE_CACHE_ENTRIES', 2)
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    _, _, _, index, _ = _bank(agent, tmp_path, count=4)
+    first = index.eligible_mask('s0', domain='research', query_time=10).copy()
+    for query_time in (0, 5, 10, 20, 1):
+        index.eligible_mask('s0', domain='research', query_time=query_time)
+    assert len(index._eligible) == 2
+    assert (index.eligible_mask('s0', domain='research', query_time=10) == first).all()
+    assert not index.eligible_mask('s0', domain='research', query_time=0).any()

@@ -189,6 +189,24 @@ def test_key_table_updates_only_touched_rows_and_round_trips():
         KeyTable(['x'], [torch.eye(1)], learning_rate=0.1).load_state_dict(table.state_dict())
 
 
+def test_key_table_adopts_shared_rows_from_a_parent_bank():
+    parent = KeyTable(['a', 'b', 'c'], [torch.eye(3)], learning_rate=0.1)
+    parent.begin_step()
+    (parent.rows(0, ['b']) @ torch.tensor([0.0, 0.0, -1.0])).sum().backward()
+    parent.step(7)
+    child_keys = torch.nn.functional.normalize(torch.ones(4, 3), dim=-1)
+    child = KeyTable(['b', 'c', 'd', 'e'], [child_keys.clone()], learning_rate=0.1)
+    assert child.adopt(parent.state_dict(), ['a', 'b', 'c']) == 2
+    assert torch.equal(child.keys[0][0], parent.keys[0][1])
+    assert torch.equal(child.keys[0][1], parent.keys[0][2])
+    assert torch.allclose(child.keys[0][2:], child_keys[2:])
+    assert child.updated.tolist() == [7, -1, -1, -1]
+    assert child.counts[0].tolist() == [1, 0, 0, 0]
+    assert child.space_steps == parent.space_steps and child.dirty is None
+    with pytest.raises(ValueError):
+        child.adopt(parent.state_dict(), ['a', 'c', 'b'])
+
+
 def test_pipeline_reads_table_keys_and_writer_pass_trains_prediction(tiny_config, tmp_path):
     agent = SDKBAgent(_direct_agent(tiny_config))
     episodes, writer_inputs, store, index, cache = _bank(agent, tmp_path)

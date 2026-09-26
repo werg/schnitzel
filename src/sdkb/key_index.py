@@ -27,6 +27,9 @@ class _Space:
     deleted: np.ndarray
 
 
+ELIGIBLE_CACHE_ENTRIES = 256
+
+
 class PublishedKeyIndex:
     """Load complete raw keys once; search with the SQLite reference semantics."""
 
@@ -249,6 +252,11 @@ class PublishedKeyIndex:
             if active is not None:
                 mask &= active
             cache[key] = mask
+            # Dated corpora have many query times; keep the most recent masks only.
+            while len(cache) > ELIGIBLE_CACHE_ENTRIES:
+                cache.pop(next(iter(cache)))
+        else:
+            cache[key] = cache.pop(key)
         return mask
 
     def restrict(self, record_ids: Iterable[str] | None) -> None:

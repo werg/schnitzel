@@ -67,3 +67,14 @@ def test_grouped_sources_support_true_holistic_and_streaming_multiwrite_prefixes
     groups = source_ingestion_groups(rows, maximum_parts=4)
     assert groups['r0'][1] == tuple((f'r{i}', f'part {i}') for i in range(4))
     assert groups['r4'][1] == (('r4', 'part 4'),)
+
+
+def test_source_groups_never_mix_creation_times():
+    rows = [{'record_id': f'r{i}', 'text': f'line {i}', 'created_at': 1 + i,
+             'provenance': {'article_title': 'story'}} for i in range(3)]
+    rows.append({'record_id': 'r9', 'text': 'same time', 'created_at': 2,
+                 'provenance': {'article_title': 'story'}})
+    groups = source_ingestion_groups(rows, maximum_parts=4)
+    assert groups['r0'][1] == (('r0', 'line 0'),) and groups['r0'][0] == 'story#0'
+    assert groups['r1'][1] == (('r1', 'line 1'), ('r9', 'same time'))
+    assert groups['r1'][0] == 'story@2#0' and groups['r2'][0] == 'story@3#0'

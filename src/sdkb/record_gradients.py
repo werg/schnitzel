@@ -424,6 +424,42 @@ class KeyTable:
         self.space_steps = list(state.get('space_steps', [0] * len(self.keys)))
         self.dirty = None
 
+    def adopt(self, state: dict, parent_ids: Sequence[str]) -> int:
+        """Warm-start shared rows from a parent table over another bank.
+
+        ``parent_ids`` is the parent bank's record order, checked against the
+        state's digest. Keys, moments and touch counts of records present in both
+        banks are copied; the rest keep their published keys. Returns the count.
+        """
+        parent_ids = [str(record_id) for record_id in parent_ids]
+        if hashlib.sha256('\n'.join(parent_ids).encode()).hexdigest() != state['ids_sha256']:
+            raise ValueError('Parent record order does not match the parent key table')
+        if state.get('optimizer', 'adam') != self.optimizer or len(state['keys']) != len(self.keys):
+            raise ValueError('Parent key table optimizer or spaces differ')
+        pairs = [(i, self.position[record_id]) for i, record_id in enumerate(parent_ids)
+                 if record_id in self.position]
+        if not pairs:
+            return 0
+        device = self.keys[0].device
+        source = torch.tensor([i for i, _ in pairs], dtype=torch.long)
+        target = torch.tensor([j for _, j in pairs], dtype=torch.long, device=device)
+        for space in range(len(self.keys)):
+            if state['keys'][space].shape[1] != self.keys[space].shape[1]:
+                raise ValueError('Parent key width differs')
+            self.keys[space][target] = state['keys'][space][source].to(device)
+            self.exp_avg[space][target] = state['exp_avg'][space][source].to(device)
+            if self.optimizer == 'adam':
+                self.exp_avg_sq[space][target] = state['exp_avg_sq'][space][source].to(device)
+        if self.optimizer != 'adam':
+            # One second moment per space: keep the parent's scale.
+            self.exp_avg_sq = [v.to(device).clone() for v in state['exp_avg_sq']]
+        self.space_steps = list(state.get('space_steps', self.space_steps))
+        self.counts[:, target.to(self.counts.device)] = state['counts'][:, source].to(
+            self.counts.device)
+        self.updated[target.cpu()] = state['updated'][source]
+        self.dirty = None
+        return len(pairs)
+
 
 class GradientSink:
     """Leaf tensors for one step's consumer reads, harvested after backward."""

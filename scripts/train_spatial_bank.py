@@ -50,6 +50,19 @@ ADJUSTABLE = ('record_refresh_per_step', 'record_refresh_backward', 'record_flus
 LEGACY_DEFAULTS = {'record_refresh_backward': True}
 
 
+def _bank_record_ids(bank_dir: Path) -> list[str]:
+    """Record IDs of a published bank in index (record-ID) order."""
+    manifest = json.loads((bank_dir / "manifest.json").read_text())
+    with sqlite3.connect(f"file:{bank_dir / 'bank.sqlite'}?mode=ro", uri=True) as db:
+        ids = [row[0] for row in db.execute(
+            "SELECT record_id FROM records WHERE namespace=? AND generation=? AND space=? "
+            "ORDER BY record_id", (manifest["namespace"], manifest["generation"],
+                                   manifest["spaces"][0]))]
+    if len(ids) != manifest["sources"]:
+        raise ValueError("Published bank record count differs from its manifest")
+    return ids
+
+
 def _fingerprint(data: SpatialTrajectoryIndex, manifest_path: Path, settings: dict) -> str:
     payload = ":".join((data.sha256, file_sha256(manifest_path), canonical_json(settings)))
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -57,6 +70,7 @@ def _fingerprint(data: SpatialTrajectoryIndex, manifest_path: Path, settings: di
 
 def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           init_from: Path | None, *, resume: bool, steps: int, batch_size: int,
+          adopt_key_table: bool = False,
           loops: int, limits: tuple[int, ...], routing_candidates: int,
           checkpoint_every: int, train_recurrent_core: bool = False,
           microbatch_size: int | None = None, inflight: int = 1,
@@ -97,6 +111,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             or maintenance_records_per_step < 0 or routing_hard_ramp_steps < 1
             or min_host_available_gib < 0 or host_pressure_wait_seconds < 0):
         raise ValueError("Invalid spatial training schedule")
+    if adopt_key_table and (resume or init_from is None):
+        raise ValueError("Key-table adoption is a warm-start option")
     max_unused_cuda_bytes = int(max_unused_cuda_gib * 1024 ** 3)
     min_host_available_bytes = int(min_host_available_gib * 1024 ** 3)
     cache_reclaim_host_reserve_bytes = int(cache_reclaim_host_reserve_gib * 1024 ** 3)
@@ -422,6 +438,15 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             initialization['bank_refresh_manifest_sha256'] = settings[
                 'bank_refresh_manifest_sha256']
             initialization['inherited_bank_state'] = refresh_manifest['journal_state']
+        parent_record_state = init_from / f"record-state-{manifest['step']:09d}.pt"
+        if config.train.key_table and adopt_key_table:
+            if not parent_record_state.is_file():
+                raise ValueError('The warm-start run has no key table at its checkpoint step')
+            parent_bank = Path(json.loads((init_from / 'spatial-inputs.json').read_text())['bank'])
+            shared = len(set(_bank_record_ids(parent_bank)) & set(_bank_record_ids(bank_dir)))
+            initialization['parent_key_table'] = {
+                'path': str(parent_record_state), 'sha256': file_sha256(parent_record_state),
+                'bank': str(parent_bank), 'shared_records': shared}
         atomic_json(output / "initialization.json", initialization)
     atomic_json(output / "spatial-inputs.json", settings | {
         "fingerprint": fingerprint, "data": str(data_path), "data_sha256": data.sha256,
@@ -508,6 +533,18 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 max_step=config.train.key_table_max_step)
             if resume and start:
                 key_table.load_state_dict(saved['table'])
+            elif not start and (output / 'initialization.json').is_file() and json.loads(
+                    (output / 'initialization.json').read_text()).get('parent_key_table'):
+                # A new bank generation: records shared with the parent bank keep
+                # their trained table rows; new records start from published keys.
+                parent = json.loads((output / 'initialization.json').read_text())[
+                    'parent_key_table']
+                if file_sha256(Path(parent['path'])) != parent['sha256']:
+                    raise ValueError('Parent key table changed since initialization')
+                parent_state = torch.load(parent['path'], weights_only=False)['table']
+                adopted = key_table.adopt(parent_state, _bank_record_ids(Path(parent['bank'])))
+                if adopted != parent['shared_records']:
+                    raise ValueError('Parent key-table rows differ from the recorded overlap')
             key_table.sync_index(index)
         else:
             key_cache.sync_index(agent, index)
@@ -900,6 +937,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--init-from", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--adopt-key-table", action="store_true",
+                        help="warm start: copy the parent's trained key-table rows for "
+                             "records shared with this bank")
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--loops", type=int, default=2)
@@ -963,7 +1003,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     print(json.dumps(train(
         args.config, args.data, args.bank, args.output, args.init_from,
-        resume=args.resume, steps=args.steps, batch_size=args.batch_size,
+        resume=args.resume, adopt_key_table=args.adopt_key_table, steps=args.steps, batch_size=args.batch_size,
         loops=args.loops, limits=tuple(args.limits),
         routing_candidates=args.routing_candidates,
         checkpoint_every=args.checkpoint_every,
