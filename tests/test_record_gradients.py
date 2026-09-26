@@ -329,3 +329,30 @@ def test_incremental_table_sync_patches_index_and_device_mirror(tiny_config, tmp
                 prediction_weight=1.0, commitment_weight=0.0)
     assert (index.spaces['s0'].domains == before).all()
     assert np.allclose(index.spaces['s0'].keys, table.keys[0].numpy(), atol=1e-6)
+
+
+def test_forward_only_writer_pass_publishes_without_gradients(tiny_config, tmp_path):
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
+    table = KeyTable(cache.ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
+                     learning_rate=0.05)
+    bank = TrainingBank(store, DiskStore(tmp_path / 'cache.sqlite'), index)
+    agent.zero_grad(set_to_none=True)
+    report = writer_pass(agent, lambda r: writer_inputs[r], cache.ids[:2], None, table, bank,
+                         cache, 3, prediction_weight=1.0, commitment_weight=0.5, backward=False)
+    assert report['encoded'] == 2 and 'key_prediction_cosine_mean' in report
+    assert all(p.grad is None for p in agent.parameters())
+    assert all(cache.versions[cache.position[r]] == 3 for r in cache.ids[:2])
+    with pytest.raises(ValueError):
+        writer_pass(agent, lambda r: writer_inputs[r], cache.ids[:1], [(None, [None])], table,
+                    bank, cache, 4, prediction_weight=1.0, commitment_weight=0.0,
+                    backward=False)
+
+
+def test_training_bank_finiteness_check_matches_torch():
+    values = torch.randn(1000).bfloat16()
+    assert TrainingBank._finite(values) and TrainingBank._finite(values.float())
+    for bad in (float('nan'), float('inf'), -float('inf')):
+        broken = values.clone()
+        broken[7] = bad
+        assert not TrainingBank._finite(broken) and not TrainingBank._finite(broken.float())

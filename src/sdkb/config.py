@@ -144,7 +144,8 @@ class TrainConfig:
     record_neighborhood_fraction: float = 0.25  # of each space's read limit, plus gold
     record_flush_budget: int = 256  # writer backward records per step
     record_flush_extra: int = 32  # largest accumulated gradients outside the neighbourhood
-    record_refresh_per_step: int = 256  # forward-only re-encodes, stalest first
+    record_refresh_per_step: int = 256  # re-encodes per step, stalest first
+    record_refresh_backward: bool = False  # key-table mode: train key prediction on refreshes
     record_gradient_capacity: int = 16384
     # Terminal per-record key table (record_gradients.KeyTable): search and gates use
     # trainable table keys, updated only where touched; the decoder regresses its

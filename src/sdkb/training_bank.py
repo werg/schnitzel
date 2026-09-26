@@ -309,11 +309,19 @@ class TrainingBank:
         self.index.set_deleted(invalidated, True)
 
     @staticmethod
+    def _finite(tensor: torch.Tensor) -> bool:
+        """Finiteness via the exponent bits (bfloat16/float16 checks are slow in torch)."""
+        if tensor.dtype == torch.bfloat16:
+            bits = tensor.view(torch.int16).numpy()
+            return not bool(((bits & 0x7F80) == 0x7F80).any())
+        return bool(np.isfinite(tensor.float().numpy()).all())
+
+    @staticmethod
     def _encode(record: StoredRecord) -> tuple[bytes, int, bytes]:
         key = record.key.detach().float().cpu().contiguous()
         payload = record.payload.detach().cpu().contiguous()
-        if (key.ndim != 1 or not torch.isfinite(key).all()
-                or not payload.is_floating_point() or not torch.isfinite(payload).all()):
+        if (key.ndim != 1 or not TrainingBank._finite(key)
+                or not payload.is_floating_point() or not TrainingBank._finite(payload)):
             raise ValueError('Mutable bank updates need finite vector keys and payloads')
         key = torch.nn.functional.normalize(key, dim=-1)
         return (key.numpy().astype('<f4', copy=False).tobytes(), key.numel(),
@@ -321,9 +329,9 @@ class TrainingBank:
 
     def _scope(self, record: StoredRecord) -> tuple[str, int, str]:
         array = self.index.spaces[record.space]
-        positions = np.flatnonzero(array.ids == record.record_id)
-        if len(positions) == 1:
-            position = int(positions[0])
+        # Index IDs are sorted and unique: a binary search, not a scan of the bank.
+        position = int(np.searchsorted(array.ids, record.record_id))
+        if position < len(array.ids) and array.ids[position] == record.record_id:
             stored_source = str(array.source_ids[position])
             if record.source_id and stored_source and record.source_id != stored_source:
                 raise ValueError('A mutable revision cannot change source identity')

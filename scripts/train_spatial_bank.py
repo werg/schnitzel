@@ -43,6 +43,13 @@ from sdkb.training import EpisodeSampler, autocast_context, environment_report, 
 from sdkb.trajectories import file_sha256
 
 
+# Compute-budget settings that may change on resume (see ``train``).
+ADJUSTABLE = ('record_refresh_per_step', 'record_refresh_backward', 'record_flush_budget',
+              'record_flush_extra')
+# Behavior of settings added after a run launched without them.
+LEGACY_DEFAULTS = {'record_refresh_backward': True}
+
+
 def _fingerprint(data: SpatialTrajectoryIndex, manifest_path: Path, settings: dict) -> str:
     payload = ":".join((data.sha256, file_sha256(manifest_path), canonical_json(settings)))
     return hashlib.sha256(payload.encode()).hexdigest()
@@ -79,7 +86,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           curriculum_min_steps: int = 300,
           curriculum_max_steps: int = 3000,
           payload_cache_gib: float = 0.0,
-          archive_dir: Path | None = None) -> dict:
+          archive_dir: Path | None = None,
+          record_budget: dict | None = None) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -124,6 +132,9 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         config.train.routing_logit_scale = routing_logit_scale
     if routing_live_weight is not None:
         config.train.routing_live_weight = routing_live_weight
+    for name, value in (record_budget or {}).items():
+        if value is not None:
+            setattr(config.train, name, value)
     for name, value in (spreading or {}).items():
         if value is not None:
             setattr(config.train, name, value)
@@ -252,7 +263,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             raise ValueError('Record gradients need the bank key-state cache')
         settings['record_gradients'] = {name: getattr(config.train, name) for name in (
             'record_gradient_decay', 'record_neighborhood_fraction', 'record_flush_budget',
-            'record_flush_extra', 'record_refresh_per_step', 'record_gradient_capacity')}
+            'record_flush_extra', 'record_refresh_per_step', 'record_gradient_capacity',
+            'record_refresh_backward')}
         settings['record_gradients']['key_states_sha256'] = file_sha256(key_states_path)
     if curriculum_sizes:
         if not config.train.key_table:
@@ -289,7 +301,38 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
             settings['bank_refresh_manifest_sha256'] = refreshed
         if 'journal_key_interface' in prior:
             settings['journal_key_interface'] = prior['journal_key_interface']
-    fingerprint = _fingerprint(data, bank_manifest_path, settings)
+    # Compute-budget settings may change on resume without changing the run: the
+    # fingerprint keeps their launch-time values (or their absence, for settings
+    # added later) and each change is logged in spatial-inputs.json.
+    fingerprint_settings = deepcopy(settings)
+    schedule_changes = []
+    if 'record_gradients' in settings:
+        record = settings['record_gradients']
+        if resume and (output / 'spatial-inputs.json').exists():
+            prior = json.loads((output / 'spatial-inputs.json').read_text())
+            schedule_changes = list(prior.get('schedule_changes', []))
+            prior_record = prior.get('record_gradients', {})
+            origin = prior.get('adjustable_origin') or {
+                name: ({'present': True, 'value': prior_record[name]}
+                       if name in prior_record else {'present': False})
+                for name in ADJUSTABLE}
+            for name in ADJUSTABLE:
+                previous = prior_record.get(name, LEGACY_DEFAULTS.get(name))
+                if previous != record.get(name):
+                    schedule_changes.append({'setting': name, 'from': previous,
+                                             'to': record.get(name)})
+        else:
+            origin = {name: {'present': True, 'value': record[name]} for name in ADJUSTABLE}
+        for name in ADJUSTABLE:
+            if origin[name]['present']:
+                fingerprint_settings['record_gradients'][name] = origin[name]['value']
+            else:
+                fingerprint_settings['record_gradients'].pop(name, None)
+        settings['adjustable_origin'] = origin
+        settings['schedule_changes'] = schedule_changes
+    fingerprint = _fingerprint(data, bank_manifest_path, {
+        key: value for key, value in fingerprint_settings.items()
+        if key not in ('adjustable_origin', 'schedule_changes')})
 
     if resume:
         if init_from is not None:
@@ -688,7 +731,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                     None, key_table, training_bank, key_cache, step + 1,
                                     prediction_weight=config.train.key_prediction_weight,
                                     commitment_weight=config.train.key_commitment_weight,
-                                    drift_sample=16)}
+                                    drift_sample=16,
+                                    backward=config.train.record_refresh_backward)}
                     record_metrics = {'record_harvested': harvested,
                                       'record_neighborhood': len(set(sink.neighborhood)),
                                       'record_flushed': len(flush),
@@ -885,6 +929,11 @@ if __name__ == "__main__":
                              "e.g. 8000 16000 32000 64000 128000 0")
     parser.add_argument("--curriculum-min-steps", type=int, default=300)
     parser.add_argument("--curriculum-max-steps", type=int, default=3000)
+    parser.add_argument("--record-refresh-per-step", type=int)
+    parser.add_argument("--record-refresh-backward", action=argparse.BooleanOptionalAction,
+                        default=None)
+    parser.add_argument("--record-flush-budget", type=int)
+    parser.add_argument("--record-flush-extra", type=int)
     parser.add_argument("--archive-dir", type=Path,
                         help="copy completed checkpoints here in the background")
     parser.add_argument("--payload-cache-gib", type=float, default=0.0,
@@ -929,4 +978,7 @@ if __name__ == "__main__":
         curriculum_max_steps=args.curriculum_max_steps,
         payload_cache_gib=args.payload_cache_gib,
         archive_dir=args.archive_dir,
+        record_budget={name: getattr(args, name) for name in (
+            'record_refresh_per_step', 'record_refresh_backward', 'record_flush_budget',
+            'record_flush_extra')},
     ), indent=2))

@@ -568,21 +568,26 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                 cotangents: Sequence[tuple[Tensor | None, list[Tensor | None]]] | None,
                 table: KeyTable, bank, cache: KeyStateCache, step: int, *,
                 prediction_weight: float, commitment_weight: float, batch_size: int = 16,
-                drift_sample: int = 0) -> dict[str, float | int]:
+                drift_sample: int = 0, backward: bool = True) -> dict[str, float | int]:
     """Encode records with gradient: key prediction, payload cotangents, publish.
 
     For each record the decoder's predicted keys regress onto the (fixed) table
     rows, and the rows move a small fraction toward the prediction (commitment).
     Accumulated payload cotangents, when given, flow into the writer in the same
-    backward. The encoded payloads are then published with the table keys, so a
+    backward. With ``backward=False`` (a refresh without cotangents) the pass is
+    forward-only: it republishes payloads and applies the commitment pull, and
+    reports key-prediction agreement without training it. The encoded payloads are then published with the table keys, so a
     flush and a refresh share one forward. Parameter gradients accumulate for the
     caller's optimizer step; table-row gradients for ``table.step``.
     """
     from .store import StoredRecord
     if not record_ids:
         return {'encoded': 0}
+    if not backward and cotangents is not None:
+        raise ValueError('A forward-only writer pass cannot apply cotangents')
     spaces = len(agent.config.memory.payload_dims)
     dtype = getattr(torch, agent.config.memory.storage_dtype)
+    grad_mode = torch.enable_grad() if backward else torch.no_grad()
     order = sorted(range(len(record_ids)),
                    key=lambda i: writer_inputs(record_ids[i]).shape[1])
     ordered = [record_ids[i] for i in order]
@@ -598,10 +603,11 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
     records, states, cosines, drift = [], [], [], []
     for start in range(0, len(ordered), batch_size):
         batch = ordered[start:start + batch_size]
-        outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
-                                      with_key_state=True)
-        key_state = outputs[-1]
-        predicted = agent.writer_space_keys(key_state)
+        with grad_mode:
+            outputs = agent.produce_batch([writer_inputs(record_id) for record_id in batch],
+                                          with_key_state=True)
+            key_state = outputs[-1]
+            predicted = agent.writer_space_keys(key_state)
         loss = key_state.new_zeros((), dtype=torch.float32)
         published_keys = []
         for space in range(spaces):
@@ -626,7 +632,8 @@ def writer_pass(agent, writer_inputs: Callable[[str], Tensor], record_ids: Seque
                 targets.append(outputs[2 * space + 1].to(dtype).float()[index])
                 grads.append(torch.stack([batch_cots[i][1][space].float() for i in rows_s])
                              .to(agent.device))
-        torch.autograd.backward(targets, grads)
+        if backward:
+            torch.autograd.backward(targets, grads)
         states.append(key_state.detach().float())
         # One device-to-host copy per space and batch; per-record copies each wait
         # for the device stream, which dominated publishing on a shared GPU.
