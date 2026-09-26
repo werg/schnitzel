@@ -78,7 +78,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           curriculum_sizes: tuple[int, ...] = (),
           curriculum_min_steps: int = 300,
           curriculum_max_steps: int = 3000,
-          payload_cache_gib: float = 0.0) -> dict:
+          payload_cache_gib: float = 0.0,
+          archive_dir: Path | None = None) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
             or cache_reclaim_host_reserve_gib < 0
@@ -356,6 +357,18 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     })
     atomic_json(output / "config.json", asdict(config))
     optimizer = make_optimizer(agent)
+    archiver = None
+    if archive_dir is not None:
+        # Live run on fast local storage; completed checkpoints are copied to the
+        # archive by a background thread, off the training step.
+        from sdkb.archiving import CheckpointArchiver
+        from sdkb.tracking import run_identity
+        archive_run = Path(archive_dir) / run_identity(output)
+        archive_run.mkdir(parents=True, exist_ok=True)
+        archiver = CheckpointArchiver(archive_run, keep=config.train.archive_keep_checkpoints,
+                                      reserve_bytes=config.train.min_free_disk_bytes)
+        atomic_json(archive_run / 'run.json', {'id': run_identity(output),
+                                               'source_run': str(output.resolve())})
     rng = random.Random(config.train.seed)
     cache = DiskStore(output / "training_cache.sqlite")
     start = restore_checkpoint(agent, optimizer, output, rng, fingerprint) if resume else 0
@@ -441,7 +454,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
 
     def save_all(step_count):
         save_checkpoint(agent, optimizer, output, step_count, rng, cache,
-                        fingerprint, keep=config.train.keep_checkpoints)
+                        fingerprint, keep=config.train.keep_checkpoints, archiver=archiver)
         if key_cache is not None:
             torch.save({'cache': key_cache.state_dict(), 'grads': record_grads.state_dict(),
                         **({'table': key_table.state_dict()} if key_table is not None else {}),
@@ -790,6 +803,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                                    force=True)
                 save_all(completed)
                 last_saved = completed
+    if archiver is not None:
+        archiver.close(wait=True)
     summary = {
         "completed_steps": completed, "requested_steps": steps,
         "complete": completed == steps, "elapsed_seconds": time.perf_counter() - began,
@@ -853,6 +868,8 @@ if __name__ == "__main__":
                              "e.g. 8000 16000 32000 64000 128000 0")
     parser.add_argument("--curriculum-min-steps", type=int, default=300)
     parser.add_argument("--curriculum-max-steps", type=int, default=3000)
+    parser.add_argument("--archive-dir", type=Path,
+                        help="copy completed checkpoints here in the background")
     parser.add_argument("--payload-cache-gib", type=float, default=0.0,
                         help="host-memory cache for bank payloads (write-through LRU)")
     args = parser.parse_args()
@@ -894,4 +911,5 @@ if __name__ == "__main__":
         curriculum_min_steps=args.curriculum_min_steps,
         curriculum_max_steps=args.curriculum_max_steps,
         payload_cache_gib=args.payload_cache_gib,
+        archive_dir=args.archive_dir,
     ), indent=2))
