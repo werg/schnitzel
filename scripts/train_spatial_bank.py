@@ -160,12 +160,28 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     bank_manifest_path = bank_dir / "manifest.json"
     bank_manifest = json.loads(bank_manifest_path.read_text())
     store = DiskStore(bank_dir / "bank.sqlite")
-    verified = publish_offline_generation(
-        store, identity=bank_manifest["identity"], namespace=bank_manifest["namespace"],
-        generation=bank_manifest["generation"], spaces=tuple(bank_manifest["spaces"]),
-        shard_ids=tuple(bank_manifest["shards"]), source_count=bank_manifest["sources"],
-        verify_only=True,
-    )
+    # Full verification reads the whole bank. Reuse a previous result while the
+    # manifest and the database file (size, mtime, inode) are unchanged.
+    bank_stat = (bank_dir / "bank.sqlite").stat()
+    verification_key = {"manifest_sha256": file_sha256(bank_manifest_path),
+                        "size": bank_stat.st_size, "mtime_ns": bank_stat.st_mtime_ns,
+                        "inode": bank_stat.st_ino}
+    verification_cache = bank_dir / "verification-cache.json"
+    cached = (json.loads(verification_cache.read_text())
+              if verification_cache.is_file() else {})
+    if cached.get("key") == verification_key:
+        verified = cached["verified"]
+    else:
+        verified = publish_offline_generation(
+            store, identity=bank_manifest["identity"], namespace=bank_manifest["namespace"],
+            generation=bank_manifest["generation"], spaces=tuple(bank_manifest["spaces"]),
+            shard_ids=tuple(bank_manifest["shards"]), source_count=bank_manifest["sources"],
+            verify_only=True,
+        )
+        try:
+            atomic_json(verification_cache, {"key": verification_key, "verified": verified})
+        except OSError:
+            pass
     if canonical_json(verified) != canonical_json({key: bank_manifest[key] for key in verified}):
         raise ValueError("Published bank differs from its verified manifest")
     bank_memory = stored_memory_identity(dict(bank_manifest["identity"]["memory"]))
@@ -693,9 +709,10 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                 if key_table is not None:
                     record_metrics.update(key_table.step(step + 1))
                     timer = time.perf_counter()
-                    key_table.sync_index(index)
+                    synced = key_table.sync_index(index)
                     record_grads.evict(step + 1)
-                    record_metrics.update(record_sync_seconds=time.perf_counter() - timer,
+                    record_metrics.update(record_synced_rows=synced,
+                                          record_sync_seconds=time.perf_counter() - timer,
                                           record_buffer=len(record_grads))
                     del sink
                     sink = None

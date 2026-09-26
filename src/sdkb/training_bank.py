@@ -525,11 +525,28 @@ class TrainingBank:
                         self.index.namespace, event['stream'], self.index.generation,
                         event['position'] + 1, event['visibility_time']))
 
+        # Existing live records keep their scope, so only their keys change and the
+        # resident index is patched in place; anything else takes the full upsert.
+        patches: dict[str, tuple[list[int], list[np.ndarray]]] = {}
         for values in encoded:
             _namespace, record_id, space, _generation, domain, created_at, \
                 _source_id, key, key_dim, _payload = values
-            self.index.upsert(space, record_id, key, key_dim, domain=domain,
-                              created_at=created_at, source_id=_source_id, deleted=False)
+            array = self.index.spaces[space]
+            position = int(np.searchsorted(array.ids, record_id))
+            vector = np.frombuffer(key, dtype='<f4')
+            if (position < len(array.ids) and array.ids[position] == record_id
+                    and not array.deleted[position] and array.domains[position] == domain
+                    and int(array.times[position]) == created_at
+                    and key_dim == array.keys.shape[1]
+                    and np.isfinite(vector).all() and np.linalg.norm(vector) > 0):
+                patches.setdefault(space, ([], []))
+                patches[space][0].append(position)
+                patches[space][1].append(vector / np.linalg.norm(vector))
+            else:
+                self.index.upsert(space, record_id, key, key_dim, domain=domain,
+                                  created_at=created_at, source_id=_source_id, deleted=False)
+        for space, (positions, vectors) in patches.items():
+            self.index.patch_keys(space, np.asarray(positions), np.stack(vectors))
         self.index.set_deleted(set(invalidated), True)
         if self._payload_limit:
             for record in rows:

@@ -176,10 +176,30 @@ class PublishedKeyIndex:
         self.invalidate()
 
     def set_deleted(self, record_ids: set[str], deleted: bool) -> None:
+        if not record_ids:
+            return
         for array in self.spaces.values():
-            if record_ids:
-                array.deleted[np.isin(array.ids, tuple(record_ids))] = deleted
+            array.deleted[np.isin(array.ids, tuple(record_ids))] = deleted
         self.invalidate()
+
+    def patch_keys(self, space: str, positions: np.ndarray, keys: np.ndarray) -> None:
+        """Replace unit keys of existing records in place, device mirror included.
+
+        Only keys change: identities, scopes and deletion flags stay, so search
+        eligibility caches remain valid and no full mirror rebuild is needed.
+        """
+        if not len(positions):
+            return
+        array = self.spaces[space]
+        positions = np.asarray(positions, dtype=np.int64)
+        keys = np.asarray(keys, dtype=np.float32)
+        if keys.shape != (len(positions), array.keys.shape[1]):
+            raise ValueError('Key patch shape differs from the index')
+        array.keys[positions] = keys
+        mirror = self._mirrors.get(space)
+        if mirror is not None:
+            mirror['keys'][torch.from_numpy(positions).to(self._device)] = (
+                torch.from_numpy(keys).to(self._device))
 
     tie_margin = 64
 

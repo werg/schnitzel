@@ -298,3 +298,34 @@ def test_sphere_adam_keeps_relative_row_strength_and_tangent_direction():
     with pytest.raises(ValueError):
         KeyTable(ids, [k.clone() for k in keys], learning_rate=0.01,
                  optimizer='adam').load_state_dict(table.state_dict())
+
+
+def test_incremental_table_sync_patches_index_and_device_mirror(tiny_config, tmp_path):
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    _, writer_inputs, store, index, cache = _bank(agent, tmp_path, count=4)
+    table = KeyTable(cache.ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
+                     learning_rate=0.5, max_step=1.0)
+    assert table.sync_index(index) == len(cache.ids)  # first sync is full
+    index.use_device('cpu')
+    queries = torch.randn(2, index.spaces['s0'].keys.shape[1])
+    kwargs = dict(top_k=5, namespace='corpus', space='s0', generation='g1',
+                  domains=('research', 'research'), query_times=(10, 10))
+    index.search_batch(queries, **kwargs)  # builds the device mirror
+    table.begin_step()
+    (table.rows(0, cache.ids[:2]) @ torch.ones(index.spaces['s0'].keys.shape[1])).sum().backward()
+    table.step(1)
+    table.pull(0, cache.ids[3:4], torch.randn(1, index.spaces['s0'].keys.shape[1]), 0.5)
+    assert table.sync_index(index) == 3
+    assert np.allclose(index.spaces['s0'].keys, table.keys[0].numpy(), atol=1e-6)
+    patched = index.search_batch(queries, **kwargs)
+    index.use_device(None)
+    reference = index.search_batch(queries, **kwargs)
+    for a, b in zip(patched, reference, strict=True):
+        assert [s.record_id for s in a.selections] == [s.record_id for s in b.selections]
+    # Publishing existing records patches keys without disturbing scope.
+    bank = TrainingBank(store, DiskStore(tmp_path / 'cache.sqlite'), index)
+    before = index.spaces['s0'].domains.copy()
+    writer_pass(agent, lambda r: writer_inputs[r], cache.ids[:2], None, table, bank, cache, 2,
+                prediction_weight=1.0, commitment_weight=0.0)
+    assert (index.spaces['s0'].domains == before).all()
+    assert np.allclose(index.spaces['s0'].keys, table.keys[0].numpy(), atol=1e-6)

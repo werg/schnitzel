@@ -271,9 +271,15 @@ class KeyTable:
         # Trust region: no row moves more than about ``max_step`` radians per step.
         self.max_step = max_step
         self.leaves: dict[tuple[int, str], Tensor] = {}
+        # Rows changed since the last index sync; None forces a full sync.
+        self.dirty: list[set[int]] | None = None
 
     def ids_digest(self) -> str:
         return hashlib.sha256('\n'.join(self.ids).encode()).hexdigest()
+
+    def _mark(self, space: int, positions: Tensor) -> None:
+        if self.dirty is not None:
+            self.dirty[space].update(positions.tolist())
 
     def begin_step(self) -> None:
         self.leaves = {}
@@ -325,6 +331,7 @@ class KeyTable:
             step_vector = step_vector * (self.max_step / norms.clamp_min(self.max_step))
             new = F.normalize(old - step_vector, dim=-1)
             self.keys[space][positions] = new
+            self._mark(space, positions)
             # Angle from the chord, exact for small steps where arccos of a float32
             # cosine rounds to zero.
             moved.append(2 * torch.arcsin(((new - old).norm(dim=-1) / 2).clamp(max=1)))
@@ -361,14 +368,35 @@ class KeyTable:
         self.keys[space][positions] = F.normalize(
             rows + weight * (F.normalize(targets.float(), dim=-1).to(rows.device) - rows),
             dim=-1)
+        self._mark(space, positions)
 
     @torch.no_grad()
-    def sync_index(self, index) -> None:
-        for space, array in enumerate(index.spaces.values()):
-            if array.ids.tolist() != self.ids:
+    def sync_index(self, index) -> int:
+        """Write rows changed since the last sync into the index; return the count.
+
+        The first sync (and any after loading state) writes every row and rebuilds
+        device mirrors; later syncs patch only changed rows in place.
+        """
+        if self.dirty is None:
+            for space, array in enumerate(index.spaces.values()):
+                if array.ids.tolist() != self.ids:
+                    raise ValueError('Key table and index record order differ')
+                array.keys[:] = self.keys[space].float().cpu().numpy()
+            index.invalidate()
+            self.dirty = [set() for _ in self.keys]
+            return len(self.ids) * len(self.keys)
+        written = 0
+        for space, name in enumerate(index.spaces):
+            if len(index.spaces[name].ids) != len(self.ids):
                 raise ValueError('Key table and index record order differ')
-            array.keys[:] = self.keys[space].float().cpu().numpy()
-        index.invalidate()
+            if not self.dirty[space]:
+                continue
+            positions = torch.tensor(sorted(self.dirty[space]), device=self.keys[space].device)
+            index.patch_keys(name, positions.cpu().numpy(),
+                             self.keys[space][positions].float().cpu().numpy())
+            written += len(positions)
+            self.dirty[space] = set()
+        return written
 
     def state_dict(self) -> dict:
         return {'ids_sha256': self.ids_digest(), 'optimizer': self.optimizer,
@@ -390,6 +418,7 @@ class KeyTable:
         self.counts = state['counts'].to(device)
         self.updated = state['updated'].clone()
         self.space_steps = list(state.get('space_steps', [0] * len(self.keys)))
+        self.dirty = None
 
 
 class GradientSink:
