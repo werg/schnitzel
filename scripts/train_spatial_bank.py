@@ -443,7 +443,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         atomic_json(archive_run / 'run.json', {'id': run_identity(output),
                                                'source_run': str(output.resolve())})
     rng = random.Random(config.train.seed)
-    cache = DiskStore(output / "training_cache.sqlite")
+    cache = DiskStore(output / "training_cache.sqlite", secure_delete=False)
     start = restore_checkpoint(agent, optimizer, output, rng, fingerprint) if resume else 0
     if start > steps:
         raise ValueError("Saved spatial step exceeds requested budget")

@@ -52,11 +52,16 @@ class StoredRecord:
 
 
 class DiskStore:
-    def __init__(self, path: str | Path, *, cache_mib: int = 32) -> None:
+    def __init__(self, path: str | Path, *, cache_mib: int = 32,
+                 secure_delete: bool | None = None) -> None:
         self.path = Path(path)
         if cache_mib < 1:
             raise ValueError("SQLite cache budget must be positive")
         self.cache_mib = cache_mib
+        # None keeps SQLite's build default (on in Debian/Ubuntu builds). A training
+        # journal of our own payload revisions may turn it off: with it on, garbage
+        # collection overwrites every freed page with zeros, twice through the WAL.
+        self.secure_delete = secure_delete
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
@@ -82,6 +87,8 @@ class DiskStore:
         db = sqlite3.connect(self.path, timeout=30)
         db.execute(f"PRAGMA cache_size={-self.cache_mib * 1024}")
         db.execute("PRAGMA mmap_size=0")  # no unaccounted application mmap cache
+        if self.secure_delete is not None:
+            db.execute(f"PRAGMA secure_delete={'ON' if self.secure_delete else 'OFF'}")
         try:
             with db:
                 yield db
@@ -515,16 +522,23 @@ class DiskStore:
                 raise ValueError('GC cursor would remove checkpoint-pinned history')
             # Keep the newest baseline revision/status no later than the new floor,
             # plus every later event needed for rollback to a retained checkpoint.
-            deleted_revisions = db.execute('''DELETE FROM mutable_bank_revisions
-                WHERE cursor<? AND (namespace,record_id,space,cursor) NOT IN (
-                    SELECT namespace,record_id,space,MAX(cursor)
-                    FROM mutable_bank_revisions WHERE cursor<=?
-                    GROUP BY namespace,record_id,space)''',
+            # A row is superseded when a newer one for the same record exists at or
+            # before the new floor. EXISTS probes the lookup indexes; the former
+            # row-value NOT IN over a grouped subquery took ~12 min per checkpoint.
+            db.execute('''CREATE INDEX IF NOT EXISTS mutable_status_lookup
+                ON mutable_bank_status(namespace,record_id,cursor)''')
+            deleted_revisions = db.execute('''DELETE FROM mutable_bank_revisions AS old
+                WHERE old.cursor<? AND EXISTS (
+                    SELECT 1 FROM mutable_bank_revisions AS newer
+                    WHERE newer.namespace=old.namespace AND newer.record_id=old.record_id
+                      AND newer.space=old.space AND newer.cursor>old.cursor
+                      AND newer.cursor<=?)''',
                 (before_cursor, before_cursor)).rowcount
-            deleted_status = db.execute('''DELETE FROM mutable_bank_status
-                WHERE cursor<? AND (namespace,record_id,cursor) NOT IN (
-                    SELECT namespace,record_id,MAX(cursor) FROM mutable_bank_status
-                    WHERE cursor<=? GROUP BY namespace,record_id)''',
+            deleted_status = db.execute('''DELETE FROM mutable_bank_status AS old
+                WHERE old.cursor<? AND EXISTS (
+                    SELECT 1 FROM mutable_bank_status AS newer
+                    WHERE newer.namespace=old.namespace AND newer.record_id=old.record_id
+                      AND newer.cursor>old.cursor AND newer.cursor<=?)''',
                 (before_cursor, before_cursor)).rowcount
             deleted_commits = db.execute(
                 'DELETE FROM mutable_bank_commits WHERE cursor<?',

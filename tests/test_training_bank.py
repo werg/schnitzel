@@ -346,3 +346,47 @@ def test_payload_cache_serves_newest_revisions_under_snapshot_and_scope(tmp_path
     torch.testing.assert_close(bank.fetch_many((plan,))[0][0], torch.tensor([1., 2.]))
     bank.enable_payload_cache(8)  # evicts down to the byte cap
     assert bank._payload_bytes <= 8
+
+
+def test_disk_store_secure_delete_setting(tmp_path):
+    for setting, expected in ((False, 0), (True, 1)):
+        store = DiskStore(tmp_path / f'journal-{setting}.sqlite', secure_delete=setting)
+        with store.connect() as db:
+            assert db.execute('PRAGMA secure_delete').fetchone()[0] == expected
+
+
+def test_mutable_gc_matches_grouped_reference_on_random_history(tmp_path):
+    import shutil
+    import sqlite3
+    base = DiskStore(tmp_path / 'base.sqlite')
+    ids = [f'r{i}' for i in range(6)]
+    for record_id in ids:
+        for space in ('s0', 's1'):
+            base.put(StoredRecord(record_id, torch.tensor([1., 0.]), torch.tensor([1., 2.]),
+                                  namespace='corpus', space=space, generation='g',
+                                  created_at=1))
+    index = PublishedKeyIndex(base, namespace='corpus', generation='g', spaces=('s0', 's1'),
+                              expected_sources=6)
+    journal = DiskStore(tmp_path / 'journal.sqlite')
+    bank = TrainingBank(base, journal, index)
+    rng = random.Random(3)
+    for step in range(30):
+        chosen = rng.sample(ids, rng.randint(1, 4))
+        bank.update([StoredRecord(r, torch.randn(2), torch.randn(2), space=space)
+                     for r in chosen for space in ('s0', 's1')], optimizer_step=step)
+    shutil.copy(tmp_path / 'journal.sqlite', tmp_path / 'reference.sqlite')
+    with sqlite3.connect(tmp_path / 'reference.sqlite') as db:
+        db.execute('''DELETE FROM mutable_bank_revisions WHERE cursor<? AND
+            (namespace,record_id,space,cursor) NOT IN (SELECT namespace,record_id,space,
+            MAX(cursor) FROM mutable_bank_revisions WHERE cursor<=?
+            GROUP BY namespace,record_id,space)''', (17, 17))
+        db.execute('''DELETE FROM mutable_bank_status WHERE cursor<? AND
+            (namespace,record_id,cursor) NOT IN (SELECT namespace,record_id,MAX(cursor)
+            FROM mutable_bank_status WHERE cursor<=? GROUP BY namespace,record_id)''', (17, 17))
+        expected = (sorted(db.execute('SELECT cursor,record_id,space FROM mutable_bank_revisions')),
+                    sorted(db.execute('SELECT cursor,record_id FROM mutable_bank_status')))
+    journal.gc_mutable_bank(17)
+    with journal.connect() as db:
+        actual = (sorted(db.execute('SELECT cursor,record_id,space FROM mutable_bank_revisions')),
+                  sorted(db.execute('SELECT cursor,record_id FROM mutable_bank_status')))
+    assert actual == expected and len(expected[0]) < 30 * 8
