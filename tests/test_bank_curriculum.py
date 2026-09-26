@@ -66,3 +66,38 @@ def test_index_restriction_limits_both_search_paths(tiny_config, tmp_path):
     index.restrict(None)
     assert len(index.search_batch(queries, **kwargs)[0].selections) > len(ids)
     assert cache.stalest(len(cache.ids), active=active) == sorted(active)
+
+
+def test_bank_load_respects_active_subset_and_query_eligibility():
+    from sdkb.key_geometry import BankLoad
+    ids = [f'r{i:03d}' for i in range(100)]
+    load = BankLoad(ids, 1, threshold=2.0)
+    active = set(ids[:10])
+    load.restrict(active)
+    load.begin_step()
+    load.record(0, ids[:10])
+    load.commit()
+    load.begin_step()
+    # Each active record carries its fair share, so none is overloaded; averaging
+    # over the whole bank would have flagged all ten.
+    assert not bool(load.overload(0, ids[:10]).any())
+    eligible = torch.zeros(100, dtype=torch.bool)
+    eligible[:5] = True
+    drawn = load.explore(0, 20, seed=1, eligible=eligible.numpy())
+    assert drawn and set(drawn) <= set(ids[:5])
+    assert set(load.explore(0, 50, seed=2)) <= active
+    assert load.statistics()[0]['cold_fraction'] == 0.0
+    load.restrict(None)
+    assert load.statistics()[0]['cold_fraction'] == pytest.approx(0.9)
+
+
+def test_index_eligible_mask_matches_eligible_ids(tiny_config, tmp_path):
+    agent = SDKBAgent(_direct_agent(tiny_config))
+    _, _, _, index, cache = _bank(agent, tmp_path, count=4)
+    index.restrict(cache.ids[::2])
+    mask = index.eligible_mask('s0', domain='research', query_time=10)
+    array = index.spaces['s0']
+    assert set(array.ids[mask].tolist()) == set(
+        index.eligible_ids('s0', cache.ids, domain='research', query_time=10))
+    index.restrict(None)
+    assert index.eligible_mask('s0', domain='research', query_time=10).sum() > mask.sum()

@@ -195,6 +195,21 @@ class PublishedKeyIndex:
     def invalidate(self) -> None:
         """Mark device mirrors stale after any change to the resident arrays."""
         self._mirrors = {}
+        self._eligible = {}
+
+    def eligible_mask(self, space: str, *, domain: str, query_time: int) -> np.ndarray:
+        """Boolean mask, in record order, of records this query may read."""
+        cache = self.__dict__.setdefault('_eligible', {})
+        key = (space, domain, int(query_time))
+        mask = cache.get(key)
+        array = self.spaces[space]
+        if mask is None or len(mask) != len(array.ids):
+            mask = (array.domains == domain) & (array.times < query_time) & ~array.deleted
+            active = self._active_mask(space)
+            if active is not None:
+                mask &= active
+            cache[key] = mask
+        return mask
 
     def restrict(self, record_ids: Iterable[str] | None) -> None:
         """Limit search and proposals to an active training subset (None: all).

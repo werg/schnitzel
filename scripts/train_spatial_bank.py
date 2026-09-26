@@ -432,6 +432,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
         if resume and start:
             curriculum.load_state_dict(saved['curriculum'])
         index.restrict(curriculum.active)
+        if bank_load is not None:
+            bank_load.restrict(curriculum.active)
 
     def save_all(step_count):
         save_checkpoint(agent, optimizer, output, step_count, rng, cache,
@@ -755,6 +757,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
                         recall=sum(recall) / len(recall) if recall else None)
                     if advanced:
                         index.restrict(curriculum.active)
+                        if bank_load is not None:
+                            bank_load.restrict(curriculum.active)
                         print(json.dumps({'event': 'curriculum_advance', 'step': completed,
                                           **curriculum.report()}), flush=True)
                     row.update(curriculum.report())

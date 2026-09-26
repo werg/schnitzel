@@ -165,6 +165,15 @@ class BankLoad:
         self.loads = [RetrievalLoad(len(self.ids), decay, threshold) for _ in range(spaces)]
         self.snapshots = [load.counts.clone() for load in self.loads]
         self.pending: list[list[Tensor]] = [[] for _ in range(spaces)]
+        self.active: Tensor | None = None
+
+    def restrict(self, record_ids) -> None:
+        """Limit load expectations, exploration and statistics to an active subset."""
+        if record_ids is None:
+            self.active = None
+            return
+        self.active = torch.zeros(len(self.ids), dtype=torch.bool)
+        self.active[self.positions(sorted(record_ids))] = True
 
     def begin_step(self) -> None:
         self.snapshots = [load.counts.clone() for load in self.loads]
@@ -186,7 +195,9 @@ class BankLoad:
     def overload(self, space: int, record_ids) -> Tensor:
         load = self.loads[space]
         counts = self.snapshots[space]
-        expected = counts.sum() / len(counts)
+        # Expected load per record among those that can be retrieved at all.
+        population = len(counts) if self.active is None else int(self.active.sum())
+        expected = counts.sum() / max(population, 1)
         if expected <= 0:
             return torch.zeros(len(record_ids), dtype=torch.float32)
         ratio = counts[self.positions(record_ids)] / (load.threshold * expected)
@@ -200,12 +211,24 @@ class BankLoad:
                       @ F.normalize(keys.float(), dim=-1).T).mean(0)
         return (similarity * weight).sum() / weight.gt(0).sum()
 
-    def explore(self, space: int, count: int, seed: int, exclude=()) -> list[str]:
-        """Draw proposals with probability proportional to 1/(1 + load); the caller
-        filters them for causal and authorization eligibility."""
+    def explore(self, space: int, count: int, seed: int, exclude=(),
+                eligible=None) -> list[str]:
+        """Draw proposals with probability proportional to 1/(1 + load).
+
+        ``eligible`` (a boolean mask in record order) restricts the draw to records
+        the query may read; the caller still filters proposals for causal and
+        authorization eligibility. Without it, low-load records that the query
+        cannot read would crowd out every proposal.
+        """
         if count <= 0:
             return []
         weights = 1.0 / (1.0 + self.snapshots[space].float())
+        if self.active is not None:
+            weights = weights * self.active
+        if eligible is not None:
+            weights = weights * torch.as_tensor(eligible, dtype=torch.bool)
+        if not bool((weights > 0).any()):
+            return []
         for record_id in exclude:
             position = self.position.get(record_id)
             if position is not None:
@@ -219,6 +242,8 @@ class BankLoad:
         rows = []
         for load in self.loads:
             counts = load.counts.float()
+            if self.active is not None:
+                counts = counts[self.active]
             ordered = counts.sort().values
             n = len(counts)
             rank = torch.arange(1, n + 1, dtype=torch.float32)

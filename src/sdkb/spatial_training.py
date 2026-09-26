@@ -281,8 +281,12 @@ def _load_wave(store: StoredReadBackend, index: BatchKeyIndexBackend, wave: _Rea
             explored = ()
             if explore_count:
                 seed = int(_site_uniform(item, f'explore-{space}') * 2 ** 62)
+                eligible = (index.eligible_mask(name, domain=item['domain'],
+                                                query_time=item['query_time'])
+                            if hasattr(index, 'eligible_mask') else None)
                 proposals = load.explore(space, 4 * explore_count, seed,
-                                         exclude=set(found[:limit]) | set(required))
+                                         exclude=set(found[:limit]) | set(required),
+                                         eligible=eligible)
                 explored = index.eligible_ids(
                     name, proposals, domain=item['domain'],
                     query_time=item['query_time'])[:explore_count]
