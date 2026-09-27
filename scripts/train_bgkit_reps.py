@@ -401,7 +401,7 @@ def train_step(model: Model, examples, weights: dict, passes: int = 0,
 @torch.no_grad()
 def _score(model: Model, groups) -> dict:
     sums: dict[str, float] = {}
-    tokens, count, length_err, stop_hits = 0, 0, 0.0, 0
+    tokens, count, length_err, stop_hits, stop_missing = 0, 0, 0.0, 0, 0
     replay, replay_n = 0.0, 0
     for examples in groups:
         counts = [ex['teacher'].shape[0] for ex in examples]
@@ -426,8 +426,10 @@ def _score(model: Model, groups) -> dict:
         tokens += int(arms['noctx'][1].numel())
         count += len(examples)
         for k, stop in zip(counts, stops):
+            # no stop within k + 1 positions: an overrun, scored as the full length
+            stop_missing += stop is None
             stop_hits += stop == k
-            length_err += abs((k if stop is None else stop) - k) / max(k, 1)
+            length_err += (1.0 if stop is None else abs(stop - k) / max(k, 1))
     nll = {name: value / tokens for name, value in sums.items()}
     extra = {}
     if model.reference is not None:
@@ -437,6 +439,7 @@ def _score(model: Model, groups) -> dict:
             'captured': {k: round((nll['noctx'] - nll[k]) / gain, 4)
                          for k in ('teacher', 'student_tf', 'student_free')},
             'stop_exact': round(stop_hits / count, 4),
+            'stop_missing': round(stop_missing / count, 4),
             'length_rel_err': round(length_err / count, 4), **extra}
 
 
