@@ -138,6 +138,27 @@ reconstructs/continues the text (NLL) and matches its outputs when reading
 teacher reps (KL). Gate: fraction of the teacher's reconstruct gain recovered
 from student reps, per ratio.
 
+Implementation (`src/sdkb/bgkit_span.py`, `scripts/train_bgkit_reps.py`):
+trainable parts are the marker vector (initialized from the sentinel's
+embedding), the zero-initialized ratio MLP, the rep head (MLP plus S2's rms-only
+interface norm) and a two-way emit/stop head that stands in for the `<|rep|>` and
+`<|/bg|>` output rows while the decoder is frozen. Write prompts name the format
+(owner direction, 27 September):
+
+- Pipeline writes (bank sources, B1 cache at the length-scaled space ratios):
+  "Compact the following passage with BGKit into a memory record, so that its
+  content can later be recalled and reproduced verbatim."
+- Classical BGKit compression, 40% of steps: reconstruct and continue samples
+  from BGKit's own train stores (contexts 64–512 tokens), log-uniform ratio
+  x1–x128, teacher reps from the frozen S2 encoder online with BGKit's own
+  encoder prompt; the writer is prompted "Summarize this text with BGKit so that
+  it can be reproduced verbatim / continued."
+
+Evaluation: held-out bank sources (0.5% by hash) per space and BGKit eval stores
+at x4/x16/x64; arms no context, full text, teacher reps, student teacher-forced
+and student free-running reps, plus stop-length error. Step-0 teacher captured
+fractions: bank s0–s3 0.83/0.62/0.47/0.33, classical x4/x16/x64 0.87/0.53/0.25.
+
 **B3 — Free-running and write adapter.** Add a write-side adapter active only
 inside compressed spans (reading stays exactly S2). Train on the model's own
 generated spans (scheduled sampling to full rollouts) with the functional loss.
