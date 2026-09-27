@@ -240,6 +240,29 @@ frozen; then leave distillation quickly for task loss with learned gates. Also
 distill BGKit multi-level node encodings (`encode_tree`, 1/4 re-encoding) for
 compaction of stored records.
 
+*Self-record curriculum (owner direction, 27 September).* Combiner training
+starts from the feedback case and phases it out. Each read contains the record
+being reconstructed (its own span, the "pure feedback source") together with
+semantically related records (exact nearest neighbours over the S2 teacher
+reps) and, for episodes, the other gold records. The self record's gate is forced
+down on a schedule from 1 to 0 (the numerator-and-mass form makes a forced gate
+exact), while the target moves from reconstructing that record to the episode's
+answer and the BGKit encoding of the *other* relevant records. The model thus
+moves from copying its own content to extracting knowledge from the actual
+sources; learned gates take over once the self record is gone.
+
+**Codec distillation (runs before B7; `scripts/train_bgkit_codecs.py`).** One
+`SpaceCodec` per coarser space (about 2M parameters each): source = teacher s0
+reps of a bank passage, target = teacher reps at that space's ratio, losses
+cosine + functional (frozen S2 reads the codec output: reconstruct NLL and KL to
+reading the teacher reps). Evaluation compares codec output with the teacher and
+with chunked mean pooling of s0. 40-step smoke: captured 0.20/0.19/0.18 on
+s1/s2/s3 (pooling 0.48/0.06/−0.08, teacher 0.63/0.47/0.33).
+
+**Combiner teacher cache.** `scripts/cache_bgkit_teacher.py --episodes`: per R6
+episode, the S2 encoding of its gold records' texts joined in order, at the
+four length-scaled space ratios.
+
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
 datasets) and periodic memory-use evaluation.
