@@ -1,239 +1,145 @@
 # SCHNITZELJAGD
 
-*Schnitzeljagd* is German for a treasure hunt: one group leaves clues, and another follows them
-to the goal.
+*Schnitzeljagd* is German for a paper chase. One group sets off first and leaves
+a trail: chalk arrows, scraps of paper (*Schnitzel*), little notes with hints. A
+second group follows later, reads the signs and finds its way to the goal.
 
-That idea inspires SCHNITZELJAGD. A small language model writes experiences as latent memories;
-later agents retrieve and combine those memories to solve new tasks. The writer leaves a trail
-for future readers.
+SCHNITZELJAGD (short: **schnitz**) teaches a small language model to play both
+parts. As it works through a task, it leaves compact notes about what it saw
+and learned. Later, perhaps in a completely different task, it finds the notes
+that matter and follows them.
 
-## Start on the Spark
+> Formerly **SDKB**. Older experiment records and links still use that name.
 
-Clone the upstream repository using your existing access:
+## Why
 
-```bash
-git clone git@github.com:werg/schnitzel.git schnitzel
-cd schnitzel
-./scripts/start_spark.sh --recipe recipes/looped_smoke.yaml --output /runs/looped-smoke
-```
+Small models can't hold everything in their weights, and they forget whatever
+drops out of their context window. The usual fix is a bigger model. We want to
+test a different trade: keep the model small and give it an external memory it
+can write to, search and read from. More storage and a little more computation,
+instead of more resident parameters.
 
-This **real-model integration run** builds the native ARM64 image when absent,
-checks CUDA/BF16, pins model and dataset revisions, prepares real teacher traces,
-checks memory gradients and runs two updates in each of four stages. It is not
-a capability experiment. After inspecting its outputs, start the main curriculum:
+Plenty of systems already bolt on a memory by retrieving text. SCHNITZELJAGD
+differs in three ways:
 
-```bash
-./scripts/start_spark.sh --recipe recipes/looped_starter_muon.yaml --output /runs/looped-starter-muon
-```
+- **The notes are latent, not text.** A memory is a short sequence of vectors
+  that the model reads straight into its input, like a compressed passage.
+  Fifty tokens of experience might become a dozen of these soft tokens, or just
+  a couple.
+- **The model learns what to write.** Training rewards a note for how much it
+  helps later, on a *different* task, not only for how faithfully it summarizes
+  its source. The writer learns to leave the clues a future reader needs.
+- **Reading happens while thinking.** The model can look things up in the middle
+  of its own computation, between passes of its layers, not just once before it
+  starts.
 
-| Stage | Optimizer updates | Training behavior |
-|---|---:|---|
-| `text_bootstrap` | 200 | Adapt the student to the recorded target format with the same selected evidence rendered as text. |
-| `recurrence_bridge` | 200 | Two middle-core passes, frozen parent, live bridge, and one-pass parent distribution anchoring. |
-| `latent_warmup` | 400 | Two passes with an actual inter-pass SCHNITZELJAGD read; freeze the base while training the latent interface. |
-| `recurrent_joint` | 400 | Sample 2/3 passes; update shared core + SCHNITZELJAGD modules, retain one-pass text anchoring. |
-
-The Muon starter uses native Muon for eligible matrices and AdamW for embedding,
-output, slot and other excluded tensors. It requires a runtime providing native
-Muon; keep the NVIDIA Torch installation intact. Checkpoints default to every
-1,000 updates plus initial, final and graceful-stop saves; configure output storage
-through the operations guide.
-
-These are initial run budgets, not promised convergence thresholds. The starter scans
-up to 2,000 Hermes and 2,000 UltraChat rows with seeded source shuffling. It records
-how many complete, budget-fitting examples survive preparation. No live teacher API,
-experiment-tracking account or paid inference endpoint is required.
-
-Resume the identical recipe/output:
-
-```bash
-./scripts/start_spark.sh --recipe recipes/looped_starter_muon.yaml --output /runs/looped-starter-muon --resume
-```
-
-The job runs synchronously in the foreground. A graceful interruption checkpoints
-after a complete microbatch/replay, preserving partial gradient accumulation for
-exact resume. Completed stages and evaluations are not repeated. Prepared
-input/config changes are rejected on resume. Run only one launcher per output directory.
-
-To download, pin and inspect data without loading the training model:
-
-```bash
-./scripts/start_spark.sh --recipe recipes/looped_starter_muon.yaml --output /runs/prepared --prepare-only
-# Inspect data/manifest.json and launch.json; then continue:
-./scripts/start_spark.sh --recipe recipes/looped_starter_muon.yaml --output /runs/prepared --resume
-```
-
-## Training recipes
-
-| Recipe | Purpose |
-|---|---|
-| `looped_starter_muon.yaml` | Hermes tool conversations + UltraChat with Muon/AdamW parameter split, sparse saves and offline W&B; initial budgets. |
-| `looped_starter.yaml` | Historical AdamW starter control. |
-| `tools.yaml` / `chat.yaml` | Separate tool-use and general conversational continuation runs. |
-| `coding.yaml` | Successful SWE-smith traces; earlier-prefix memory. |
-| `openhands.yaml` | Successful Nebius SWE-rebench/OpenHands coding traces. |
-| `cross_experience.yaml` | Different prior SWE-smith instances in the same repository; repository-held-out validation. |
-| `looped_causal.yaml` | **Real LFM student** text-to-latent training on controlled rules, then fresh-world counterfactual and binding evaluation. |
-| `looped_binding.yaml` | Selected-pair permission, restoration, action and identifier curriculum with rule counterfactuals; oracle routing. |
-| `looped_binding_muon_selected.yaml` / `looped_binding_muon_all.yaml` | Native Muon MLP curricula with selected versus all-world evidence; external-storage operating policy and sparse checkpoints. |
-| `looped_binding_muon_attention.yaml` | Matched attention control; demonstrated selected-support action composition, with explicit distractor/identifier limits. |
-| `looped_smoke.yaml` | Real model and starter sources, two updates per stage, native recurrence preflight. |
-| `tiny_looped_smoke.yaml` | Tiny CPU recurrent curriculum and fresh causal worlds, no downloads. |
-
-The previous `starter.yaml`, `causal.yaml`, and dataset-specific recipes remain one-pass controls; the `looped_` recipes explicitly enable recurrent conversion. `smollm2_looped_causal.yaml` is the attention-only conversion comparison. Paths are under `recipes/`. Sources/configurations/licenses and exact parsing are in
-[the dataset guide](docs/datasets.md); `schnitz datasets` prints the executable catalog.
-See [training](docs/training.md) and [Spark setup](docs/spark.md) for operations.
-
-**Two separate data protocols are implemented.** Prefix memory encodes earlier
-context before a later assistant target. Cross-experience memory encodes different
-completed instances, never the query's own future solution. Supplied context is not
-falsely labeled as a verified sufficient support set. The controlled causal suite
-provides that stronger test.
-
-## Docker choice
-
-The default is **`nvcr.io/nvidia/pytorch:25.11-py3`**, explicitly used in
-[NVIDIA's Spark fine-tuning instructions](https://build.nvidia.com/spark/unsloth/instructions).
-The build script pulls `linux/arm64`, verifies architecture, resolves an immutable
-image digest and preserves NVIDIA's torch/CUDA installation. An isolated venv adds
-Transformers 5.17.0 and datasets 5.0.1 without replacing the GPU runtime.
-
-SCHNITZELJAGD does not require Unsloth model patches, FlashAttention, bitsandbytes or custom
-convolution wheels. It uses the public Transformers embedding interface and the
-ordinary pretrained path as its one-pass baseline. A documented base image is not
-proof that the complete assembled stack has run here: build-time imports and the
-real-device model/gradient preflight verify it on the Spark. `SCHNITZELJAGD_BASE_IMAGE` is an
-explicit override for another tested NVIDIA image.
-
-## Implemented architecture
+## How it works
 
 ```text
-source experience -> shared LFM + learned write slots
-  -> canonical key and fixed values -> per-space codecs -> stored payloads
-
-prompt -> prelude -> shared core -> query/read -> bridge + soft result
-  -> same shared core again -> coda -> later teacher target
-
-training: consumer cotangents -> selective replay of live source producers
-inference: stored payloads only; no producer encoding on the read path
+          ┌──────────── writing ────────────┐
+ a task ──▶ model works on it ──▶ writes a few latent notes ──┐
+                                                             ▼
+                                              ┌──────────────────────────┐
+                                              │  the bank (Zettelkasten) │
+                                              │  many small records with │
+                                              │  IDs, time, provenance   │
+                                              └──────────────────────────┘
+                                                             │
+ a new task ──▶ model thinks ──▶ asks the bank ──▶ combines ─┘
+                   ▲                                 │  the hits
+                   └───── reads them, thinks on ◀────┘
 ```
 
-The new main experiment retains LFM's 14 layers, repeats layers `[4:10]`, and
-reads SCHNITZELJAGD between core passes. The one-pass plain-input path exactly preserves the
-parent at installation. The writer stays at one pass while consumer depth changes.
-Native masks and positional conventions are retained; no KV/conv cache crosses a
-loop. The initial gates are small but live, not zeroed across all extra computation.
+**1. Writing.** While the model processes a trajectory (a conversation, a tool
+session, a document), it emits memory records: variable-length runs of soft
+tokens in the same space the model uses for its own input embeddings.
+Compression can be light (about x4) for details that must survive, or heavy
+(x32 and beyond) for the gist. Records carry an opaque ID, a timestamp and where
+they came from.
 
-The recurrent set readers, multiscale transforms, selective producer replay, and
-checkpointing remain. In-loop raw reads and persisted full-cluster codes are
-implemented, with complete cumulative aggregation at each boundary and raw fallback
-for partial clusters. Native single-read training supports temporary mean/synthetic
-compaction with interleaved or paired raw/compact objectives, including replay and
-emergency resume. Streaming in-loop reads and multi-read compaction remain deferred.
-Offline code fitting is separate from stored-only reads.
+**2. Storing.** Records go into a bank that behaves like a *Zettelkasten*
+(Niklas Luhmann's slip box): lots of small, self-contained notes, retrieved and
+recombined as needed, never read front to back. Each record is indexed in
+several retrieval spaces. Coarse spaces find broadly relevant material, and fine
+ones pin down specifics.
 
-[The research and conversion note](docs/recurrence.md) explains the choice, equations,
-2025–September 2026 primary evidence, conversion curriculum, limitations, and exact
-commands. The legacy full-stack adapter remains available as a control.
+**3. Reading.** When the model needs something, it forms a query from what it
+has seen so far, never from the answer it is about to produce. It retrieves a
+handful of records, and a gated combiner weighs them and merges them into one
+span that the model reads, much as it would read text. A gate can turn an
+irrelevant record all the way down.
 
-## What is measured
+**4. Learning end to end.** At training time, gradients flow from a later
+task's loss back through the read, the combiner and the notes, into the
+computation that wrote them. So the writer is shaped by how useful its notes
+turn out to be. Inference is kept honest: it reads only the stored notes and
+never goes back to re-encode the original experience.
 
-Every stage writes held-out supports once, serializes/reopens the bank, and performs
-stored-only teacher evaluation. Metrics include full-target NLL, token-weighted
-summaries, paired trajectory intervals, no memory, zero payloads, and fixed-key/ID
-payload permutation. Reference likelihood is **not** an agent execution success rate.
+**5. Tidying up.** As the bank grows, clusters of similar records can be
+*compacted* into fewer codes. The compacted code has to produce the same effect
+on a reader as the cluster it replaces, including how much weight that cluster
+carried. That is the "holographic" part of the name: many memories superposed
+in one representation.
 
-After the last checkpoint freezes, new Boolean and multi-binding worlds test support
-removal, adjusted-answer source counterfactuals, joint evidence and exact identifiers.
-For the starter this is an out-of-domain diagnostic; `looped_causal.yaml` supplies the relevant
-controlled training family. No evaluation threshold silently changes the recipe.
+**6. Getting better by leaving better trails.** Agents don't message each other.
+One writes, and later ones are steered by what they find, the way ants follow
+and reinforce pheromone trails (*stigmergy*). The bank for a domain keeps
+evolving: each new attempt at a task reads earlier attempts and supersedes its
+own old record. Over time the bank accumulates know-how that any task in that
+domain can draw on.
 
-Artifacts stay under the run directory: revision locks, prepared JSONL, model probe,
-metrics, optimizer/model/cache checkpoints, stored banks and evaluation JSON. Input
-files are hashed and indexed by offsets rather than all retained in training RAM.
+## Where things stand
 
-## Research status
+This is an active research project, not a finished system. Some parts are well
+tested, some are being built, and some are still plans.
 
-**Version 0.4.0 · Student `LiquidAI/LFM2.5-230M` · Initial GPU validation: DGX Spark.**
-The Python runtime supports CPU/CUDA; Spark-specific checks live in the container wrapper.
-The Python package, CLI, agent class, scripts, container and active documentation now
-use SCHNITZELJAGD (`schnitz`, `SchnitzelAgent`). Historical experiment logs remain immutable evidence.
+- The pipeline runs end to end on a real small model (LiquidAI LFM2.5) on an
+  NVIDIA DGX Spark. It covers writing, storing, serializing a bank, reopening it
+  and reading from it.
+- On controlled synthetic tasks, the model can combine separate stored notes
+  into correct new actions. It keeps that ability when the notes are compacted.
+- Precise recall of unseen details through latent notes is not solved yet. The
+  first generation of notes turned out to carry too little of their content.
+- The project is therefore restarting on a decoder that already reads
+  compressed text well (a BGKit-style compressor). On that decoder, the model
+  learns to write its own compressed notes, then to combine them, then to use
+  them on real tasks: tool calling, SQL, code and text-world agents.
 
-[Research status](docs/research-status.md) summarizes what is established and what
-remains open, including the completed reader-capacity and real-trajectory studies.
-The next target combines the [trajectory memory v0.5 plan](docs/trajectory-memory-v0.5.md)
-with the [mutable-bank v0.8 contract](docs/mutable-bank-v0.8.md):
-frequent visible memory search/write tool calls at distinct causal positions,
-length-scaled write-call counts, recursive read-augmented writes into one
-continuously learned bank, and
-corpus-scale storage. The first compatibility stage now implements multi-site stored
-reads; learned call placement, multi-site writes, recursive authored bank evolution,
-and corpus scale remain planned and are not attributed to it.
-The multi-site target runs the whole teacher-forced trajectory at each recurrent
-level, retrieves all active spatial sites together, and scatters results into blank
-site workspaces for the following level.
+The details, with every number and its caveats, are in
+[research status](docs/research-status.md). The current work plan is the
+[restart plan](docs/bgkit-restart-plan.md).
 
-Run ownership, detached start/stop/resume, optional W&B and verified external-disk
-archives are documented in [portable training operations](docs/operations.md).
-See [current Spark validation](docs/validation-spark.md) for tested behavior and remaining limits.
-The [Muon binding study](experiments/binding-muon-20260919/README.md) and
-[longer MLP continuation](experiments/binding-continuation-20260919/README.md) confirm
-narrow stored-memory action composition with both attention and the pooled MLP.
-Reliable competing-entity composition and exact unseen identifiers remain unresolved;
-the first [learned routing intervention](experiments/binding-routing-20260919/README.md)
-learned source types but did not solve entity selection.
-Later [global retrieval tests](experiments/binding-global-routing-20260919/README.md)
-exposed the dependence on supplied world membership. Later
-[cross-world training](experiments/binding-global-stored-long-20260919/README.md)
-reaches 101/128 generated actions on a fresh 128-record bank, but
-[adding distractors](experiments/binding-bank-scale-20260919/README.md) reduces this
-to 76/128 at 4,096 records, with uncertain benefit over no memory.
-[Corrected scoring precision](experiments/binding-routing-precision-20260919/README.md)
-preserves this pattern (102/128 and 78/128). An
-[exact-detail control](experiments/binding-exact-detail-20260920/README.md)
-copies 64/64 unseen identifiers from selected text but 0/64 from latent payloads;
-perfect retrieval alone does not solve this representation/training failure.
-The [matched breadth](experiments/binding-detail-breadth-20260920/README.md) and
-[alternate-history](experiments/binding-endpoint-views-20260920/README.md) continuations
-preserve oracle action composition but still give 0/64 exact identifiers.
-[Temporary-compaction training](experiments/binding-compact-aware-20260920/README.md)
-now makes a single mean-plus-mass MLP code preserve 128/128 actions and the tested
-rule-change pairs; its matched raw-trained mean-code control gets 81/128. The raw
-path regresses to 126/128. The completed [paired-objective comparison](experiments/binding-paired-compaction-20260920/README.md)
-has mixed raw-path results and no compact advantage over interleaving. Raw fallback
-records remain stored; net disk savings are not established.
-A [lexical selection control](experiments/binding-lexical-routing-20260920/README.md)
-recovers 128/128 stored-memory actions at 4,096 records using an additional source-token
-index; this exposes the literal-name fixture and does not improve learned keys.
-A [focused copy diagnostic](experiments/binding-copy-fit-20260920/README.md) fits
-64/64 training identifiers but fails changed and held-out endpoints, with rule/action
-regressions. The completed [endpoint freshness study](experiments/binding-endpoint-freshness-20260920/README.md)
-reduces old-target reuse with broader training but still generates 0/64 original
-held-out endpoints. [Frozen readouts](experiments/binding-reader-stages-20260920/README.md)
-find weaker character access through the reader than in its input payloads. The
-[reader-capacity study](experiments/binding-reader-capacity-20260920/README.md) is
-now training matched reset readers of two widths; its capability results are pending.
-The [bgkit audit](docs/bgkit-audit.md) records storage, recovery and runtime adoption.
+## Try it
 
-## Offline development
-
-With Python 3.11+ and CPU PyTorch installed:
+The core tests and a tiny recurrent curriculum run on a laptop CPU and need no
+downloads (Python 3.11+ with PyTorch):
 
 ```bash
 python -m pip install -e '.[dev]'
 python -m pytest -q
 schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline
-schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline --resume
 ```
 
-Core tests do not download models/data. Current execution and capability evidence
-is in [Spark validation](docs/validation-spark.md). The earlier
-[0.4 handoff](docs/validation-v0.4.md) remains historical CPU evidence.
+Real-model training runs in an NVIDIA container on a DGX Spark. The
+[getting started guide](docs/getting-started.md) walks through the Spark launch,
+the training recipes and what each run measures.
 
-[Recurrent conversion](docs/recurrence.md) · [Positional memory interface](docs/positional-memory-v0.7.md) · [Architecture](docs/architecture.md) · [Implementation](docs/implementation.md) ·
-[Dataset guide](docs/datasets.md) · [Training](docs/training.md) ·
-[Migration](docs/migration.md) · [Publication/handoff](docs/handoff.md)
+## Where to read next
+
+| If you want… | Read |
+|---|---|
+| to run things | [Getting started](docs/getting-started.md) · [Training](docs/training.md) · [Spark setup](docs/spark.md) · [Operations](docs/operations.md) |
+| the full design | [Architecture](docs/architecture.md) · [Recurrent reading](docs/recurrence.md) · [Implementation](docs/implementation.md) |
+| what has been shown | [Research status](docs/research-status.md) · [Spark validation](docs/validation-spark.md) · [`experiments/`](experiments/) |
+| what's happening now | [Restart plan](docs/bgkit-restart-plan.md) · [Backlog](docs/backlog.md) |
+| the data | [Dataset guide](docs/datasets.md) |
+| the name | [Naming](docs/naming.md) |
+
+Contributors: please read [AGENTS.md](AGENTS.md) first. It lists the invariants
+that keep the experiments honest.
 
 ## The acronym
 
-**Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders**
+**S**tigmergic **C**ompactable **H**olographic **N**eural **I**ndexed
+**T**rajectory **Z**ettelkasten with **E**volving **L**atents, **J**ointly
+**A**dapted by **G**ated **D**ecoders.
