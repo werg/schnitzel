@@ -178,3 +178,64 @@ def span_mask(starts: list[int], lengths: list[int], width: int, device=None) ->
     start = torch.tensor(starts, device=device)[:, None]
     end = start + torch.tensor(lengths, device=device)[:, None]
     return ((pos >= start) & (pos < end)).unsqueeze(-1)
+
+
+def fourier(x: torch.Tensor, frequencies: int = 8) -> torch.Tensor:
+    """Features of values in [0, 1] (positions) or log-ratios: x, sin, cos at octave scales."""
+    scales = 2.0 ** torch.arange(frequencies, device=x.device) * math.pi
+    angles = x.unsqueeze(-1).float() * scales
+    return torch.cat([x.unsqueeze(-1).float(), angles.sin(), angles.cos()], dim=-1)
+
+
+class SpaceCodec(nn.Module):
+    """Size-agnostic projection of a dense span (n reps) to a coarser space (m reps).
+
+    Output i of m is a normalized, attention-weighted mix of the full-width source
+    reps (plus a zero-initialized low-rank correction of the values and a
+    query-conditioned delta), so pooling finer reps into coarser ones is the easy
+    case and no narrow bottleneck carries content. Queries are generated from the
+    normalized output position (i + 0.5) / m and the compression log2(n / m); keys
+    see source content and normalized source position (j + 0.5) / n. Each round
+    updates the queries from what they read. About 2M parameters at width 1024."""
+
+    def __init__(self, width: int, target_norm: float, inner: int = 256, heads: int = 4,
+                 rounds: int = 2, rank: int = 32, frequencies: int = 8):
+        super().__init__()
+        feats = 2 * frequencies + 1
+        self.heads, self.inner, self.frequencies = heads, inner, frequencies
+        self.target_norm = float(target_norm)
+        self.query0 = nn.Sequential(nn.Linear(2 * feats, inner), nn.SiLU(), nn.Linear(inner, inner))
+        self.key_content = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, inner))
+        self.key_position = nn.Linear(feats, inner)
+        self.read_back = nn.Linear(width, inner)
+        self.rounds = nn.ModuleList(
+            nn.ModuleDict({'q': nn.Linear(inner, inner),
+                           'mlp': nn.Sequential(nn.LayerNorm(inner), nn.Linear(inner, 2 * inner),
+                                                nn.SiLU(), nn.Linear(2 * inner, inner))})
+            for _ in range(rounds))
+        self.value_down = nn.Linear(width, rank, bias=False)
+        self.value_up = nn.Linear(rank, width, bias=False)
+        self.delta = nn.Linear(inner, width)
+        for layer in (self.value_up, self.delta):
+            nn.init.zeros_(layer.weight)
+        nn.init.zeros_(self.delta.bias)
+
+    def forward(self, source: torch.Tensor, count: int) -> torch.Tensor:
+        """``source`` (n, width) -> (count, width) in the decoder's input space."""
+        n, device = source.shape[0], source.device
+        x = source.float()
+        out_pos = (torch.arange(count, device=device) + 0.5) / count
+        src_pos = (torch.arange(n, device=device) + 0.5) / n
+        ratio = torch.full((count,), math.log2(max(n, 1) / max(count, 1)) / 8, device=device)
+        query = self.query0(torch.cat([fourier(out_pos, self.frequencies),
+                                       fourier(ratio, self.frequencies)], dim=-1))
+        keys = self.key_content(x) + self.key_position(fourier(src_pos, self.frequencies))
+        values = x + self.value_up(self.value_down(x))
+        head = self.inner // self.heads
+        k = keys.view(n, self.heads, head).transpose(0, 1)
+        for block in self.rounds:
+            q = block['q'](query).view(count, self.heads, head).transpose(0, 1)
+            weights = torch.softmax(q @ k.transpose(1, 2) / math.sqrt(head), dim=-1)
+            mixed = (weights @ values.unsqueeze(0)).mean(0)          # (count, width)
+            query = query + block['mlp'](query + self.read_back(mixed))
+        return interface_rms(mixed + self.delta(query), self.target_norm)

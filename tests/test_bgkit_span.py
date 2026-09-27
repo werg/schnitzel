@@ -81,3 +81,23 @@ def test_open_adapter_merges_exactly():
     with gate.active(torch.ones(3, 1)):
         merged = layers[0](x)  # hook removed: the gate no longer adds anything
     assert torch.allclose(merged, opened, atol=1e-5)
+
+
+def test_space_codec_is_size_agnostic_and_small():
+    from sdkb.bgkit_span import SpaceCodec
+
+    codec = SpaceCodec(1024, target_norm=0.8)
+    assert sum(p.numel() for p in codec.parameters()) < 5_000_000
+    for n, m in ((13, 7), (5, 1), (200, 25)):
+        out = codec(torch.randn(n, 1024), m)
+        assert out.shape == (m, 1024)
+        assert torch.allclose(out.norm(dim=-1), torch.full((m,), 0.8), atol=0.05)
+
+
+def test_space_codec_starts_as_attention_pooling():
+    from sdkb.bgkit_span import SpaceCodec, interface_rms
+
+    codec = SpaceCodec(16, target_norm=1.0, inner=8, heads=2)
+    same = torch.randn(1, 16).expand(6, -1)
+    out = codec(same, 3)
+    assert torch.allclose(out, interface_rms(same[:3], 1.0), atol=1e-5)
