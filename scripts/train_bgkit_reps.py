@@ -66,9 +66,10 @@ def _heldout(record_id: str) -> bool:
 class TeacherCache:
     """Random access into the B1 shards (memory-mapped safetensors)."""
 
-    def __init__(self, root: Path, sources: Path):
+    def __init__(self, root: Path, sources: Path | None, texts: list[str] | None = None):
         from safetensors import safe_open
-        self.texts = [json.loads(line)['text'] for line in sources.open(encoding='utf-8')]
+        self.texts = texts if texts is not None else [
+            json.loads(line)['text'] for line in sources.open(encoding='utf-8')]
         shard_size = json.loads((root / 'manifest.json').read_text())['identity']['shard_size']
         self.handles, self.items = {}, []
         self.offsets: dict[tuple[int, str], torch.Tensor] = {}
@@ -262,8 +263,10 @@ class Model:
              decoder=None, index: torch.Tensor | None = None):
         """S2 layout for each example's task; returns (target logits (N, V), target ids (N,))."""
         dec = decoder or self.decoder
-        suffix = [torch.cat([self.instr[ex['task']], ex['target'], self.eos]) for ex in examples]
-        start = [self.instr[ex['task']].shape[0] for ex in examples]
+        # an example may bring its own instruction (e.g. a question) instead of the task's
+        instr = [ex['instr'] if 'instr' in ex else self.instr[ex['task']] for ex in examples]
+        suffix = [torch.cat([ins, ex['target'], self.eos]) for ins, ex in zip(instr, examples)]
+        start = [ins.shape[0] for ins in instr]
         prefix = [self.tpl.prefix.cpu()] * len(examples)
         if full:
             reps = [dec.embed(ex['ids'].to(self.device)) for ex in examples]
