@@ -1,75 +1,11 @@
 # SCHNITZELJAGD
 
-> Formerly SDKB (`sdkb`). Historical experiment records retain their original names.
+*Schnitzeljagd* is German for a treasure hunt: one group leaves clues, and another follows them
+to the goal.
 
-[Research status](docs/research-status.md) summarizes what is established and what
-remains open, including the completed reader-capacity and real-trajectory studies.
-The next target combines the [trajectory memory v0.5 plan](docs/trajectory-memory-v0.5.md)
-with the [mutable-bank v0.8 contract](docs/mutable-bank-v0.8.md):
-frequent visible memory search/write tool calls at distinct causal positions,
-length-scaled write-call counts, recursive read-augmented writes into one
-continuously learned bank, and
-corpus-scale storage. The first compatibility stage now implements multi-site stored
-reads; learned call placement, multi-site writes, recursive authored bank evolution,
-and corpus scale remain planned and are not attributed to it.
-The multi-site target runs the whole teacher-forced trajectory at each recurrent
-level, retrieves all active spatial sites together, and scatters results into blank
-site workspaces for the following level.
-
-Run ownership, detached start/stop/resume, optional W&B and verified external-disk
-archives are documented in [portable training operations](docs/operations.md).
-See [current Spark validation](docs/validation-spark.md) for tested behavior and remaining limits.
-The [Muon binding study](experiments/binding-muon-20260919/README.md) and
-[longer MLP continuation](experiments/binding-continuation-20260919/README.md) confirm
-narrow stored-memory action composition with both attention and the pooled MLP.
-Reliable competing-entity composition and exact unseen identifiers remain unresolved;
-the first [learned routing intervention](experiments/binding-routing-20260919/README.md)
-learned source types but did not solve entity selection.
-Later [global retrieval tests](experiments/binding-global-routing-20260919/README.md)
-exposed the dependence on supplied world membership. Later
-[cross-world training](experiments/binding-global-stored-long-20260919/README.md)
-reaches 101/128 generated actions on a fresh 128-record bank, but
-[adding distractors](experiments/binding-bank-scale-20260919/README.md) reduces this
-to 76/128 at 4,096 records, with uncertain benefit over no memory.
-[Corrected scoring precision](experiments/binding-routing-precision-20260919/README.md)
-preserves this pattern (102/128 and 78/128). An
-[exact-detail control](experiments/binding-exact-detail-20260920/README.md)
-copies 64/64 unseen identifiers from selected text but 0/64 from latent payloads;
-perfect retrieval alone does not solve this representation/training failure.
-The [matched breadth](experiments/binding-detail-breadth-20260920/README.md) and
-[alternate-history](experiments/binding-endpoint-views-20260920/README.md) continuations
-preserve oracle action composition but still give 0/64 exact identifiers.
-[Temporary-compaction training](experiments/binding-compact-aware-20260920/README.md)
-now makes a single mean-plus-mass MLP code preserve 128/128 actions and the tested
-rule-change pairs; its matched raw-trained mean-code control gets 81/128. The raw
-path regresses to 126/128. The completed [paired-objective comparison](experiments/binding-paired-compaction-20260920/README.md)
-has mixed raw-path results and no compact advantage over interleaving. Raw fallback
-records remain stored; net disk savings are not established.
-A [lexical selection control](experiments/binding-lexical-routing-20260920/README.md)
-recovers 128/128 stored-memory actions at 4,096 records using an additional source-token
-index; this exposes the literal-name fixture and does not improve learned keys.
-A [focused copy diagnostic](experiments/binding-copy-fit-20260920/README.md) fits
-64/64 training identifiers but fails changed and held-out endpoints, with rule/action
-regressions. The completed [endpoint freshness study](experiments/binding-endpoint-freshness-20260920/README.md)
-reduces old-target reuse with broader training but still generates 0/64 original
-held-out endpoints. [Frozen readouts](experiments/binding-reader-stages-20260920/README.md)
-find weaker character access through the reader than in its input payloads. The
-[reader-capacity study](experiments/binding-reader-capacity-20260920/README.md) is
-now training matched reset readers of two widths; its capability results are pending.
-The [bgkit audit](docs/bgkit-audit.md) records storage, recovery and runtime adoption.
-
-**Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders**
-
-SCHNITZELJAGD trains a small language model to write experiences into stored latent values,
-compose selected values through a recurrent set reader, and use the result on later
-questions or actions. Selective replay trains the writer without retaining every
-source graph. Compaction learns to replace groups with synthetic records while
-preserving their conditional contributions.
-
-**Version 0.4.0 · Student `LiquidAI/LFM2.5-230M` · Initial GPU validation: DGX Spark.**
-The Python runtime supports CPU/CUDA; Spark-specific checks live in the container wrapper.
-The Python package, CLI, agent class, scripts, container and active documentation now
-use SCHNITZELJAGD (`schnitz`, `SchnitzelAgent`). Historical experiment logs remain immutable evidence.
+That idea inspires SCHNITZELJAGD. A small language model writes experiences as latent memories;
+later agents retrieve and combine those memories to solve new tasks. The writer leaves a trail
+for future readers.
 
 ## Start on the Spark
 
@@ -216,6 +152,69 @@ Artifacts stay under the run directory: revision locks, prepared JSONL, model pr
 metrics, optimizer/model/cache checkpoints, stored banks and evaluation JSON. Input
 files are hashed and indexed by offsets rather than all retained in training RAM.
 
+## Research status
+
+**Version 0.4.0 · Student `LiquidAI/LFM2.5-230M` · Initial GPU validation: DGX Spark.**
+The Python runtime supports CPU/CUDA; Spark-specific checks live in the container wrapper.
+The Python package, CLI, agent class, scripts, container and active documentation now
+use SCHNITZELJAGD (`schnitz`, `SchnitzelAgent`). Historical experiment logs remain immutable evidence.
+
+[Research status](docs/research-status.md) summarizes what is established and what
+remains open, including the completed reader-capacity and real-trajectory studies.
+The next target combines the [trajectory memory v0.5 plan](docs/trajectory-memory-v0.5.md)
+with the [mutable-bank v0.8 contract](docs/mutable-bank-v0.8.md):
+frequent visible memory search/write tool calls at distinct causal positions,
+length-scaled write-call counts, recursive read-augmented writes into one
+continuously learned bank, and
+corpus-scale storage. The first compatibility stage now implements multi-site stored
+reads; learned call placement, multi-site writes, recursive authored bank evolution,
+and corpus scale remain planned and are not attributed to it.
+The multi-site target runs the whole teacher-forced trajectory at each recurrent
+level, retrieves all active spatial sites together, and scatters results into blank
+site workspaces for the following level.
+
+Run ownership, detached start/stop/resume, optional W&B and verified external-disk
+archives are documented in [portable training operations](docs/operations.md).
+See [current Spark validation](docs/validation-spark.md) for tested behavior and remaining limits.
+The [Muon binding study](experiments/binding-muon-20260919/README.md) and
+[longer MLP continuation](experiments/binding-continuation-20260919/README.md) confirm
+narrow stored-memory action composition with both attention and the pooled MLP.
+Reliable competing-entity composition and exact unseen identifiers remain unresolved;
+the first [learned routing intervention](experiments/binding-routing-20260919/README.md)
+learned source types but did not solve entity selection.
+Later [global retrieval tests](experiments/binding-global-routing-20260919/README.md)
+exposed the dependence on supplied world membership. Later
+[cross-world training](experiments/binding-global-stored-long-20260919/README.md)
+reaches 101/128 generated actions on a fresh 128-record bank, but
+[adding distractors](experiments/binding-bank-scale-20260919/README.md) reduces this
+to 76/128 at 4,096 records, with uncertain benefit over no memory.
+[Corrected scoring precision](experiments/binding-routing-precision-20260919/README.md)
+preserves this pattern (102/128 and 78/128). An
+[exact-detail control](experiments/binding-exact-detail-20260920/README.md)
+copies 64/64 unseen identifiers from selected text but 0/64 from latent payloads;
+perfect retrieval alone does not solve this representation/training failure.
+The [matched breadth](experiments/binding-detail-breadth-20260920/README.md) and
+[alternate-history](experiments/binding-endpoint-views-20260920/README.md) continuations
+preserve oracle action composition but still give 0/64 exact identifiers.
+[Temporary-compaction training](experiments/binding-compact-aware-20260920/README.md)
+now makes a single mean-plus-mass MLP code preserve 128/128 actions and the tested
+rule-change pairs; its matched raw-trained mean-code control gets 81/128. The raw
+path regresses to 126/128. The completed [paired-objective comparison](experiments/binding-paired-compaction-20260920/README.md)
+has mixed raw-path results and no compact advantage over interleaving. Raw fallback
+records remain stored; net disk savings are not established.
+A [lexical selection control](experiments/binding-lexical-routing-20260920/README.md)
+recovers 128/128 stored-memory actions at 4,096 records using an additional source-token
+index; this exposes the literal-name fixture and does not improve learned keys.
+A [focused copy diagnostic](experiments/binding-copy-fit-20260920/README.md) fits
+64/64 training identifiers but fails changed and held-out endpoints, with rule/action
+regressions. The completed [endpoint freshness study](experiments/binding-endpoint-freshness-20260920/README.md)
+reduces old-target reuse with broader training but still generates 0/64 original
+held-out endpoints. [Frozen readouts](experiments/binding-reader-stages-20260920/README.md)
+find weaker character access through the reader than in its input payloads. The
+[reader-capacity study](experiments/binding-reader-capacity-20260920/README.md) is
+now training matched reset readers of two widths; its capability results are pending.
+The [bgkit audit](docs/bgkit-audit.md) records storage, recovery and runtime adoption.
+
 ## Offline development
 
 With Python 3.11+ and CPU PyTorch installed:
@@ -234,3 +233,7 @@ is in [Spark validation](docs/validation-spark.md). The earlier
 [Recurrent conversion](docs/recurrence.md) · [Positional memory interface](docs/positional-memory-v0.7.md) · [Architecture](docs/architecture.md) · [Implementation](docs/implementation.md) ·
 [Dataset guide](docs/datasets.md) · [Training](docs/training.md) ·
 [Migration](docs/migration.md) · [Publication/handoff](docs/handoff.md)
+
+## The acronym
+
+**Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders**
