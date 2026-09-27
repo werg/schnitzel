@@ -72,12 +72,20 @@ The decoder emits a compressed span:
   can compress at x4, x8, x16, …
 - Reps are ordered as the teacher's survivors (document order).
 
-### 3.3 Spaces become ratios (proposed)
-R5d5's four spaces were four widths of one record (4/8/16/36 tokens). Here each
-space is the same record compressed at a different ratio (e.g. x4, x8, x16, x32),
-each with its own variable-length payload and its own key. Coarse spaces give
-cheap wide reads; fine spaces give detail. This keeps R5d5's four key spaces as
-distillation targets.
+### 3.3 Dense, size-scaled compression (owner decision, 27 September)
+Compression is denser than x4 throughout and grows with input size: longer texts
+are compressed harder. During BGKit distillation the ratio is a function of the
+source length N within BGKit's trained range (x8 for short passages rising
+toward x32–x64 for long documents). After distillation, output sizes become
+logarithmic in the source length, k(N) = ceil(a·log2(N) + b), with a and b set
+from the distilled model's measured quality-per-rep curve.
+
+### 3.3a Spaces
+R5d5's four spaces were four widths of one record. Here each space is the same
+record at a different compression level (a different k(N) scale), each with its
+own variable-length payload and key, so R5d5's four key spaces remain
+distillation targets. Space projections are initialized from the corresponding
+R5d5 weights where shapes allow (both models are 1024 wide).
 
 ### 3.4 Storage
 Payloads become variable-length sequences of 1024-d bf16 vectors per record and
@@ -126,29 +134,51 @@ R5d5's routing addresses (queries), cached offline. Gate: retrieval recall with
 distilled keys on R5d5's validation sites close to R5d5's (0.94 union at
 checkpoint 1000).
 
-**B6 — Reads by splicing.** A read inserts retrieved records' rep sequences
-(each wrapped in its markers) into the read workspace under a rep budget per
-space, instead of the MLP reader's fixed slots. Build the bank by frozen-writer
+**B6 — Reads.** A read passes the retrieved records' rep sequences and their
+gates through the combiner (B7), whose variable-length output span is spliced
+into the read workspace at the loop boundary, instead of the MLP reader's fixed
+slots. Before B7 exists, the first reading runs splice gold reps directly. Build the bank by frozen-writer
 generation; train reading with retrieval (gold-forced at first, then annealed).
 Gate: memory-vs-text probe fraction far above R5d5's 5%; invented-passage
 fraction above 50% at x4.
 
-**B7 — Combiners.** Multi-record compaction by the same mechanism: the decoder
-generates a node span from its children's spans at 1/4 (BGKit tree nodes). First
-distill BGKit's multi-level node encodings (`encode_tree`, identity bridge), then
-train on task loss. Mass/responsibility invariants (5, 7) carry over to how
-children are weighted.
+**B7 — Combiners (block-operator MLPs on variable-size records).** The combiners
+keep SDKB's block-operator-matrix form, made size-agnostic: each block is an MLP
+applied to a contribution indexed by normalized positions (output i of m, input
+j of n) and content, so the operator is defined for any input and output length
+rather than for fixed slot counts. Inputs are the retrieved records' reps with
+their gate weights; contributions keep pre-normalization numerators and masses
+(invariants 5 and 7), so gating is part of the operator, not an afterthought.
+
+Distillation target (owner direction): the combiner's output should look like
+BGKit's compressed encoding of *all the relevant parts* — the S2 encoder,
+reconstruct prompt, over the concatenated gold texts of the read, at the output
+size k(total length). Gates may be fudged during this phase (e.g. gold records
+fixed at full weight, others as scored), since the target only describes the
+relevant content. Combiner and space-projection weights start from R5d5's
+operator reader where shapes allow, so training begins near a working function
+and moves toward the BGKit manifold. Train only the combiners, everything else
+frozen; then leave distillation quickly for task loss with learned gates. Also
+distill BGKit multi-level node encodings (`encode_tree`, 1/4 re-encoding) for
+compaction of stored records.
 
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
 datasets) and periodic memory-use evaluation.
 
-## 5. Open decisions
+## 5. Decisions (owner, 27 September)
 
-1. Space ratios (x4/x8/x16/x32 proposed) and whether x4 is affordable for the
-   full bank (about 80 KB per passage per space).
-2. Whether to keep the recurrent middle-block loops (R5) in the first B6 runs
-   or start one-pass and reintroduce loops after reading works.
-3. Whether reads carry per-record relevance (gates) when splicing; BGKit has no
-   weighting, and scaling reps would leave the interface-norm distribution.
-4. Whether R5d5 keeps training until B5 needs its keys (it is the key teacher).
+1. Dense compression, above x4, scaled with input size; logarithmic output sizes
+   after distillation (3.3).
+2. Recurrent loops are kept: reads happen at loop boundaries as in R5.
+3. Reads are gated. Retrieved records pass through the gated block-operator
+   combiner (B7), which produces the spliced read span; raw rep sequences are not
+   spliced unweighted. Gates may be fudged only during distillation.
+4. R5d5 is stopped (27 September, step ~1480) and serves as the frozen key
+   teacher for B5.
+
+## 6. Still open
+
+- Exact k(N) during distillation and the log-law constants afterwards.
+- Positional parametrization of the size-agnostic operator blocks.
+- How the read budget per space is set when every read passes through a combiner.
