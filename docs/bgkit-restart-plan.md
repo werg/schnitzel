@@ -263,6 +263,27 @@ s1/s2/s3 (pooling 0.48/0.06/−0.08, teacher 0.63/0.47/0.33).
 episode, the S2 encoding of its gold records' texts joined in order, at the
 four length-scaled space ratios.
 
+**Soft I/O port (owner side quest, 27 September).** For end-to-end
+differentiable subagents: the decoder reads task prompts and questions given as
+BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
+
+- *Input port:* the prompt is encoded by the frozen S2 encoder at x1 and spliced
+  as a `<|bg|>(1)` span in place of its text.
+- *Output port:* a separate marker (`<|port|>`), rep head and stop head (not the
+  memory writer's), targeting S2's x1 encoding of the response text, with the
+  functional loss (a frozen S2 reader recovers the response). Its target space is
+  the frozen S2 encoder's, so it stays BGKit-compatible while the memory
+  write-out space drifts under end-to-end training. The x1 teacher encoding is
+  bidirectional, so each output rep must plan the rest of the response; rollout
+  passes as for the writer.
+- *Schedule:* (1) measure frozen S2 reading x1 soft-token questions (no training);
+  (2) input port after the B3 merge (whole decoder trains): the soft-prompt share
+  of QA, summarize and memory-write prompts ramps 0 → 50% over a few thousand
+  steps, guarded by the replay KL and text-mode evals (ramp pauses on
+  regression); (3) output port once the input port holds, ramping to 50%, with
+  evals over text/soft input × text/soft output. Target: at least half of all
+  tasks through the port.
+
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
 datasets) and periodic memory-use evaluation.
