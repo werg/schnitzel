@@ -315,10 +315,23 @@ so later episodes sharing rules or entities can use them.
 - *Controls:* same rounds with prior trajectories removed; prior trajectories
   swapped with other episodes'; accuracy per round, to catch self-confirming
   errors.
-- *Tasks (stretch goals for a 350M model; under review):* GSM8K-level math with
-  teacher chain-of-thought (worked solutions as know-how), ALFWorld with expert
-  trajectories (agentic, experience memory), Reasoning Gym for difficulty-
-  controlled supply.
+- *One persistent KB per dataset (owner, 27 September):* runs keep working in
+  the same KB. A later run of a task reads the previous run's record of that
+  task and supersedes it (new version with provenance; the old version stays
+  for measurement, not for reading), and every other task of the domain adds and
+  improves its own records, so the KB accumulates domain know-how that each
+  task can draw on. Records carry how they were produced (model-only, hinted,
+  gold-weighted); held-out evaluation tasks read only records whose lineage never
+  saw gold or hints for those tasks.
+- *Tasks (owner-approved, 27 September):* function calling with API
+  documentation held in the KB (xLAM-60k, ToolACE single calls → APIGen-MT
+  multi-turn with domain policies), text-to-SQL with schemas in the KB (Spider,
+  BIRD, SynSQL-2.5M with chain-of-thought), KodCode easy/medium with unit tests
+  as warm-up and control; world-based agent trajectories (ETO / AgentInstruct /
+  AgentBank for ALFWorld, WebShop, ScienceWorld), Knights & Knaves and SynLogic
+  for shared-rule reasoning. Raw data under
+  `/mnt/external/sdkb-archive/raw/{agentic,worlds}-20260927/`. Next: single-pass
+  baselines of S2 on each, with and without the docs/schemas in context.
 
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
