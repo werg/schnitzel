@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 from torch.nn import functional as F
 
-from .agent import ForwardResult, SDKBAgent
+from .agent import ForwardResult, SchnitzelAgent
 from .data import Episode
 from .recurrence import LoopMemory, LoopWrite
 from .routing import cosine_scores, cosine_similarities, group_plan_loss
@@ -12,7 +12,7 @@ from .store import ReadPlan, Selection, lookup_record
 from .storage_contract import KeySearchBackend
 
 
-def stored_corpus_forward(agent: SDKBAgent, store: KeySearchBackend, episode: Episode, *,
+def stored_corpus_forward(agent: SchnitzelAgent, store: KeySearchBackend, episode: Episode, *,
                           generation: str, limits: tuple[int, ...],
                           namespace: str = 'corpus', searcher=None) -> tuple[ForwardResult, dict]:
     """Plan each space from a causal native prefix, then train on fetched values.
@@ -132,7 +132,7 @@ def stored_corpus_forward(agent: SDKBAgent, store: KeySearchBackend, episode: Ep
                     'supplied_positive': True} | contrast_info
 
 
-def stored_corpus_forward_batch(agent: SDKBAgent, store: KeySearchBackend,
+def stored_corpus_forward_batch(agent: SchnitzelAgent, store: KeySearchBackend,
                                 episodes: list[Episode], *, generation: str,
                                 limits: tuple[int, ...], namespace: str = 'corpus',
                                 searcher=None, token_rows: list[dict] | None = None):

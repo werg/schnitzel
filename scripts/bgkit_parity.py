@@ -6,13 +6,13 @@ reconstruction through BGKit's own evaluation arm (``core._arm``) on
 
 - BGKit's own corpus eval split (same stores, seed and sampler as the trainer;
   compare with the checkpoint's ``metadata.json``), and
-- SDKB passages: bank sources and invented passages, with the question-free
+- SCHNITZELJAGD passages: bank sources and invented passages, with the question-free
   reconstruct prompt.
 
 Arms: no context, full text, zeroed x4, and x4/x8/x16/x32/x64 reps. Reports mean
 NLL, token accuracy and the captured fraction of the full-text gain. Runs in the
-``sdkb-bgkit`` container (BGKit image; BGKit source and checkpoints mounted
-read-only). Training-only teacher: nothing here is an SDKB inference path.
+``schnitz-bgkit`` container (BGKit image; BGKit source and checkpoints mounted
+read-only). Training-only teacher: nothing here is an SCHNITZELJAGD inference path.
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def main() -> None:
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--experiment', default='bgkit2_s2_showcase')
     parser.add_argument('--sources', type=Path, action='append', default=[],
-                        help='SDKB source manifests (JSONL with "text"); one set each')
+                        help='SCHNITZELJAGD source manifests (JSONL with "text"); one set each')
     parser.add_argument('--per-set', type=int, default=256)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--cuda-fraction', type=float, default=0.10)

@@ -4,15 +4,15 @@ import numpy as np
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.record_gradients import (GradientSink, KeyStateCache, KeyTable, RecordGradients,
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.record_gradients import (GradientSink, KeyStateCache, KeyTable, RecordGradients,
                                    refresh_records, writer_backward, writer_pass)
-from sdkb.spatial_data import pack_spatial_trajectory
-from sdkb.spatial_training import spatial_bank_pipeline_forward
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training_bank import TrainingBank
+from schnitz.spatial_data import pack_spatial_trajectory
+from schnitz.spatial_training import spatial_bank_pipeline_forward
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training_bank import TrainingBank
 
 from test_spatial_training import StableChatTokenizer
 
@@ -70,7 +70,7 @@ def _bank(agent, tmp_path, count=3):
 
 
 def test_key_state_cache_reproduces_index_and_tracks_versions(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     stored = index.spaces['s0'].keys.copy()
     cache.sync_index(agent, index)
@@ -88,7 +88,7 @@ def test_key_state_cache_reproduces_index_and_tracks_versions(tiny_config, tmp_p
 
 
 def test_writer_backward_with_one_step_cotangents_matches_direct_backprop(tiny_config):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     episodes = [make_episode(index, distractors=1) for index in range(2)]
     texts = [source.text for episode in episodes for source in episode.supports][:3]
     inputs = [agent.text_ids(text, source=True) for text in texts]
@@ -111,7 +111,7 @@ def test_writer_backward_with_one_step_cotangents_matches_direct_backprop(tiny_c
 
 
 def test_device_search_matches_numpy_reference(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, _, _, index, _ = _bank(agent, tmp_path, count=4)
     queries = torch.randn(3, index.spaces['s0'].keys.shape[1])
     kwargs = dict(top_k=5, namespace='corpus', space='s0', generation='g1',
@@ -139,7 +139,7 @@ def test_device_search_matches_numpy_reference(tiny_config, tmp_path):
 
 
 def test_pipeline_sink_collects_key_state_and_payload_cotangents(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     episodes, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     cache.sync_index(agent, index)
     rows = [pack_spatial_trajectory(StableChatTokenizer(), [episode], read_slots=2,
@@ -208,7 +208,7 @@ def test_key_table_adopts_shared_rows_from_a_parent_bank():
 
 
 def test_pipeline_reads_table_keys_and_writer_pass_trains_prediction(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     episodes, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     ids = cache.ids
     table = KeyTable(ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
@@ -253,7 +253,7 @@ def test_pipeline_reads_table_keys_and_writer_pass_trains_prediction(tiny_config
 
 
 def test_writer_pass_gradient_matches_direct_objective(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     ids = cache.ids[:3]
     table = KeyTable(cache.ids, [torch.nn.functional.normalize(
@@ -319,7 +319,7 @@ def test_sphere_adam_keeps_relative_row_strength_and_tangent_direction():
 
 
 def test_incremental_table_sync_patches_index_and_device_mirror(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, writer_inputs, store, index, cache = _bank(agent, tmp_path, count=4)
     table = KeyTable(cache.ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
                      learning_rate=0.5, max_step=1.0)
@@ -350,7 +350,7 @@ def test_incremental_table_sync_patches_index_and_device_mirror(tiny_config, tmp
 
 
 def test_forward_only_writer_pass_publishes_without_gradients(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     table = KeyTable(cache.ids, [torch.from_numpy(a.keys.copy()) for a in index.spaces.values()],
                      learning_rate=0.05)
@@ -390,7 +390,7 @@ def test_vectorized_stalest_matches_reference_order():
 
 def test_writer_pass_without_recompute_matches_gradients(tiny_config, tmp_path):
     tiny_config.model.gradient_checkpointing = True
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     agent.train()
     _, writer_inputs, store, index, cache = _bank(agent, tmp_path)
     table = KeyTable(cache.ids, [torch.nn.functional.normalize(

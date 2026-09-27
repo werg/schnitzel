@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from sdkb.operations import control_dir, run_lock
-from sdkb.trajectories import file_sha256
+from schnitz.operations import control_dir, run_lock
+from schnitz.trajectories import file_sha256
 
 
 def setup(tmp_path, monkeypatch):

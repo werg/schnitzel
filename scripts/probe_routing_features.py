@@ -11,16 +11,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes, make_multiuse_world, save_episodes
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.runtime import available_host_memory, configure_memory, memory_metrics, compute_watchdog
-from sdkb.probe_state import restore_probe_state, save_probe_state, parameter_names
-from sdkb.optimizers import optimizer_report
-from sdkb.tracking import Tracking
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes, make_multiuse_world, save_episodes
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.runtime import available_host_memory, configure_memory, memory_metrics, compute_watchdog
+from schnitz.probe_state import restore_probe_state, save_probe_state, parameter_names
+from schnitz.optimizers import optimizer_report
+from schnitz.tracking import Tracking
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def pair_loss(scores, required, lengths):
@@ -143,7 +143,7 @@ def run(checkpoint, root, steps, train_worlds=0, batch_size=0):
         torch.set_num_threads(config.train.threads)
         random.seed(43)
         torch.manual_seed(43)
-        agent = SDKBAgent(config).to(config.train.device).eval()
+        agent = SchnitzelAgent(config).to(config.train.device).eval()
         load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
         if (config.memory.read_steps != 1 or len(config.memory.payload_dims) != 1
                 or config.memory.independent_routing_query):
@@ -269,7 +269,7 @@ if __name__ == '__main__':
         parser.error('World and batch counts must be nonnegative')
     if args.steps < 1:
         parser.error('--steps must be positive')
-    from sdkb.operations import control_dir
+    from schnitz.operations import control_dir
     def request_stop(_signal, _frame):
         (control_dir(args.output) / 'STOP').touch()
     signal.signal(signal.SIGTERM, request_stop)

@@ -5,7 +5,7 @@ import sys
 import pytest
 import torch
 
-from sdkb.data import make_multiuse_world
+from schnitz.data import make_multiuse_world
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 try:
@@ -47,9 +47,9 @@ def test_readout_normalization_is_fixed_from_training_values():
 
 @pytest.mark.parametrize('representation', ['reader', 'reader_inputs', 'reader_state'])
 def test_reader_feature_uses_only_causal_stored_memory(tmp_path, tiny_config, monkeypatch, representation):
-    from sdkb.agent import SDKBAgent
-    from sdkb.evaluation import build_shared_bank
-    from sdkb.store import DiskStore
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.evaluation import build_shared_bank
+    from schnitz.store import DiskStore
     from probe_payload_identifiers import reader_feature
     c = tiny_config
     c.model.tiny_layers = 4
@@ -59,7 +59,7 @@ def test_reader_feature_uses_only_causal_stored_memory(tmp_path, tiny_config, mo
     c.memory.read_timing, c.memory.read_steps = 'loop_boundary', 1
     c.train.max_source_tokens = c.train.max_prompt_tokens = 512
     c.validate()
-    agent = SDKBAgent(c).eval().requires_grad_(False)
+    agent = SchnitzelAgent(c).eval().requires_grad_(False)
     episode = next(e for e in make_multiuse_world(1, bindings=1) if e.task_family == 'multiuse/identifier')
     other = replace(next(e for e in make_multiuse_world(2, bindings=1)
                          if e.task_family == 'multiuse/identifier'), query=episode.query)

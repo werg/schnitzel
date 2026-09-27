@@ -4,16 +4,16 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.optimizers import make_optimizer
-from sdkb.training import train
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.optimizers import make_optimizer
+from schnitz.training import train
 
 
 def test_writer_key_learning_rate_keeps_all_parameters_owned(tiny_config):
     config = copy.deepcopy(tiny_config)
     config.train.writer_key_learning_rate = 1e-6
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     optimizer = make_optimizer(agent)
     rates = {name: group['lr'] for group, names in zip(
         optimizer.param_groups, optimizer._sdkb_parameter_names, strict=True)
@@ -30,11 +30,11 @@ def test_muon_excludes_reader_fallback_token_tables(tiny_config, kind):
     config = copy.deepcopy(tiny_config)
     config.train.optimizer = 'muon'
     config.memory.reader = kind
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     optimizer = make_optimizer(agent)
     muon_ids = {id(p) for g in optimizer.optimizers['muon'].param_groups for p in g['params']}
     adam_ids = {id(p) for g in optimizer.optimizers['adamw'].param_groups for p in g['params']}
-    from sdkb.readers import SetReader
+    from schnitz.readers import SetReader
     readers = [m for m in agent.modules() if isinstance(m, SetReader)]
     assert readers
     for reader in readers:
@@ -51,12 +51,12 @@ def test_muon_excludes_reader_fallback_token_tables(tiny_config, kind):
 @pytest.mark.skipif(not hasattr(torch.optim, 'Muon'), reason='Native Muon unavailable in this Torch')
 def test_legacy_muon_slot_ownership_is_rejected_before_loading_weights(tmp_path, tiny_config, monkeypatch):
     import random
-    from sdkb import checkpoints
-    from sdkb.optimizers import MuonAdamW
-    from sdkb.store import DiskStore
+    from schnitz import checkpoints
+    from schnitz.optimizers import MuonAdamW
+    from schnitz.store import DiskStore
     config = copy.deepcopy(tiny_config)
     config.train.optimizer = 'muon'
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     optimizer = make_optimizer(agent)
     # Construct the previous ownership topology: fallback tables in memory Muon.
     groups = {name: [dict(params=list(g['params']), lr=g['lr']) for g in opt.param_groups]
@@ -100,8 +100,8 @@ def assert_state_equal(a, b):
 @pytest.mark.skipif(not hasattr(torch.optim, 'Muon'), reason='Native Muon unavailable in this Torch')
 @pytest.mark.parametrize('selected_only', [False, True])
 def test_muon_ownership_and_complete_resume(tmp_path, tiny_config, monkeypatch, selected_only):
-    from sdkb.operations import request_stop
-    from sdkb.replay import ReplayTape
+    from schnitz.operations import request_stop
+    from schnitz.replay import ReplayTape
     config = copy.deepcopy(tiny_config)
     config.train.optimizer = 'muon'
     config.train.steps = 3
@@ -110,7 +110,7 @@ def test_muon_ownership_and_complete_resume(tmp_path, tiny_config, monkeypatch, 
     config.train.selected_producers_only = selected_only
     config.train.checkpoint_every = 1000
     config.memory.noise_std = .02
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     optimizer = make_optimizer(agent)
     owned = [id(p) for g in optimizer.param_groups for p in g['params']]
     assert len(owned) == len(set(owned))
@@ -151,12 +151,12 @@ def test_resume_rejects_optimizer_and_learning_rate_changes(tmp_path, tiny_confi
 
 
 def test_operational_policy_preserves_training_config(tmp_path, tiny_config):
-    from sdkb.operations import configure_checkpoints
+    from schnitz.operations import configure_checkpoints
     run = tmp_path / 'run'
     train(tiny_config, run, stop_after=1)
     configure_checkpoints(run, checkpoint_every=1000, archive_dir=None)
     train(tiny_config, run, resume=True)
-    from sdkb.training import config_from_run
+    from schnitz.training import config_from_run
     saved = config_from_run(run)
     assert saved.train.checkpoint_every == 1000
     assert saved.train.learning_rate == tiny_config.train.learning_rate

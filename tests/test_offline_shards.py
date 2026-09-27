@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from sdkb.offline_bank import ensure_offline_shard, publish_offline_generation
-from sdkb.store import DiskStore, StoredRecord
+from schnitz.offline_bank import ensure_offline_shard, publish_offline_generation
+from schnitz.store import DiskStore, StoredRecord
 
 
 def _records(source_ids, *, namespace='bank', generation='g1'):

@@ -16,31 +16,31 @@ import time
 from safetensors.torch import load_model
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_curriculum import BankCurriculum
-from sdkb.bank_replay import BankWriterReplay
-from sdkb.checkpoints import (resolve_checkpoint, restore_checkpoint, save_checkpoint,
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_curriculum import BankCurriculum
+from schnitz.bank_replay import BankWriterReplay
+from schnitz.checkpoints import (resolve_checkpoint, restore_checkpoint, save_checkpoint,
                               stop_on_signal)
-from sdkb.config import load_config
-from sdkb.key_geometry import BankLoad
-from sdkb.record_gradients import (GradientSink, KeyStateCache, RecordGradients,
+from schnitz.config import load_config
+from schnitz.key_geometry import BankLoad
+from schnitz.record_gradients import (GradientSink, KeyStateCache, RecordGradients,
                                    KeyTable, refresh_records, writer_backward, writer_pass)
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
-from sdkb.offline_bank import (canonical_json, publish_offline_generation,
+from schnitz.offline_bank import (canonical_json, publish_offline_generation,
                                stored_memory_identity, writer_prompt_generation)
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.optimizers import make_optimizer, optimizer_report
-from sdkb.runtime import available_host_memory, configure_memory, reclaim_cuda_cache
-from sdkb.spatial_data import SpatialTrajectoryIndex
-from sdkb.spatial_training import spatial_bank_forward, spatial_bank_pipeline_forward
-from sdkb.routing_curriculum import RoutingCandidateIndex
-from sdkb.store import DiskStore
-from sdkb.training_bank import TrainingBank
-from sdkb.tracking import Tracking
-from sdkb.training import EpisodeSampler, autocast_context, environment_report, resource_report
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.optimizers import make_optimizer, optimizer_report
+from schnitz.runtime import available_host_memory, configure_memory, reclaim_cuda_cache
+from schnitz.spatial_data import SpatialTrajectoryIndex
+from schnitz.spatial_training import spatial_bank_forward, spatial_bank_pipeline_forward
+from schnitz.routing_curriculum import RoutingCandidateIndex
+from schnitz.store import DiskStore
+from schnitz.training_bank import TrainingBank
+from schnitz.tracking import Tracking
+from schnitz.training import EpisodeSampler, autocast_context, environment_report, resource_report
+from schnitz.trajectories import file_sha256
 
 
 # Compute-budget settings that may change on resume (see ``train``).
@@ -380,7 +380,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     random.seed(config.train.seed)
     torch.manual_seed(config.train.seed)
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     for name, parameter in agent.named_parameters():
         if name.startswith(("write_slots", "key_head.", "value_head.",
                             "address_maps.", "writer_key_heads.", "codecs.")):
@@ -459,8 +459,8 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
     if archive_dir is not None:
         # Live run on fast local storage; completed checkpoints are copied to the
         # archive by a background thread, off the training step.
-        from sdkb.archiving import CheckpointArchiver
-        from sdkb.tracking import run_identity
+        from schnitz.archiving import CheckpointArchiver
+        from schnitz.tracking import run_identity
         archive_run = Path(archive_dir) / run_identity(output)
         archive_run.mkdir(parents=True, exist_ok=True)
         archiver = CheckpointArchiver(archive_run, keep=config.train.archive_keep_checkpoints,

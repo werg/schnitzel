@@ -6,8 +6,8 @@ import json
 import pytest
 import yaml
 
-from sdkb.data import make_multiuse_world, counterfactual_multiuse, load_episodes
-from sdkb.launch import launch
+from schnitz.data import make_multiuse_world, counterfactual_multiuse, load_episodes
+from schnitz.launch import launch
 
 
 @pytest.mark.parametrize('kind', ['restoration', 'permission'])
@@ -36,7 +36,7 @@ def test_binding_counterfactual_preserves_world_identity_and_shared_sources(kind
 
 
 def test_binding_curriculum_uses_separate_worlds_and_evaluates_counterfactuals(tmp_path, tiny_config, monkeypatch):
-    import sdkb.evaluation as evaluation
+    import schnitz.evaluation as evaluation
     calls, original = [], evaluation.stored_transfer_evaluation
     def observe(*args, **kwargs):
         result = original(*args, **kwargs)
@@ -81,11 +81,11 @@ def test_binding_curriculum_uses_separate_worlds_and_evaluates_counterfactuals(t
 
 
 def test_full_evidence_fast_path_matches_reference_rows(tmp_path, tiny_config):
-    from sdkb.agent import SDKBAgent
-    from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-    from sdkb.store import DiskStore
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+    from schnitz.store import DiskStore
     episodes = make_multiuse_world(2, bindings=2)
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_shared_bank(agent, store, episodes)
     reference = stored_transfer_evaluation(agent, store, episodes)
@@ -95,9 +95,9 @@ def test_full_evidence_fast_path_matches_reference_rows(tmp_path, tiny_config):
 
 def test_world_learned_routing_respects_eligibility_and_fixed_intervention_plans(
         tmp_path, tiny_config, monkeypatch):
-    from sdkb.data import save_episodes
-    from sdkb.store import DiskStore
-    from sdkb.training import train
+    from schnitz.data import save_episodes
+    from schnitz.store import DiskStore
+    from schnitz.training import train
     tiny_config.train.steps = 1
     tiny_config.train.max_prompt_tokens = 1500
     run = tmp_path / 'model'

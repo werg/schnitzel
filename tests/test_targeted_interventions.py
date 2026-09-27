@@ -3,8 +3,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sdkb.evaluation_interventions import TargetedPayloadStore
-from sdkb.store import DiskStore, StoredRecord, ReadPlan, Selection
+from schnitz.evaluation_interventions import TargetedPayloadStore
+from schnitz.store import DiskStore, StoredRecord, ReadPlan, Selection
 
 
 def fixture(tmp_path):

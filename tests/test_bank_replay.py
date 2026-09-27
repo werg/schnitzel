@@ -1,15 +1,15 @@
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_replay import BankWriterReplay
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.store import DiskStore, ReadPlan, Selection, StoredRecord
-from sdkb.training_bank import TrainingBank
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_replay import BankWriterReplay
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.store import DiskStore, ReadPlan, Selection, StoredRecord
+from schnitz.training_bank import TrainingBank
 
 
 def test_selected_serialized_key_and_payload_replay_then_refresh(tiny_config, tmp_path):
     tiny_config.memory.storage_dtype = 'bfloat16'
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     inputs = {'record': torch.tensor([[1, 2, 3]], dtype=torch.long)}
     with torch.no_grad():
         initial = agent.produce_batch([inputs['record']])
@@ -37,7 +37,7 @@ def test_selected_serialized_key_and_payload_replay_then_refresh(tiny_config, tm
 
 
 def test_replay_reuses_a_record_selected_by_later_read_waves(tiny_config):
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     inputs = {
         'a': torch.tensor([[1, 2, 3]], dtype=torch.long),
         'b': torch.tensor([[4, 5]], dtype=torch.long),
@@ -55,7 +55,7 @@ def test_replay_reuses_a_record_selected_by_later_read_waves(tiny_config):
 
 def test_replay_can_retain_activations_and_restores_checkpoint_policy(tiny_config):
     tiny_config.model.gradient_checkpointing = True
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     inputs = {'a': torch.tensor([[1, 2, 3]], dtype=torch.long)}
     replay = BankWriterReplay(agent, inputs, checkpoint_backward=False)
     leaves = replay.capture(('a',))['a']

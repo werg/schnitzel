@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sdkb.operations import request_stop, run_lock, stop_requested
-from sdkb.trajectories import file_sha256
+from schnitz.operations import request_stop, run_lock, stop_requested
+from schnitz.trajectories import file_sha256
 
 
 @pytest.mark.parametrize('active_child', [False, True])

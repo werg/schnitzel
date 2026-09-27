@@ -37,7 +37,7 @@ span, the gold records' teacher spans concatenated, the combiner over golds, ove
 golds + related, and over related only (gold removed), as captured fractions of
 the full-text gain; and matched controls built from the next episode
 (``teacher_shuffled``, ``comb_shuffled``). A trained span can lower NLL by format
-alone, so ``content_nats`` (shuffled minus actual) is the measure of content. Training-only; runs in ``sdkb-bgkit``.
+alone, so ``content_nats`` (shuffled minus actual) is the measure of content. Training-only; runs in ``schnitz-bgkit``.
 """
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_bgkit_reps import (SPACES, Model, TeacherCache, _example, _kl,  # noqa: E402
                               _rollout)
 
-from sdkb.bgkit_span import SpaceCodec  # noqa: E402
+from schnitz.bgkit_span import SpaceCodec  # noqa: E402
 
 
 class GateHead(nn.Module):

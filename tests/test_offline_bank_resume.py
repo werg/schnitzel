@@ -3,14 +3,14 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode
-from sdkb.evaluation import build_shared_bank
-from sdkb.store import DiskStore, StoredRecord
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode
+from schnitz.evaluation import build_shared_bank
+from schnitz.store import DiskStore, StoredRecord
 
 
 def test_committed_bank_resumes_without_writer_and_ignores_code_views(tiny_config, tmp_path, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     episodes = [make_episode(0)]
     first = build_shared_bank(agent, store, episodes, writer_identity='checkpoint-sha')
@@ -24,7 +24,7 @@ def test_committed_bank_resumes_without_writer_and_ignores_code_views(tiny_confi
 
 
 def test_interrupted_bank_and_manifest_roll_back_together(tiny_config, tmp_path, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     produce, calls = agent.produce, 0
     def interrupted(*args):
@@ -44,7 +44,7 @@ def test_interrupted_bank_and_manifest_roll_back_together(tiny_config, tmp_path,
 
 @pytest.mark.parametrize('change', ['writer', 'source', 'payload', 'deleted', 'extra', 'precision'])
 def test_resume_rejects_changed_identity_or_raw_records(tiny_config, tmp_path, change):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     episodes = [make_episode(0)]
     build_shared_bank(agent, store, episodes, writer_identity='a')
@@ -68,7 +68,7 @@ def test_resume_rejects_changed_identity_or_raw_records(tiny_config, tmp_path, c
 
 
 def test_legacy_bank_is_not_silently_adopted(tiny_config, tmp_path):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     episodes = [make_episode(0)]
     build_shared_bank(agent, store, episodes)

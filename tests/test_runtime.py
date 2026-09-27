@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sdkb import runtime
+from schnitz import runtime
 
 
 def test_unified_memory_uses_available_host_memory(monkeypatch):
@@ -42,7 +42,7 @@ def test_watchdog_does_not_add_unrequested_device_wait(monkeypatch, seconds, dev
 
 
 def test_cpu_resource_reset_never_initializes_cuda(monkeypatch):
-    from sdkb import training
+    from schnitz import training
     monkeypatch.setattr(training.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(training.torch.cuda, "synchronize",
                         lambda: pytest.fail("CPU training synchronized CUDA"))

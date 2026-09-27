@@ -4,7 +4,7 @@ import runpy
 
 import pytest
 
-from sdkb.data import make_multiuse_world
+from schnitz.data import make_multiuse_world
 
 
 def helpers():

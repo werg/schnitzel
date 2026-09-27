@@ -20,20 +20,20 @@ from safetensors import safe_open
 from safetensors.torch import load_model, save_file
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import canonical_json, publish_offline_generation
-from sdkb.operations import atomic_json
-from sdkb.recurrence import SpatialReadSite
-from sdkb.spatial_data import SpatialTrajectoryIndex
-from sdkb.spatial_training import spatial_bank_forward
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.training_bank import TrainingBank
-from sdkb.trajectories import file_sha256
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import canonical_json, publish_offline_generation
+from schnitz.operations import atomic_json
+from schnitz.recurrence import SpatialReadSite
+from schnitz.spatial_data import SpatialTrajectoryIndex
+from schnitz.spatial_training import spatial_bank_forward
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.training_bank import TrainingBank
+from schnitz.trajectories import file_sha256
 
 
 def cache_states(run: Path, bank_dir: Path, sources: Path, data_path: Path,
@@ -63,7 +63,7 @@ def cache_states(run: Path, bank_dir: Path, sources: Path, data_path: Path,
     if config.memory.key_interface != 'shared_maps':
         raise ValueError('State caching converts from the shared-map interface')
     torch.manual_seed(config.train.seed)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     agent.eval()
     index = PublishedKeyIndex(base, namespace=manifest['namespace'],

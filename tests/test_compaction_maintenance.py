@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from sdkb.compaction_maintenance import rebuild_invalidated
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training_bank import TrainingBank
+from schnitz.compaction_maintenance import rebuild_invalidated
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training_bank import TrainingBank
 
 
 def make_bank(tmp_path):

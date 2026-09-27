@@ -3,7 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
-repository="${1:-werg/sdkb}"
+repository="${1:-werg/schnitz}"
 [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo 'Use owner/repo.' >&2; exit 2; }
 command -v gh >/dev/null || { echo 'Install GitHub CLI and authenticate locally.' >&2; exit 1; }
 gh auth status

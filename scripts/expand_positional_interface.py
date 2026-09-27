@@ -14,17 +14,17 @@ import torch
 from torch.nn import functional as F
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import (reconcile_metrics, resolve_checkpoint, restore_checkpoint,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import (reconcile_metrics, resolve_checkpoint, restore_checkpoint,
                               save_checkpoint, stop_on_signal)
-from sdkb.data import evidence_ids
-from sdkb.episode_index import EpisodeIndex
-from sdkb.interface_migration import expand_positional_state, new_slice_masks
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.optimizers import make_optimizer
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run, stored_channel
-from sdkb.trajectories import file_sha256
+from schnitz.data import evidence_ids
+from schnitz.episode_index import EpisodeIndex
+from schnitz.interface_migration import expand_positional_state, new_slice_masks
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.optimizers import make_optimizer
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run, stored_channel
+from schnitz.trajectories import file_sha256
 
 
 def _autocast(config):
@@ -167,11 +167,11 @@ def run(source_run: Path, episodes_file: Path, output: Path, *, steps: int,
         target_config.validate()
         output.mkdir(parents=True)
         atomic_json(output / 'migration-inputs.json', identity)
-    source = SDKBAgent(source_config).to(source_config.train.device).eval()
+    source = SchnitzelAgent(source_config).to(source_config.train.device).eval()
     load_model(source, str(source_checkpoint / 'model.safetensors'),
                device=source_config.train.device)
     source.requires_grad_(False)
-    target = SDKBAgent(target_config).to(target_config.train.device)
+    target = SchnitzelAgent(target_config).to(target_config.train.device)
     migration = expand_positional_state(source, target, seed=seed)
     masks = new_slice_masks(source, target)
     named = dict(target.named_parameters())

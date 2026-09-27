@@ -19,7 +19,7 @@ parts" that a gated read should reproduce.
 with its length N: c_0(N) = clamp(sqrt(N)/2, 4, 32) and c_s = min(128, c_0 * 2^s)
 for spaces s0..s3, so short passages are compressed less. ``--schedule fixed``
 uses ``--ratios`` for every source. A training-time
-teacher only: SDKB inference never runs this encoder.
+teacher only: SCHNITZELJAGD inference never runs this encoder.
 """
 from __future__ import annotations
 

@@ -10,11 +10,11 @@ from pathlib import Path
 import shutil
 import uuid
 
-from sdkb.corpus_data import title_located_question
-from sdkb.data import episode_from_dict
-from sdkb.operations import atomic_json
-from sdkb.text import render_prompt
-from sdkb.trajectories import file_sha256
+from schnitz.corpus_data import title_located_question
+from schnitz.data import episode_from_dict
+from schnitz.operations import atomic_json
+from schnitz.text import render_prompt
+from schnitz.trajectories import file_sha256
 
 REVISION = '40cb2ad3b3044d5a41eee083a6103c8b523afa45'
 

@@ -3,8 +3,8 @@ from dataclasses import asdict, replace
 from pathlib import Path
 import runpy
 
-from sdkb.corpus_data import short_reconstruction
-from sdkb.data import Source
+from schnitz.corpus_data import short_reconstruction
+from schnitz.data import Source
 
 
 def test_located_span_uses_prior_versioned_source_and_disjoint_clue():

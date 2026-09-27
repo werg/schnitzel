@@ -1,4 +1,4 @@
-"""Command line interface. Run python -m sdkb.cli or the installed sdkb command."""
+"""Command line interface. Run python -m schnitz.cli or the installed schnitz command."""
 from __future__ import annotations
 
 import argparse
@@ -9,9 +9,9 @@ from .config import load_config
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="SDKB: Spatially Superposed Differentiable Knowledge Base")
+    parser = argparse.ArgumentParser(description="SCHNITZELJAGD: Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders")
     from . import __version__
-    parser.add_argument("--version", action="version", version=f"SDKB {__version__}")
+    parser.add_argument("--version", action="version", version=f"SCHNITZELJAGD {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser('runs', help='Start, inspect or cooperatively stop a local detached curriculum')
     p.add_argument('action', choices=['start', 'status', 'stop', 'configure'])

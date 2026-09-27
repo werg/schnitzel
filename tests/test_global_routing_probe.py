@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sdkb.data import make_multiuse_world
+from schnitz.data import make_multiuse_world
 
 scripts = Path(__file__).resolve().parents[1] / 'scripts'
 sys.path.insert(0, str(scripts))

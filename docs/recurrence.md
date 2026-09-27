@@ -1,4 +1,4 @@
-# SDKB recurrent decoder conversion
+# SCHNITZELJAGD recurrent decoder conversion
 
 > **v0.5 spatial extension:** the legacy path described below has one workspace and
 > one query position. The first spatial path now adds many site-aligned blank
@@ -30,11 +30,11 @@ result, inject its workspace after the fixed prelude before the recurrent core. 
 is a distinct measured schedule, not evidence that blank-first-pass training and
 immediate-result inference are automatically equivalent.
 
-**Decision and implementation note · 19 September 2026 · SDKB 0.4**
+**Decision and implementation note · 19 September 2026 · SCHNITZELJAGD 0.4**
 
 ## Decision
 
-Make a **prelude / shared recurrent core / coda** decoder the main SDKB experiment.
+Make a **prelude / shared recurrent core / coda** decoder the main SCHNITZELJAGD experiment.
 Retain LFM2.5-230M as the initial student, retain every pretrained layer, and initially
 repeat the middle six layers. Read memory at actual boundaries between core passes.
 Keep the writer at one pass while varying consumer depth. This is an implemented
@@ -58,7 +58,7 @@ There are two different transformations worth distinguishing:
 
 The first transformation lets us investigate repeated interpretation of external
 knowledge without simultaneously throwing away part of the pretrained controller.
-The SDKB capacity-substitution claim must still be measured separately.
+The SCHNITZELJAGD capacity-substitution claim must still be measured separately.
 
 ## 1. What the current literature supports
 
@@ -66,7 +66,7 @@ The relevant distinction is evidence about **converting pretrained models**, ver
 successful **pretraining of recurrent models from scratch**. Both inform design;
 they do not establish that the same training budget or normalization trick transfers.
 
-| Work | Relevant finding or mechanism | Use in SDKB |
+| Work | Relevant finding or mechanism | Use in SCHNITZELJAGD |
 |---|---|---|
 | McLeish et al., *Teaching Pretrained Language Models to Think Deeper with Retrofitted Recurrence*, November 2025 [1] | Direct conversions of TinyLlama, OLMo and Llama; prelude/core/coda, persistent prelude reinjection, recurrent-depth curriculum and recovery training. | Main methodological precedent. Adopt reinjection and gradual depth; do not copy its pruning or large-depth training schedule into the first 230M hybrid experiment. |
 | *Retrofitting Recurrent Depth into a Pretrained Language Model*, August 2026 [2] | A keep-all-layers Qwen retrofit with a one-pass identity path; bridge installation, retention and shared-adapter experiments. | Supports treating identity, bridge trainability and retention as distinct tests. This is a recent, narrow study, not established LFM validation. |
@@ -141,7 +141,7 @@ plain one-pass identity control. At initialization, it is the parent's function.
 When parent weights later change, the one-pass path remains structurally identical
 to the **updated** parent, not a guarantee of unchanged original capabilities.
 
-For each subsequent pass, the implemented SDKB bridge is:
+For each subsequent pass, the implemented SCHNITZELJAGD bridge is:
 
 ```text
 scale(p) = stopgrad(max(RMS_per_token(p), epsilon))
@@ -183,7 +183,7 @@ middle-block training, activation checkpointing applies to the repeated shared b
 the one-pass prelude and coda retain their activations. This spends bounded memory to
 avoid recomputing layers that execute only once.
 
-## 4. SDKB reads are part of the recurrence
+## 4. SCHNITZELJAGD reads are part of the recurrence
 
 The decoder input for a memory-conditioned decision is:
 
@@ -253,7 +253,7 @@ optimizer-update budgets, not promises of convergence.
 | `text_bootstrap`, 200 | 1 | Ordinary backbone | Teacher targets with the same support information rendered as text. |
 | `recurrence_bridge`, 200 | 2 | Bridge; parent backbone frozen | Text target loss plus 0.1 forward KL from the fixed one-pass parent on identical inputs. |
 | `latent_warmup`, 400 | 2 | Writer slots/heads, codecs, reader, bridge and workspace; backbone frozen | Downstream target loss through an actual in-loop read. |
-| `recurrent_joint`, 400 | Sample 2 or 3 per optimizer step | Shared native core plus SDKB modules; prelude/coda/embeddings frozen | Latent task loss plus a 0.1 one-pass oracle-text task anchor. |
+| `recurrent_joint`, 400 | Sample 2 or 3 per optimizer step | Shared native core plus SCHNITZELJAGD modules; prelude/coda/embeddings frozen | Latent task loss plus a 0.1 one-pass oracle-text task anchor. |
 
 The frozen-parent KL is available without another resident model because the R=1
 path bypasses all bridge parameters and the base weights are frozen. It is computed
@@ -286,7 +286,7 @@ Changing an existing middle-block partition through ordinary warm-start also fai
 Use a fresh output directory: conversion is not resuming the old optimizer/cache.
 
 The new staged recipes start directly from the pretrained Hugging Face checkpoint;
-no old SDKB checkpoint is required.
+no old SCHNITZELJAGD checkpoint is required.
 
 ## 6. Running the experiments
 
@@ -306,7 +306,7 @@ Then run the teacher-trajectory curriculum or controlled causal curriculum:
 These are independent foreground runs, not intended to launch simultaneously by
 pasting the whole block into background jobs. Resume a particular run with the same
 recipe/output plus `--resume`. Revision locks and native NVIDIA ARM64 image digest
-pinning are unchanged. The local image tag is now `sdkb-spark:0.4`.
+pinning are unchanged. The local image tag is now `schnitz-spark:0.4`.
 
 Use an independent attention-only comparison with:
 
@@ -322,7 +322,7 @@ with Transformers installed. Do not override a failing preflight to continue tra
 After the causal run:
 
 ```bash
-./scripts/spark.sh run sdkb evaluate-depths \
+./scripts/spark.sh run schnitz evaluate-depths \
   --run runs/looped-causal/recurrent_joint \
   --episodes runs/looped-causal/fresh-causal.jsonl \
   --output runs/looped-depths --depths 1 2 3 4 --max-episodes 32
@@ -350,8 +350,8 @@ Offline execution without downloads:
 
 ```bash
 python -m pytest -q
-sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/tiny-looped
-sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/tiny-looped --resume
+schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/tiny-looped
+schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/tiny-looped --resume
 ```
 
 ## 7. What would establish useful conversion?
@@ -382,7 +382,7 @@ The next extensions are to vary the core split and bridge, add a genuinely froze
 retention reference when more base weights are unfrozen, and integrate prelude
 prefetch with explicit result availability. Learned stopping, per-loop caches,
 token-level schedules, and parameter-reducing block merging follow the validated
-reference. Their postponement does not block training the recurrent SDKB now.
+reference. Their postponement does not block training the recurrent SCHNITZELJAGD now.
 
 ## Sources
 

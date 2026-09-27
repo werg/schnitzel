@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sdkb.operations import request_stop
-from sdkb.trajectories import file_sha256
+from schnitz.operations import request_stop
+from schnitz.trajectories import file_sha256
 
 
 def queue_fixture(root, monkeypatch, arms):

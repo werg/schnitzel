@@ -3,8 +3,8 @@ from dataclasses import asdict
 from pathlib import Path
 import runpy
 
-from sdkb.corpus_data import short_reconstruction
-from sdkb.data import Source
+from schnitz.corpus_data import short_reconstruction
+from schnitz.data import Source
 
 
 def test_indexed_span_preserves_versioned_support_and_word_boundaries():

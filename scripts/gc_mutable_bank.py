@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from sdkb.store import DiskStore
+from schnitz.store import DiskStore
 
 
 def inspect(path: Path) -> dict:

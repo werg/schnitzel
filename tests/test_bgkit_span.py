@@ -1,6 +1,6 @@
 import torch
 
-from sdkb.bgkit_span import RatioEmbedding, SpanWriter, interface_rms, span_targets
+from schnitz.bgkit_span import RatioEmbedding, SpanWriter, interface_rms, span_targets
 
 
 def test_ratio_embedding_starts_at_zero_and_is_smooth():
@@ -32,7 +32,7 @@ def test_span_targets_emit_then_stop():
 
 
 def test_write_adapter_changes_only_span_positions():
-    from sdkb.bgkit_span import attach_write_adapter, span_mask
+    from schnitz.bgkit_span import attach_write_adapter, span_mask
 
     class Block(torch.nn.Module):
         def __init__(self):
@@ -62,7 +62,7 @@ def test_write_adapter_changes_only_span_positions():
 
 
 def test_open_adapter_merges_exactly():
-    from sdkb.bgkit_span import attach_write_adapter
+    from schnitz.bgkit_span import attach_write_adapter
 
     layers = torch.nn.ModuleList([torch.nn.Sequential()])
     layers[0].add_module('w1', torch.nn.Linear(6, 4))
@@ -84,7 +84,7 @@ def test_open_adapter_merges_exactly():
 
 
 def test_space_codec_is_size_agnostic_and_small():
-    from sdkb.bgkit_span import SpaceCodec
+    from schnitz.bgkit_span import SpaceCodec
 
     codec = SpaceCodec(1024, target_norm=0.8)
     assert sum(p.numel() for p in codec.parameters()) < 5_000_000
@@ -95,7 +95,7 @@ def test_space_codec_is_size_agnostic_and_small():
 
 
 def test_space_codec_starts_as_attention_pooling():
-    from sdkb.bgkit_span import SpaceCodec, interface_rms
+    from schnitz.bgkit_span import SpaceCodec, interface_rms
 
     codec = SpaceCodec(16, target_norm=1.0, inner=8, heads=2)
     same = torch.randn(1, 16).expand(6, -1)
@@ -104,7 +104,7 @@ def test_space_codec_starts_as_attention_pooling():
 
 
 def test_combiner_gate_zero_removes_a_record_exactly():
-    from sdkb.bgkit_span import SpaceCodec
+    from schnitz.bgkit_span import SpaceCodec
 
     codec = SpaceCodec(32, target_norm=1.0, inner=16, heads=2)
     a, b = torch.randn(5, 32), torch.randn(4, 32)
@@ -117,7 +117,7 @@ def test_combiner_gate_zero_removes_a_record_exactly():
 
 
 def test_combiner_gates_scale_mass():
-    from sdkb.bgkit_span import SpaceCodec
+    from schnitz.bgkit_span import SpaceCodec
 
     codec = SpaceCodec(8, target_norm=1.0, inner=8, heads=1, rounds=1)
     for module in (codec.key_content[1], codec.key_position, codec.query0[2]):
@@ -125,5 +125,5 @@ def test_combiner_gates_scale_mass():
         torch.nn.init.zeros_(module.bias)
     a, b = torch.randn(1, 8), torch.randn(1, 8)
     out = codec.combine([a, b], 1, torch.tensor([3.0, 1.0]))
-    from sdkb.bgkit_span import interface_rms
+    from schnitz.bgkit_span import interface_rms
     assert torch.allclose(out, interface_rms((3 * a + b) / 4, 1.0), atol=1e-5)

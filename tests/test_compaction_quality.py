@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sdkb.compaction_quality import assess_compaction
+from schnitz.compaction_quality import assess_compaction
 
 
 def test_compaction_quality_requires_behavior_and_net_savings():

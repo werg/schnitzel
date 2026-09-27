@@ -13,17 +13,17 @@ import shutil
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.archiving import ensure_free
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import Source
-from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+from schnitz.agent import SchnitzelAgent
+from schnitz.archiving import ensure_free
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import Source
+from schnitz.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
-from sdkb.offline_bank import canonical_json, ensure_offline_shard, publish_offline_generation
-from sdkb.operations import atomic_json
-from sdkb.store import DiskStore, lookup_record
-from sdkb.training import autocast_context, config_from_run, output_records, stored_channel
-from sdkb.trajectories import file_sha256
+from schnitz.offline_bank import canonical_json, ensure_offline_shard, publish_offline_generation
+from schnitz.operations import atomic_json
+from schnitz.store import DiskStore, lookup_record
+from schnitz.training import autocast_context, config_from_run, output_records, stored_channel
+from schnitz.trajectories import file_sha256
 
 
 def build(run: Path, sources: Path, output: Path, *, max_sources: int,
@@ -98,7 +98,7 @@ def build(run: Path, sources: Path, output: Path, *, max_sources: int,
 
     def load_writer():
         torch.set_num_threads(config.train.threads)
-        writer = SDKBAgent(config).to(config.train.device)
+        writer = SchnitzelAgent(config).to(config.train.device)
         if writer.resolved_revision != config.model.revision:
             raise ValueError('Resolved writer model revision changed')
         load_model(writer, str(checkpoint / 'model.safetensors'), device=config.train.device)

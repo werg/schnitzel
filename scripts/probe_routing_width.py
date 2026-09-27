@@ -13,15 +13,15 @@ import torch
 from probe_global_routing import global_features, address_scores, assess
 from probe_routing_features import pair_loss
 from probe_routing_stop import StopProbe
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.operations import atomic_json, control_dir, run_lock, stop_requested
-from sdkb.optimizers import optimizer_report
-from sdkb.probe_state import restore_probe_state, save_probe_state, parameter_names
-from sdkb.runtime import configure_memory, available_host_memory, memory_metrics, compute_watchdog
-from sdkb.tracking import Tracking
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.operations import atomic_json, control_dir, run_lock, stop_requested
+from schnitz.optimizers import optimizer_report
+from schnitz.probe_state import restore_probe_state, save_probe_state, parameter_names
+from schnitz.runtime import configure_memory, available_host_memory, memory_metrics, compute_watchdog
+from schnitz.tracking import Tracking
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 def widen_weights(weights, width, generator):

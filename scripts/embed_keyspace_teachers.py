@@ -14,12 +14,12 @@ from safetensors.torch import save_file
 import torch
 from transformers import AutoTokenizer
 
-from sdkb.document_ingestion import source_ingestion_groups
-from sdkb.keyspace_views import QUERY_VIEWS, SOURCE_VIEWS, query_view, source_view
-from sdkb.operations import atomic_json
-from sdkb.spatial_data import SpatialTrajectoryIndex
-from sdkb.teacher_encoders import TEACHERS, TeacherEncoder
-from sdkb.trajectories import file_sha256
+from schnitz.document_ingestion import source_ingestion_groups
+from schnitz.keyspace_views import QUERY_VIEWS, SOURCE_VIEWS, query_view, source_view
+from schnitz.operations import atomic_json
+from schnitz.spatial_data import SpatialTrajectoryIndex
+from schnitz.teacher_encoders import TEACHERS, TeacherEncoder
+from schnitz.trajectories import file_sha256
 
 
 def view_texts(cache: Path, sources: Path, episodes: Path, data: Path, *,

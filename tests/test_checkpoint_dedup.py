@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sdkb.operations import run_lock
+from schnitz.operations import run_lock
 
 
 def checkpoint(root, arm, step, data=b'weights'):
@@ -17,7 +17,7 @@ def checkpoint(root, arm, step, data=b'weights'):
 
 
 def test_dedup_is_dry_by_default_then_atomic_and_idempotent(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     paths = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b', 'c']]
     before = [(p / 'manifest.json').read_bytes() for p in paths]
     plan = deduplicate_weights(paths)
@@ -32,7 +32,7 @@ def test_dedup_is_dry_by_default_then_atomic_and_idempotent(tmp_path):
 
 
 def test_corrupt_duplicate_aborts_without_replacement(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     a, b = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b']]
     (b / 'model.safetensors').write_bytes(b'corrupt')
     inodes = [(p / 'model.safetensors').stat().st_ino for p in [a, b]]
@@ -43,7 +43,7 @@ def test_corrupt_duplicate_aborts_without_replacement(tmp_path):
 
 
 def test_dedup_refuses_active_run_or_parent(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     a, b = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b']]
     for owner in [tmp_path, a.parent.parent]:
         with run_lock(owner), pytest.raises(RuntimeError, match='already running'):
@@ -52,7 +52,7 @@ def test_dedup_refuses_active_run_or_parent(tmp_path):
 
 
 def test_dedup_preserves_distinct_permissions_and_existing_links(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     a, b, c = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b', 'c']]
     (b / 'model.safetensors').chmod(0o600)
     Path(tmp_path / 'other-copy').hardlink_to(c / 'model.safetensors')
@@ -66,7 +66,7 @@ def test_dedup_preserves_distinct_permissions_and_existing_links(tmp_path):
 
 
 def test_dedup_reuses_existing_shared_copy_for_new_warm_starts(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     a, b, source = [checkpoint(tmp_path, arm, 0) for arm in ['a-new', 'b-new', 'z-source']]
     alias = tmp_path/'retained-archive-copy'
     alias.hardlink_to(source/'model.safetensors')
@@ -81,7 +81,7 @@ def test_dedup_reuses_existing_shared_copy_for_new_warm_starts(tmp_path):
 
 
 def test_dedup_rejects_symlinked_payload(tmp_path):
-    from sdkb.checkpoint_dedup import deduplicate_weights
+    from schnitz.checkpoint_dedup import deduplicate_weights
     a, b = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b']]
     (b / 'model.safetensors').unlink()
     (b / 'model.safetensors').symlink_to(a / 'model.safetensors')
@@ -90,8 +90,8 @@ def test_dedup_rejects_symlinked_payload(tmp_path):
 
 
 def test_failed_publication_preserves_destination_and_removes_temporary_link(tmp_path, monkeypatch):
-    from sdkb.checkpoint_dedup import deduplicate_weights
-    import sdkb.checkpoint_dedup as module
+    from schnitz.checkpoint_dedup import deduplicate_weights
+    import schnitz.checkpoint_dedup as module
     a, b = [checkpoint(tmp_path, arm, 0) for arm in ['a', 'b']]
     before = (b / 'model.safetensors').stat().st_ino
 

@@ -8,9 +8,9 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.tracking import Tracking
-from sdkb.training import train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.tracking import Tracking
+from schnitz.training import train
 
 
 def equal_state(a, b):
@@ -71,7 +71,7 @@ def test_finish_failure_does_not_replace_original_training_exception(tmp_path, t
 
 
 def test_telemetry_error_record_failure_is_nonfatal(tmp_path, tiny_config, monkeypatch):
-    from sdkb import tracking
+    from schnitz import tracking
     def fail_log(row):
         raise RuntimeError('telemetry failed')
     def fail_record(*args, **kwargs):

@@ -9,9 +9,9 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from sdkb.episode_index import EpisodeIndex
-from sdkb.spatial_data import pack_spatial_trajectory
-from sdkb.trajectories import file_sha256
+from schnitz.episode_index import EpisodeIndex
+from schnitz.spatial_data import pack_spatial_trajectory
+from schnitz.trajectories import file_sha256
 
 
 def build(episodes_path: Path, output: Path, *, model_id: str, revision: str,

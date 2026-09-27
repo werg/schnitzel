@@ -2,7 +2,7 @@ from dataclasses import asdict
 import json
 import pytest
 
-from sdkb.data import Episode, Source, load_episodes
+from schnitz.data import Episode, Source, load_episodes
 
 
 @pytest.mark.parametrize(('family', 'locator'), [

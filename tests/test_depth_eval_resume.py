@@ -2,11 +2,11 @@ import json
 
 import pytest
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.operations import request_stop
-from sdkb.training import train
-from sdkb.depth_eval import evaluate_depths
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.operations import request_stop
+from schnitz.training import train
+from schnitz.depth_eval import evaluate_depths
 
 
 def test_teacher_depth_sweep_resumes_same_bank_plans_and_rows(tmp_path, tiny_config, monkeypatch):
@@ -26,7 +26,7 @@ def test_teacher_depth_sweep_resumes_same_bank_plans_and_rows(tmp_path, tiny_con
     reference = evaluate_depths(run, episodes, full, depths=(1, 2),
                                 protocol='teacher', max_episodes=1)
     assert reference['status'] == 'complete'
-    original = SDKBAgent.conditioned_nll
+    original = SchnitzelAgent.conditioned_nll
     calls = []
     def interrupt(self, *args, **kwargs):
         result = original(self, *args, **kwargs)
@@ -34,18 +34,18 @@ def test_teacher_depth_sweep_resumes_same_bank_plans_and_rows(tmp_path, tiny_con
         if len(calls) == 5:
             request_stop(stopped)
         return result
-    monkeypatch.setattr(SDKBAgent, 'conditioned_nll', interrupt)
+    monkeypatch.setattr(SchnitzelAgent, 'conditioned_nll', interrupt)
     assert evaluate_depths(run, episodes, stopped, depths=(1, 2),
                            protocol='teacher', max_episodes=1)['status'] == 'checkpointed'
     assert len(calls) == 5 and not (stopped/'summary.json').exists()
     assert len(json.loads((stopped/'depth-2-progress.json').read_text())['rows']) == 1
     def forbid_writer(*args, **kwargs):
         raise AssertionError('Completed frozen depth bank re-encoded sources')
-    monkeypatch.setattr(SDKBAgent, 'produce', forbid_writer)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', forbid_writer)
     def counted(self, *args, **kwargs):
         calls.append(True)
         return original(self, *args, **kwargs)
-    monkeypatch.setattr(SDKBAgent, 'conditioned_nll', counted)
+    monkeypatch.setattr(SchnitzelAgent, 'conditioned_nll', counted)
     resumed = evaluate_depths(run, episodes, stopped, depths=(1, 2),
                               protocol='teacher', max_episodes=1)
     assert resumed['status'] == 'complete' and len(calls) == 8

@@ -5,11 +5,11 @@ from pathlib import Path
 import pytest
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.evaluation import build_shared_bank
-from sdkb.store import DiskStore
-from sdkb.training import train
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.evaluation import build_shared_bank
+from schnitz.store import DiskStore
+from schnitz.training import train
 
 
 @pytest.mark.parametrize('learned', [False, True])
@@ -18,7 +18,7 @@ def test_generation_uses_stored_records_and_fixed_plans(tmp_path, tiny_config, m
     tiny_config.train.max_prompt_tokens = 1500
     run = tmp_path / 'run'
     train(tiny_config, run)
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     load_model(agent, str(run / 'model.safetensors'))
     episodes = make_multiuse_world(2, bindings=2) + make_multiuse_world(3, bindings=2)
     path = tmp_path / 'episodes.jsonl'

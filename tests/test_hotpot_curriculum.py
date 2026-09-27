@@ -1,7 +1,7 @@
 from pathlib import Path
 import runpy
 
-from sdkb.data import Source
+from schnitz.data import Source
 
 
 class WordTokenizer:

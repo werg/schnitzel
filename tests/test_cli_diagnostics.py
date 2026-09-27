@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from sdkb.cli import main
-from sdkb.config import load_config
-from sdkb.diagnostics import compact_probe, io_benchmark
+from schnitz.cli import main
+from schnitz.config import load_config
+from schnitz.diagnostics import compact_probe, io_benchmark
 
 
 def test_doctor_cli(capsys):
@@ -14,7 +14,7 @@ def test_doctor_cli(capsys):
 
 
 def test_teacher_evaluation_cli_accepts_checkpoint_specific_output(monkeypatch, capsys):
-    import sdkb.trajectory_eval as trajectory_eval
+    import schnitz.trajectory_eval as trajectory_eval
     received = {}
     def fake_evaluate(run, episodes, *, max_episodes, generate_tokens, output):
         received.update(run=run, episodes=episodes, count=max_episodes,

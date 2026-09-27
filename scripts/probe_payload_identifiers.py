@@ -11,15 +11,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.operations import atomic_json, control_dir, run_lock, stop_requested
-from sdkb.probe_state import restore_probe_state, save_probe_state
-from sdkb.runtime import configure_memory, available_host_memory, compute_watchdog, memory_metrics
-from sdkb.store import DiskStore, lookup_record
-from sdkb.tracking import Tracking
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.operations import atomic_json, control_dir, run_lock, stop_requested
+from schnitz.probe_state import restore_probe_state, save_probe_state
+from schnitz.runtime import configure_memory, available_host_memory, compute_watchdog, memory_metrics
+from schnitz.store import DiskStore, lookup_record
+from schnitz.tracking import Tracking
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 def split_identifiers(episodes, heldout_worlds):
@@ -74,8 +74,8 @@ def assess(model, values, labels, config):
 @torch.no_grad()
 def reader_feature(agent, store, episode, *, zero_values=False, representation='reader', metadata=None):
     """First native reader output, before bridge injection; targets are never inputs."""
-    from sdkb.recurrence import LoopMemory
-    from sdkb.sessions import read_session
+    from schnitz.recurrence import LoopMemory
+    from schnitz.sessions import read_session
     if (agent.training or agent.config.memory.read_timing != 'loop_boundary'
             or agent.config.memory.read_steps != 1):
         raise ValueError('Reader feature requires a frozen, single-read recurrent agent')
@@ -83,7 +83,7 @@ def reader_feature(agent, store, episode, *, zero_values=False, representation='
         raise ValueError('Unknown reader feature boundary')
     captures, hooks = [], []
     if representation != 'reader':
-        from sdkb.readers import SetReader
+        from schnitz.readers import SetReader
         if not isinstance(agent.reader, SetReader) or len(episode.required_ids) != 1:
             raise ValueError('Intermediate features require one selected record and one reader space')
         if representation == 'reader_inputs':
@@ -148,7 +148,7 @@ def run(source, episodes_path, bank_path, output, steps=1600, heldout_worlds=32,
         store, values, labels = DiskStore(bank_path), {}, {}
         agent = None
         if representation != 'payload':
-            from sdkb.evaluation_adapter import load_frozen_agent
+            from schnitz.evaluation_adapter import load_frozen_agent
             agent, _ = load_frozen_agent(config, checkpoint)
             agent.requires_grad_(False)
             def forbidden(*_args, **_kwargs):

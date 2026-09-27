@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.episode_index import EpisodeIndex
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.episode_index import EpisodeIndex
 
 
 @pytest.fixture

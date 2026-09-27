@@ -4,12 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.training import train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.training import train
 
 
 def test_checkpoint_status_distinguishes_logged_progress_and_durable_step(tmp_path):
-    from sdkb.operations import checkpoint_status
+    from schnitz.operations import checkpoint_status
     stage = tmp_path/'stage'
     checkpoint = stage/'checkpoints'/'step-000000004-test'
     checkpoint.mkdir(parents=True)
@@ -28,7 +28,7 @@ def test_checkpoint_status_distinguishes_logged_progress_and_durable_step(tmp_pa
 
 
 def test_run_lock_and_cooperative_stop(tmp_path, tiny_config):
-    from sdkb.operations import run_lock, request_stop, stop_requested
+    from schnitz.operations import run_lock, request_stop, stop_requested
     run = tmp_path / 'run'
     with run_lock(run):
         with pytest.raises(RuntimeError, match='already running'):
@@ -42,7 +42,7 @@ def test_run_lock_and_cooperative_stop(tmp_path, tiny_config):
 
 
 def test_stop_checkpoints_at_optimizer_boundary(tmp_path, tiny_config, monkeypatch):
-    from sdkb.operations import request_stop
+    from schnitz.operations import request_stop
     import torch
     run = tmp_path / 'run'
     original = torch.optim.AdamW.step
@@ -57,7 +57,7 @@ def test_stop_checkpoints_at_optimizer_boundary(tmp_path, tiny_config, monkeypat
 
 
 def test_archive_roundtrip_and_corruption(tmp_path, tiny_config):
-    from sdkb.archiving import archive_checkpoint, restore_archive
+    from schnitz.archiving import archive_checkpoint, restore_archive
     run, archive = tmp_path / 'run', tmp_path / 'archive'
     archive.mkdir()
     train(tiny_config, run)
@@ -76,7 +76,7 @@ def test_archive_roundtrip_and_corruption(tmp_path, tiny_config):
 
 
 def test_incomplete_archive_is_never_published(tmp_path, tiny_config, monkeypatch):
-    import sdkb.archiving as module
+    import schnitz.archiving as module
     run, archive = tmp_path / 'run', tmp_path / 'archive'
     archive.mkdir()
     train(tiny_config, run)
@@ -90,7 +90,7 @@ def test_incomplete_archive_is_never_published(tmp_path, tiny_config, monkeypatc
 
 
 def test_archive_backlog_is_bounded_and_active_copy_protected(tmp_path, monkeypatch):
-    import sdkb.archiving as module
+    import schnitz.archiving as module
     entered, release = threading.Event(), threading.Event()
     def copy(source, *args, **kwargs):
         entered.set()
@@ -110,7 +110,7 @@ def test_archive_backlog_is_bounded_and_active_copy_protected(tmp_path, monkeypa
 
 
 def test_low_disk_preserves_last_checkpoint(tmp_path, tiny_config, monkeypatch):
-    import sdkb.archiving as module
+    import schnitz.archiving as module
     run = tmp_path / 'run'
     train(tiny_config, run, stop_after=1)
     current = (run / 'CURRENT').read_text()
@@ -123,7 +123,7 @@ def test_low_disk_preserves_last_checkpoint(tmp_path, tiny_config, monkeypatch):
 
 
 def test_archive_retention_never_crosses_run_identity(tmp_path, tiny_config):
-    from sdkb.archiving import archive_checkpoint
+    from schnitz.archiving import archive_checkpoint
     archive = tmp_path / 'archive'
     archive.mkdir()
     first, second = tmp_path / 'first', tmp_path / 'second'
@@ -139,8 +139,8 @@ def test_archive_retention_never_crosses_run_identity(tmp_path, tiny_config):
 def test_optional_tracking_keeps_identity_and_does_not_upload_payloads(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace
-    from sdkb.tracking import Tracking
-    from sdkb.config import Config
+    from schnitz.tracking import Tracking
+    from schnitz.config import Config
     calls, logs, finished = [], [], []
     fake = SimpleNamespace(log=lambda row: logs.append(row), finish=lambda **kw: finished.append(kw),
                            define_metric=lambda *a, **kw: None)
@@ -157,7 +157,7 @@ def test_optional_tracking_keeps_identity_and_does_not_upload_payloads(tmp_path,
 
 
 def test_relocate_checkpoints_preserves_resume_and_frees_local_files(tmp_path, tiny_config):
-    from sdkb.archiving import relocate_checkpoints
+    from schnitz.archiving import relocate_checkpoints
     run, destination = tmp_path / 'run', tmp_path / 'external'
     destination.mkdir()
     train(tiny_config, run, stop_after=1)
@@ -172,8 +172,8 @@ def test_relocate_checkpoints_preserves_resume_and_frees_local_files(tmp_path, t
 
 
 def test_relocate_refuses_corrupt_archive_and_running_owner(tmp_path, tiny_config):
-    from sdkb.archiving import relocate_checkpoints
-    from sdkb.operations import run_lock
+    from schnitz.archiving import relocate_checkpoints
+    from schnitz.operations import run_lock
     run, destination = tmp_path / 'run', tmp_path / 'external'
     destination.mkdir()
     train(tiny_config, run)

@@ -1,7 +1,7 @@
 """Codec distillation (restart plan 3.3a): dense span -> coarser spaces.
 
 The coarser spaces s1..s3 are small size-agnostic projections of the densest
-span s0 (``sdkb.bgkit_span.SpaceCodec``, one per space). Trained on the B1 cache:
+span s0 (``schnitz.bgkit_span.SpaceCodec``, one per space). Trained on the B1 cache:
 source = the teacher's s0 reps of a bank passage, target = the teacher's reps of
 the same passage at that space's ratio (same count). Losses: cosine to the
 teacher reps, and functional - the frozen S2 decoder reading the codec output
@@ -10,7 +10,7 @@ reconstructs the passage (NLL) and matches its reading of the teacher reps (KL).
 Evaluation per space on held-out bank passages: reconstruct NLL with no context,
 full text, teacher reps, codec(teacher s0) and a baseline that mean-pools s0 in
 m equal chunks, as captured fractions of the full-text gain. Later the codecs are
-applied to the writer's own dense spans. Training-only; runs in ``sdkb-bgkit``.
+applied to the writer's own dense spans. Training-only; runs in ``schnitz-bgkit``.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_bgkit_reps import (Model, TeacherCache, _batches, _heldout,  # noqa: E402
                               _kl)
 
-from sdkb.bgkit_span import SpaceCodec, interface_rms  # noqa: E402
+from schnitz.bgkit_span import SpaceCodec, interface_rms  # noqa: E402
 
 TARGETS = ('s1', 's2', 's3')
 

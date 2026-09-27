@@ -1,4 +1,4 @@
-"""Recorded teacher traces -> causal SDKB support/query episodes.
+"""Recorded teacher traces -> causal SCHNITZELJAGD support/query episodes.
 
 Prefix context compression and cross-experience transfer are separate protocols.
 Targets are complete messages; no tools or remote dataset Python are executed.
@@ -203,7 +203,7 @@ def recent_query(tokenizer, trajectory, target, cfg):
     ids = tokenizer.encode(recent, add_special_tokens=False)
     if len(ids) > cfg.get('recent_tokens', 512):
         recent = '[Earlier visible context cropped.]\n' + tokenizer.decode(ids[-cfg.get('recent_tokens', 512):], skip_special_tokens=False)
-    return ('Continue this recorded conversation. Earlier context or related experiences may be supplied by SDKB. '
+    return ('Continue this recorded conversation. Earlier context or related experiences may be supplied by SCHNITZELJAGD. '
             'Return only the next assistant message. Preserve JSON tool calls inside <tool_call> tags when applicable.\n'
             'Original task (possibly excerpted):\n' + first + '\nRecent visible messages:\n' + recent)
 
@@ -323,7 +323,7 @@ def source_rows(spec):
     try:
         from datasets import load_dataset
     except ImportError as e:
-        raise RuntimeError('Install sdkb[data] or use the Spark image') from e
+        raise RuntimeError('Install schnitz[data] or use the Spark image') from e
     source = load_dataset(spec['path'], name=spec.get('config'), revision=spec['revision'],
                           split=spec.get('split', 'train'), streaming=True)
     if spec.get('shuffle_buffer', 0):

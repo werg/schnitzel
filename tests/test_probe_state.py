@@ -3,14 +3,14 @@ import random
 import pytest
 import torch
 
-from sdkb.probe_state import restore_probe_state, save_probe_state
+from schnitz.probe_state import restore_probe_state, save_probe_state
 
 
 def setup(kind="adamw"):
     model = torch.nn.Sequential(torch.nn.Linear(3, 3), torch.nn.Dropout(.3), torch.nn.Linear(3, 2))
     if kind == 'muon':
-        from sdkb.config import TrainConfig
-        from sdkb.optimizers import MuonAdamW
+        from schnitz.config import TrainConfig
+        from schnitz.optimizers import MuonAdamW
         optimizer = MuonAdamW([{'params': [p for p in model.parameters() if p.ndim == 2], 'lr': .02}],
                              [{'params': [p for p in model.parameters() if p.ndim != 2], 'lr': .02}], TrainConfig())
     else:
@@ -63,7 +63,7 @@ def test_failed_probe_save_preserves_previous_checkpoint(tmp_path, monkeypatch):
     previous = path.read_bytes()
     def fail(*_args):
         raise OSError('disk failure')
-    monkeypatch.setattr('sdkb.probe_state._fsync', fail)
+    monkeypatch.setattr('schnitz.probe_state._fsync', fail)
     with pytest.raises(OSError, match='disk failure'):
         save_probe_state(path, a, opt, sampler, {}, 1, reserve_bytes=0)
     assert path.read_bytes() == previous

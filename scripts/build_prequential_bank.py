@@ -17,18 +17,18 @@ import time
 from safetensors.torch import load_model
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint, stop_on_signal
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import (canonical_json, publish_offline_generation,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint, stop_on_signal
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import (canonical_json, publish_offline_generation,
                                stored_memory_identity)
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.spatial_data import SpatialTrajectoryIndex
-from sdkb.spatial_training import spatial_bank_forward
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training_bank import TrainingBank
-from sdkb.training import autocast_context, config_from_run, environment_report, resource_report
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.spatial_data import SpatialTrajectoryIndex
+from schnitz.spatial_training import spatial_bank_forward
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training_bank import TrainingBank
+from schnitz.training import autocast_context, config_from_run, environment_report, resource_report
+from schnitz.trajectories import file_sha256
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -71,7 +71,7 @@ def _model_bank_compatible(config, manifest: dict) -> None:
         raise ValueError("Executor model and parent stored interface differ")
 
 
-def _validate_write_texts(agent: SDKBAgent, texts: list[str], maximum: int) -> None:
+def _validate_write_texts(agent: SchnitzelAgent, texts: list[str], maximum: int) -> None:
     for text in texts:
         ids = agent.tokenizer.encode(text, add_special_tokens=True)
         if not ids:
@@ -164,7 +164,7 @@ def build(run: Path, parent_bank: Path, trajectories: Path, output: Path, *,
         raise OSError("External disk reserve is already below --min-free-bytes")
 
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     load_model(agent, str(checkpoint / "model.safetensors"), device=config.train.device)
     began, completed = time.perf_counter(), start
     event_log = output / "events.jsonl"

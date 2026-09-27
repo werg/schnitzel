@@ -15,16 +15,16 @@ import pytest
 ])
 def test_evaluation_rejects_memory_pressure_before_model(
         monkeypatch, tiny_config, tmp_path, module_name, function_name):
-    module = importlib.import_module('sdkb.'+module_name)
+    module = importlib.import_module('schnitz.'+module_name)
     tiny_config.train.min_system_available_bytes = 1024
-    monkeypatch.setattr('sdkb.runtime.available_host_memory', lambda: 512)
+    monkeypatch.setattr('schnitz.runtime.available_host_memory', lambda: 512)
     if hasattr(module, 'config_from_run'):
         monkeypatch.setattr(module, 'config_from_run', lambda _path: tiny_config)
     if hasattr(module, 'load_episodes'):
         monkeypatch.setattr(module, 'load_episodes', lambda _path: [])
     def forbidden(*_args, **_kwargs):
         pytest.fail('Allocated model before checking host-memory reserve')
-    monkeypatch.setattr(module, 'SDKBAgent', forbidden)
+    monkeypatch.setattr(module, 'SchnitzelAgent', forbidden)
     if function_name == 'load_frozen_agent':
         args = (tiny_config, tmp_path)
     elif function_name == 'model_probe':

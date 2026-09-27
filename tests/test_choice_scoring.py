@@ -4,9 +4,9 @@ import torch
 
 @pytest.mark.parametrize('timing', ['prefix', 'loop_boundary'])
 def test_batched_candidates_match_serial_and_padding_cannot_change_short_answer(tiny_config, timing):
-    from sdkb.agent import SDKBAgent
-    from sdkb.choice_scoring import candidate_nll
-    from sdkb.recurrence import LoopMemory
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.choice_scoring import candidate_nll
+    from schnitz.recurrence import LoopMemory
     c = tiny_config
     if timing == 'loop_boundary':
         c.model.tiny_layers = 4
@@ -15,7 +15,7 @@ def test_batched_candidates_match_serial_and_padding_cannot_change_short_answer(
         c.model.loops = 3
         c.memory.read_timing = timing
     c.validate()
-    agent = SDKBAgent(c).eval()
+    agent = SchnitzelAgent(c).eval()
     prompt = agent.prompt_ids('Question')
     memory = torch.randn(1, c.memory.read_slots, agent.width)
     if timing == 'loop_boundary':

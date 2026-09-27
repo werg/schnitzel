@@ -4,16 +4,16 @@ from pathlib import Path
 
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.positional import (PositionalCodec, PositionalCompactor,
+from schnitz.agent import SchnitzelAgent
+from schnitz.positional import (PositionalCodec, PositionalCompactor,
                              PositionalSetReader)
-from sdkb.interface_migration import (expand_positional_state,
+from schnitz.interface_migration import (expand_positional_state,
                                       initialize_positional_student,
                                       new_slice_masks)
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import make_episode, save_episodes
-from sdkb.training import config_from_run, train
-from sdkb.offline_bank import stored_memory_identity
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import make_episode, save_episodes
+from schnitz.training import config_from_run, train
+from schnitz.offline_bank import stored_memory_identity
 
 
 def test_positional_codec_preserves_slot_axis_and_shares_projection():
@@ -75,7 +75,7 @@ def test_agent_positional_interface_round_trip_and_gradients(tiny_config):
     config.memory.payload_layout = 'positional'
     config.memory.reader = 'mlp'
     config.validate()
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     produced = agent.produce(agent.text_ids('remember this', source=True))
     assert produced[1].shape == (1, 24)
     assert produced[3].shape == (1, 40)
@@ -110,10 +110,10 @@ def test_legacy_bank_identity_defaults_to_flat_layout():
 
 
 def test_flat_teacher_initializes_structured_student_without_copying_dense_codec(tiny_config):
-    teacher = SDKBAgent(copy.deepcopy(tiny_config))
+    teacher = SchnitzelAgent(copy.deepcopy(tiny_config))
     structured = copy.deepcopy(tiny_config)
     structured.memory.payload_layout = 'positional'
-    student = SDKBAgent(structured)
+    student = SchnitzelAgent(structured)
     migration = initialize_positional_student(teacher, student)
     torch.testing.assert_close(student.key_head.weight, teacher.key_head.weight)
     assert 'key_head.weight' in migration.copied
@@ -125,13 +125,13 @@ def test_flat_teacher_initializes_structured_student_without_copying_dense_codec
 def test_positional_expansion_preserves_shared_parameters_and_masks_old_slices(tiny_config):
     old_config = copy.deepcopy(tiny_config)
     old_config.memory.payload_layout = 'positional'
-    source = SDKBAgent(old_config)
+    source = SchnitzelAgent(old_config)
     new_config = copy.deepcopy(old_config)
     new_config.memory.write_slots = 8
     new_config.memory.read_slots = 8
     channels = [d // old_config.memory.write_slots for d in old_config.memory.payload_dims]
     new_config.memory.payload_dims = [8 * c for c in channels]
-    target = SDKBAgent(new_config)
+    target = SchnitzelAgent(new_config)
     migration = expand_positional_state(source, target, seed=3)
     assert 'write_slots' in migration.expanded
     torch.testing.assert_close(target.write_slots[:old_config.memory.write_slots + 1],
@@ -194,7 +194,7 @@ def _joint_config(tiny_config, slots=2):
 
 
 def test_joint_tokens_mix_every_writer_slot_into_full_width_tokens(tiny_config):
-    from sdkb.positional import JointTokenCodec
+    from schnitz.positional import JointTokenCodec
     codec = JointTokenCodec(32, 3, heads=4)
     states = torch.randn(2, 5, 32, requires_grad=True)
     stored = codec(states)
@@ -202,7 +202,7 @@ def test_joint_tokens_mix_every_writer_slot_into_full_width_tokens(tiny_config):
     stored[:, :32].sum().backward()
     # Every writer slot influences even the first stored token.
     assert (states.grad.abs().sum(-1) > 0).all()
-    agent = SDKBAgent(_joint_config(tiny_config))
+    agent = SchnitzelAgent(_joint_config(tiny_config))
     produced = agent.produce(agent.text_ids('remember this', source=True))
     assert produced[1].shape == (1, 32) and produced[3].shape == (1, 96)
     values = [produced[1][:, None], produced[3][:, None]]
@@ -228,7 +228,7 @@ def test_joint_tokens_require_full_width_tokens_per_space(tiny_config):
     config.memory.payload_dims = [16, 48]
     config.memory.space_tokens = [1, 3]
     try:
-        SDKBAgent(config)
+        SchnitzelAgent(config)
     except ValueError as exc:
         assert 'full decoder-width' in str(exc)
     else:
@@ -236,8 +236,8 @@ def test_joint_tokens_require_full_width_tokens_per_space(tiny_config):
 
 
 def test_joint_expansion_keeps_codec_and_token_tables(tiny_config):
-    source = SDKBAgent(_joint_config(tiny_config, slots=2))
-    target = SDKBAgent(_joint_config(tiny_config, slots=4))
+    source = SchnitzelAgent(_joint_config(tiny_config, slots=2))
+    target = SchnitzelAgent(_joint_config(tiny_config, slots=4))
     migration = expand_positional_state(source, target, seed=5)
     assert 'write_slots' in migration.expanded
     for old, new in zip(source.codecs, target.codecs, strict=True):

@@ -11,8 +11,8 @@ import re
 import shutil
 import uuid
 
-from sdkb.data import episode_from_dict
-from sdkb.trajectories import file_sha256
+from schnitz.data import episode_from_dict
+from schnitz.trajectories import file_sha256
 
 
 def indexed_span(row: dict, *, span_words: int = 8):

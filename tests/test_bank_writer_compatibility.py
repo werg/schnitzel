@@ -4,8 +4,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from sdkb.offline_bank import assert_bank_writer_compatible
-from sdkb.trajectories import file_sha256
+from schnitz.offline_bank import assert_bank_writer_compatible
+from schnitz.trajectories import file_sha256
 
 
 def test_bank_evaluation_rejects_changed_writer_but_allows_frozen_reader_update(tmp_path):

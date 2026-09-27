@@ -14,21 +14,21 @@ import signal
 from safetensors.torch import load_file, save_file
 import torch
 
-from sdkb.checkpoints import resolve_checkpoint, _fsync, _fsync_dir
-from sdkb.cluster_store import ClusterBank, state_fingerprint
-from sdkb.compaction import SyntheticCompactor, contribution_loss, mean_and_mass
-from sdkb.data import load_episodes, make_multiuse_world, save_episodes
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-from sdkb.evaluation_adapter import load_frozen_agent
-from sdkb.operations import atomic_json, control_dir, run_lock, stop_requested
-from sdkb.optimizers import MuonAdamW
-from sdkb.probe_state import restore_probe_state, save_probe_state
-from sdkb.recurrence import LoopMemory
-from sdkb.runtime import configure_memory, available_host_memory, memory_metrics, compute_watchdog
-from sdkb.store import DiskStore, ReadPlan, Selection
-from sdkb.tracking import Tracking
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint, _fsync, _fsync_dir
+from schnitz.cluster_store import ClusterBank, state_fingerprint
+from schnitz.compaction import SyntheticCompactor, contribution_loss, mean_and_mass
+from schnitz.data import load_episodes, make_multiuse_world, save_episodes
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+from schnitz.evaluation_adapter import load_frozen_agent
+from schnitz.operations import atomic_json, control_dir, run_lock, stop_requested
+from schnitz.optimizers import MuonAdamW
+from schnitz.probe_state import restore_probe_state, save_probe_state
+from schnitz.recurrence import LoopMemory
+from schnitz.runtime import configure_memory, available_host_memory, memory_metrics, compute_watchdog
+from schnitz.store import DiskStore, ReadPlan, Selection
+from schnitz.tracking import Tracking
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 def plan_for(episode):

@@ -5,7 +5,7 @@ validation_fraction: 0.25
 sources:
 - local_file: tests/fixtures/trajectories.jsonl
   adapter: ultrachat
-  path: sdkb/authored-fixtures
+  path: schnitz/authored-fixtures
   license: project-authored
   max_rows: 60
 preparation:

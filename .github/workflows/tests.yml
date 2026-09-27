@@ -19,11 +19,11 @@ jobs:
       - run: python -m pip install -e '.[hf,dev]'
       - run: ruff check src tests scripts
       - run: python -m pytest -q --junitxml=test-results.xml
-      - run: sdkb launch --recipe recipes/offline_smoke.yaml --output runs/ci-smoke
-      - run: sdkb launch --recipe recipes/offline_smoke.yaml --output runs/ci-smoke --resume
-      - run: sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/ci-looped
-      - run: sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/ci-looped --resume
-      - run: sdkb evaluate-depths --run runs/ci-looped/recurrent_joint --episodes runs/ci-looped/fresh-causal.jsonl --output runs/ci-depths --max-episodes 3
+      - run: schnitz launch --recipe recipes/offline_smoke.yaml --output runs/ci-smoke
+      - run: schnitz launch --recipe recipes/offline_smoke.yaml --output runs/ci-smoke --resume
+      - run: schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/ci-looped
+      - run: schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/ci-looped --resume
+      - run: schnitz evaluate-depths --run runs/ci-looped/recurrent_joint --episodes runs/ci-looped/fresh-causal.jsonl --output runs/ci-depths --max-episodes 3
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -4,8 +4,8 @@ from pathlib import Path
 from safetensors.torch import load, save
 import torch
 
-from sdkb.compaction import SyntheticCompactor, contribution_loss
-from sdkb.readers import SetReader
+from schnitz.compaction import SyntheticCompactor, contribution_loss
+from schnitz.readers import SetReader
 
 
 def test_compactor_training_uses_serialized_precision_and_frozen_reader():
@@ -31,7 +31,7 @@ def test_compactor_training_uses_serialized_precision_and_frozen_reader():
 
 
 def test_cached_single_read_task_gradient_matches_causal_prefix_plan(tiny_config):
-    from sdkb.agent import SDKBAgent
+    from schnitz.agent import SchnitzelAgent
     path = Path(__file__).parents[1] / 'scripts/probe_stored_compaction.py'
     spec = importlib.util.spec_from_file_location('task_compaction_probe', path)
     module = importlib.util.module_from_spec(spec)
@@ -43,7 +43,7 @@ def test_cached_single_read_task_gradient_matches_causal_prefix_plan(tiny_config
     c.model.loops, c.model.writer_loops = 3, 1
     c.memory.read_timing, c.memory.read_steps = 'loop_boundary', 1
     c.validate()
-    agent = SDKBAgent(c).eval().requires_grad_(False)
+    agent = SchnitzelAgent(c).eval().requires_grad_(False)
     compactor = SyntheticCompactor(24, 24, 1)
     prompt, target = agent.prompt_ids('Use the stored rules.'), agent.target_ids('RETRY')
     raw = torch.randn(1, 2, 24).bfloat16().float()
@@ -72,8 +72,8 @@ def test_cached_single_read_task_gradient_matches_causal_prefix_plan(tiny_config
 
 def test_compactor_probe_emergency_resume_preserves_complete_state(tmp_path, tiny_config, monkeypatch):
     import pytest
-    from sdkb.data import make_multiuse_world, save_episodes
-    from sdkb.training import train
+    from schnitz.data import make_multiuse_world, save_episodes
+    from schnitz.training import train
     path = Path(__file__).parents[1] / 'scripts/probe_stored_compaction.py'
     spec = importlib.util.spec_from_file_location('recover_compaction_probe', path)
     module = importlib.util.module_from_spec(spec)

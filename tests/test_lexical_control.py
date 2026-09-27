@@ -62,7 +62,7 @@ def test_sufficient_group_is_not_the_full_annotated_pair(lexical):
 def test_index_preserves_source_versions_and_bank_visibility(lexical, tmp_path):
     import json
     import sqlite3
-    from sdkb.data import make_multiuse_world, save_episodes
+    from schnitz.data import make_multiuse_world, save_episodes
     episodes = make_multiuse_world(1, bindings=2)
     corpus = tmp_path/'episodes.jsonl'
     save_episodes(corpus, episodes)

@@ -1,4 +1,4 @@
-# Spatially Superposed Differentiable Knowledge Base (SDKB)
+# Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders (SCHNITZELJAGD)
 
 
 > **Implementation update, 19 September 2026:** the decoder now has a native
@@ -1244,9 +1244,9 @@ Original primary-source bibliography retained from the first specification; revi
 [^24]: Zhao, B., and Bilen, H. (2021 preprint; CVPR 2023). [Dataset Condensation with Distribution Matching](https://arxiv.org/abs/2110.04181). A precedent for synthetic-set feature-distribution matching, not for preserving this reader's full conditional behavior.
 
 
-## SDKB 0.3: implemented real-student curriculum
+## SCHNITZELJAGD 0.3: implemented real-student curriculum
 
-The project is now **Spatially Superposed Differentiable Knowledge Base (SDKB)**.
+The project is now **Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders (SCHNITZELJAGD)**.
 The full research hypotheses above remain intact. The current runnable operational
 plan is in [training.md](training.md), with researched source choices in
 [datasets.md](datasets.md) and Spark runtime setup in [spark.md](spark.md).

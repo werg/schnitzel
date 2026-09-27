@@ -13,10 +13,10 @@ import uuid
 
 import pyarrow.parquet as pq
 
-from sdkb.data import Episode, Source
-from sdkb.operations import atomic_json
-from sdkb.text import render_prompt
-from sdkb.trajectories import file_sha256
+from schnitz.data import Episode, Source
+from schnitz.operations import atomic_json
+from schnitz.text import render_prompt
+from schnitz.trajectories import file_sha256
 
 
 DATASET_REVISION = '1908d6afbbead072334abe2965f91bd2709910ab'

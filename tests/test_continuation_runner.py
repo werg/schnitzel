@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from sdkb.config import load_config
-from sdkb.operations import control_dir
-from sdkb.trajectories import file_sha256
+from schnitz.config import load_config
+from schnitz.operations import control_dir
+from schnitz.trajectories import file_sha256
 
 
 @pytest.fixture

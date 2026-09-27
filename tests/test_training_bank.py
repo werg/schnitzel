@@ -3,12 +3,12 @@ import random
 import pytest
 from safetensors.torch import save
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import restore_checkpoint, save_checkpoint
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.optimizers import make_optimizer
-from sdkb.store import DiskStore, ReadPlan, Selection, StoredRecord
-from sdkb.training_bank import TrainingBank
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import restore_checkpoint, save_checkpoint
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.optimizers import make_optimizer
+from schnitz.store import DiskStore, ReadPlan, Selection, StoredRecord
+from schnitz.training_bank import TrainingBank
 
 
 def test_training_overlay_updates_search_keys_and_stored_payloads(tmp_path):
@@ -61,7 +61,7 @@ def test_training_overlay_batches_multiple_plans_and_spaces(tmp_path):
 
 
 def test_training_overlay_is_part_of_exact_checkpoint_resume(tiny_config, tmp_path):
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     optimizer = make_optimizer(agent)
     run = tmp_path / 'run'
     run.mkdir()
@@ -284,7 +284,7 @@ def test_legacy_overlay_migrates_to_revision_journal(tmp_path):
 
 
 def test_legacy_checkpoint_reuses_and_rolls_back_completed_migration(tiny_config, tmp_path):
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     optimizer = make_optimizer(agent)
     run = tmp_path / 'run'
     run.mkdir()

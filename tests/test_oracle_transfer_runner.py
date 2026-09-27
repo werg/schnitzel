@@ -4,9 +4,9 @@ import sys
 
 import pytest
 
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.training import train
-from sdkb.trajectories import file_sha256
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.training import train
+from schnitz.trajectories import file_sha256
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 try:
@@ -67,8 +67,8 @@ def test_endpoint_counterfactual_changes_only_endpoint_information():
 @pytest.mark.parametrize('stop_mode', ['control', 'signal', 'memory'])
 def test_oracle_runner_resumes_scoring_and_generation_without_repeating_work(tmp_path, tiny_config, monkeypatch, stop_mode):
     import signal
-    from sdkb.agent import SDKBAgent
-    from sdkb.operations import control_dir, request_stop
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.operations import control_dir, request_stop
     path = tmp_path/'episodes.jsonl'
     episodes = make_multiuse_world(11, bindings=1)
     save_episodes(path, episodes)
@@ -114,7 +114,7 @@ def test_oracle_runner_resumes_scoring_and_generation_without_repeating_work(tmp
         raise AssertionError('Resume repeated committed writer/scoring work')
     monkeypatch.setattr(evaluator.FrozenScorer, 'generate', count)
     monkeypatch.setattr(evaluator, 'stored_transfer_evaluation', forbidden)
-    monkeypatch.setattr(SDKBAgent, 'produce', forbidden)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', forbidden)
     run(source, path, partial)
     assert calls == len(episodes)*6 - 5
     expected = json.loads((full/'results.json').read_text())
@@ -171,10 +171,10 @@ def test_oracle_runner_reads_native_compact_codes_and_raw_subsets(tmp_path, tiny
             assert any(a['clusters'] for a in row['payload_accounting'])
     bank_hash = file_sha256(output/'bank.sqlite')
     (output/'results.json').unlink()
-    from sdkb.agent import SDKBAgent
+    from schnitz.agent import SchnitzelAgent
     def forbidden(*args, **kwargs):
         raise AssertionError('Restart re-encoded a source')
-    monkeypatch.setattr(SDKBAgent, 'produce', forbidden)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', forbidden)
     run(source, path, output, compact_method=method)
     resumed = json.loads((output/'results.json').read_text())
     assert resumed['generation_rows'] == report['generation_rows']
@@ -184,8 +184,8 @@ def test_oracle_runner_reads_native_compact_codes_and_raw_subsets(tmp_path, tiny
 
 
 def test_oracle_offline_pressure_rolls_back_partial_bank(tmp_path, tiny_config, monkeypatch):
-    from sdkb.agent import SDKBAgent
-    from sdkb.store import DiskStore
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.store import DiskStore
     path = tmp_path/'episodes.jsonl'
     save_episodes(path, make_multiuse_world(17, bindings=1))
     tiny_config.train.steps = 1
@@ -195,19 +195,19 @@ def test_oracle_offline_pressure_rolls_back_partial_bank(tmp_path, tiny_config, 
     source, output = tmp_path/'source', tmp_path/'output'
     train(tiny_config, source)
     pressure = {'low': False}
-    original = SDKBAgent.produce
+    original = SchnitzelAgent.produce
     def produce(self, *args, **kwargs):
         result = original(self, *args, **kwargs)
         pressure['low'] = True
         return result
-    monkeypatch.setattr(SDKBAgent, 'produce', produce)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', produce)
     monkeypatch.setattr(evaluator, 'available_host_memory', lambda: 0 if pressure['low'] else 2**40, raising=False)
     with pytest.raises(RuntimeError, match='Stopped'):
         run(source, path, output)
     with DiskStore(output/'bank.sqlite').connect() as db:
         assert db.execute('SELECT count(*) FROM records').fetchone()[0] == 0
     pressure['low'] = False
-    monkeypatch.setattr(SDKBAgent, 'produce', original)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', original)
     run(source, path, output)
     report = json.loads((output/'results.json').read_text())
     assert all(writes['writer_calls'] == 2 for writes in report['writes'].values())

@@ -10,7 +10,7 @@ import time
 import torch
 from safetensors.torch import load_model
 
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .checkpoints import resolve_checkpoint
 from .data import Episode, load_episodes, counterfactual_boolean, counterfactual_multiuse, evidence_ids
 from .metrics import summarize_rows, paired_world_bootstrap
@@ -179,7 +179,7 @@ def evaluate_transfer_run(run: str | Path, episodes_path: str | Path, *,
     torch.manual_seed(config.train.seed)
     from .runtime import configure_memory
     configure_memory(config.train)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     load_model(agent, str(resolve_checkpoint(run) / 'model.safetensors'), device=config.train.device)
     episodes = load_episodes(episodes_path)
     output = run / ('transfer-v2-' + str(time.time_ns()))

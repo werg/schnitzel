@@ -1,4 +1,4 @@
-# SDKB on NVIDIA DGX Spark
+# SCHNITZELJAGD on NVIDIA DGX Spark
 
 See [portable operations](operations.md) for named detached containers, W&B,
 configurable run/archive mounts and checkpoint retention. These features also work
@@ -13,7 +13,7 @@ through the Python CLI on other CPU/CUDA hosts.
 ## Chosen runtime
 
 Run natively on Spark's ARM64 host with its supported NVIDIA driver, Docker and NVIDIA
-Container Toolkit working. SDKB does not modify host drivers, install host Python
+Container Toolkit working. SCHNITZELJAGD does not modify host drivers, install host Python
 packages, run privileged containers, or use x86 emulation.
 
 The default base is **`nvcr.io/nvidia/pytorch:25.11-py3`**. NVIDIA's
@@ -24,7 +24,7 @@ not a claim that later NVIDIA releases are unsuitable. The previous unvalidated
 26.08 default is replaced; the cited instructions do not require a separate `-igpu`
 image for this path.
 
-We use the NVIDIA runtime, not Unsloth's model rewrites. SDKB needs ordinary
+We use the NVIDIA runtime, not Unsloth's model rewrites. SCHNITZELJAGD needs ordinary
 `inputs_embeds`, shared producer/consumer parameters, exact replay and reference
 comparisons. An inference-serving image is not the training environment.
 
@@ -32,16 +32,16 @@ comparisons. An inference-serving image is not the training environment.
 
 ```bash
 ./scripts/spark.sh build
-./scripts/spark.sh run sdkb doctor --require-spark
+./scripts/spark.sh run schnitz doctor --require-spark
 ./scripts/spark.sh run python -m pytest -q
 ```
 
 The build checks native architecture, pulls `linux/arm64`, verifies the image,
-resolves its digest, and records that digest in `.sdkb/base-image.txt` and inside
-the image at `/opt/sdkb-base-image.txt`. Dockerfile builds made directly by an editor
+resolves its digest, and records that digest in `.schnitz/base-image.txt` and inside
+the image at `/opt/schnitz-base-image.txt`. Dockerfile builds made directly by an editor
 use the documented tag; use the script for a digest-recorded scientific run.
 
-The installer creates `/opt/sdkb-venv` with system site packages, then adds pinned
+The installer creates `/opt/schnitz-venv` with system site packages, then adds pinned
 [Transformers 5.17.0](https://pypi.org/project/transformers/5.17.0/) and
 [datasets 5.0.1](https://pypi.org/project/datasets/5.0.1/). LFM's
 [model card](https://huggingface.co/LiquidAI/LFM2.5-230M) specifies Transformers >=5.0.
@@ -49,7 +49,7 @@ Vendor torch/torchvision/torchaudio/triton/NVIDIA versions are first recorded as
 explicit constraints. General vendor pip pins are lifted only for the isolated
 project install; GPU-runtime constraints stay enforced. The build fails if the
 imported torch version, CUDA runtime or torch file path changes. It checks LFM class
-imports and records `/opt/sdkb-python-freeze.txt`.
+imports and records `/opt/schnitz-python-freeze.txt`.
 
 No FlashAttention, bitsandbytes, mamba or custom causal-convolution package is
 mandatory. Default attention is SDPA. Parameters and optimizer state are FP32 with
@@ -68,23 +68,23 @@ Container output paths should use `/runs/NAME`, which maps to the chosen host
 storage. Relative training output paths are rejected to prevent bypassing that
 mount and writing into the repository.
 
-Choose an existing run directory with `SDKB_RUNS_DIR`, or persist it locally:
+Choose an existing run directory with `SCHNITZELJAGD_RUNS_DIR`, or persist it locally:
 
 ```bash
-mkdir -p .sdkb
-printf '%s\n' /path/to/existing/external/sdkb-runs > .sdkb/runs-dir
-printf '%s\n' /path/to/existing/external/archive > .sdkb/archive-dir # optional mount
+mkdir -p .schnitz
+printf '%s\n' /path/to/existing/external/schnitz-runs > .schnitz/runs-dir
+printf '%s\n' /path/to/existing/external/archive > .schnitz/archive-dir # optional mount
 ```
 
 These ignored files contain paths only; they are not shell scripts. Environment
 variables override them. Configured directories must exist, so a missing disk does
 not silently cause a new internal directory to be created. On the current machine,
-`.sdkb/runs-dir` selects `/mnt/external/sdkb-archive/runs`. Other machines choose
+`.schnitz/runs-dir` selects `/mnt/external/schnitz-archive/runs`. Other machines choose
 their own storage. Mounting an archive does not itself enable asynchronous copies;
 that remains an explicit training checkpoint policy.
 
 `start_spark.sh` builds only when the local image is absent, checks the device, then
-executes `sdkb launch` in the foreground. Rebuild explicitly after changing pinned
+executes `schnitz launch` in the foreground. Rebuild explicitly after changing pinned
 Python dependencies or the Dockerfile. Ordinary source edits are bind-mounted.
 The model preflight checks ordinary one-pass behavior, zero-gated loop identity,
 causal isolation and nonzero finite soft-memory gradients before training.
@@ -99,18 +99,18 @@ not prove the learned model solves tasks. The separate controlled curriculum is:
 
 ## Resource and access details
 
-The container uses the caller's UID/GID, a mounted checkout at `/workspace/sdkb`,
+The container uses the caller's UID/GID, a mounted checkout at `/workspace/schnitz`,
 8 GiB shared memory, unlimited memlock, a 64 MiB stack limit, an init process, and a
 600-second graceful stop interval. No service port is opened. A hard kill resumes
 from the last committed checkpoint, not a partially written optimizer state.
 Only one launcher should use a given output directory.
 
-`SDKB_CACHE_DIR` overrides the ignored, checkout-local `.sdkb/cache-dir` setting.
-With neither configured, cache storage defaults to `~/.cache/sdkb`. It is mounted
+`SCHNITZELJAGD_CACHE_DIR` overrides the ignored, checkout-local `.schnitz/cache-dir` setting.
+With neither configured, cache storage defaults to `~/.cache/schnitz`. It is mounted
 at `/cache`, with Hugging Face model/dataset caches under `/cache/huggingface`.
 An explicitly configured cache directory must already exist; an unavailable path
 fails before Docker launch rather than being created on an unintended disk.
-On this machine `.sdkb/cache-dir` now selects `/mnt/external/sdkb-archive/cache`.
+On this machine `.schnitz/cache-dir` now selects `/mnt/external/schnitz-archive/cache`.
 Other machines choose their own path; no external-disk location is hardcoded.
 Downloads require network and adequate storage capacity. Streaming
 bounds selected rows/buffering, not necessarily remote Parquet bytes transferred.
@@ -128,12 +128,12 @@ can be used anonymously when their hosts permit it. Optional gated datasets requ
 upstream access; no mirrors or access-control workarounds are selected automatically.
 
 ```bash
-SDKB_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3 ./scripts/spark.sh build
-SDKB_CACHE_DIR=/path/to/ssd/cache ./scripts/start_spark.sh \
+SCHNITZELJAGD_BASE_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3 ./scripts/spark.sh build
+SCHNITZELJAGD_CACHE_DIR=/path/to/ssd/cache ./scripts/start_spark.sh \
   --recipe recipes/coding.yaml --output /runs/coding
 ```
 
-`SDKB_IMAGE` changes the local tag. Another NVIDIA runtime must pass the same checks.
+`SCHNITZELJAGD_IMAGE` changes the local tag. Another NVIDIA runtime must pass the same checks.
 CUDA configurations never silently fall back to CPU. The VS Code devcontainer uses
 the same Dockerfile. The manual Spark workflow requires an owner-provided
 `[self-hosted, linux, ARM64, spark]` runner and is not run on arbitrary pull requests.

@@ -14,17 +14,17 @@ import torch
 from torch.nn import functional as F
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import (reconcile_metrics, resolve_checkpoint, restore_checkpoint,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import (reconcile_metrics, resolve_checkpoint, restore_checkpoint,
                               save_checkpoint, stop_on_signal)
-from sdkb.data import evidence_ids
-from sdkb.episode_index import EpisodeIndex
-from sdkb.interface_migration import initialize_positional_student
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.optimizers import make_optimizer
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run, stored_channel
-from sdkb.trajectories import file_sha256
+from schnitz.data import evidence_ids
+from schnitz.episode_index import EpisodeIndex
+from schnitz.interface_migration import initialize_positional_student
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.optimizers import make_optimizer
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run, stored_channel
+from schnitz.trajectories import file_sha256
 
 
 def _autocast(config):
@@ -150,7 +150,7 @@ def run(teacher_run: Path, episodes_file: Path, output: Path, *, steps: int,
                     'task': task_weight},
     }
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    teacher = SDKBAgent(teacher_config).to(teacher_config.train.device).eval()
+    teacher = SchnitzelAgent(teacher_config).to(teacher_config.train.device).eval()
     load_model(teacher, str(teacher_checkpoint / 'model.safetensors'),
                device=teacher_config.train.device)
     teacher.requires_grad_(False)
@@ -175,7 +175,7 @@ def run(teacher_run: Path, episodes_file: Path, output: Path, *, steps: int,
         student_config.validate()
         output.mkdir(parents=True)
         atomic_json(output / 'migration-inputs.json', identity)
-    student = SDKBAgent(student_config).to(student_config.train.device)
+    student = SchnitzelAgent(student_config).to(student_config.train.device)
     migration = initialize_positional_student(teacher, student)
     for name, parameter in student.named_parameters():
         parameter.requires_grad_(name.startswith(('codecs.', 'reader.')))

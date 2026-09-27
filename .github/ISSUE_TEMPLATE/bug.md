@@ -9,6 +9,6 @@ assignees: ''
 
 ## Minimal command and configuration
 
-## sdkb doctor output (remove private paths)
+## schnitz doctor output (remove private paths)
 
 ## Stack trace and failing parity test

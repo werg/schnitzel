@@ -2,10 +2,10 @@ import copy
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.backbones import TinyBackbone, RecurrentBackbone
-from sdkb.data import make_episode, counterfactual, save_episodes, load_episodes
-from sdkb.replay import ReplayTape
+from schnitz.agent import SchnitzelAgent
+from schnitz.backbones import TinyBackbone, RecurrentBackbone
+from schnitz.data import make_episode, counterfactual, save_episodes, load_episodes
+from schnitz.replay import ReplayTape
 
 
 def test_loop_one_matches_original_and_zero_gate_preserves_it():
@@ -41,7 +41,7 @@ def test_loop_gate_has_learning_signal():
 
 
 def test_agent_full_graph_vs_selective_replay(tiny_config):
-    a = SDKBAgent(tiny_config)
+    a = SchnitzelAgent(tiny_config)
     b = copy.deepcopy(a)
     episode = make_episode(2, distractors=0)
     sources = [a.text_ids(s.text, source=True) for s in episode.supports]
@@ -64,7 +64,7 @@ def test_agent_full_graph_vs_selective_replay(tiny_config):
 
 
 def test_batched_writer_matches_serial_with_variable_lengths(tiny_config):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     ids = [agent.text_ids(text, source=True) for text in ('short', 'a substantially longer source')]
     serial = [agent.produce(item) for item in ids]
     batched = agent.produce_batch(ids)
@@ -82,7 +82,7 @@ def test_batched_native_consumer_matches_mean_serial_objective(tiny_config):
     tiny_config.memory.read_timing = 'loop_boundary'
     tiny_config.train.retrieval = 'oracle'
     tiny_config.train.live_fraction = 1.0
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = [make_episode(11, distractors=0), make_episode(12, distractors=0)]
     records, prompts, targets, required = [], [], [], []
     for episode in episodes:
@@ -99,7 +99,7 @@ def test_batched_native_consumer_matches_mean_serial_objective(tiny_config):
 
 
 def test_query_is_independent_of_teacher_target(tiny_config):
-    a = SDKBAgent(tiny_config).eval()
+    a = SchnitzelAgent(tiny_config).eval()
     episode = make_episode(2, distractors=0)
     prompt = a.prompt_ids(episode.query)
     q = a.query(prompt)
@@ -109,7 +109,7 @@ def test_query_is_independent_of_teacher_target(tiny_config):
 
 @pytest.mark.parametrize("arm", ["memory", "no_memory", "oracle_text"])
 def test_forward_arms_and_empty_reads(tiny_config, arm):
-    a = SDKBAgent(tiny_config)
+    a = SchnitzelAgent(tiny_config)
     e = make_episode(0, distractors=0)
     result = a(a.prompt_ids(e.query), a.target_ids(e.answer), [], [], arm=arm)
     assert torch.isfinite(result.loss)
@@ -120,7 +120,7 @@ def test_forward_arms_and_empty_reads(tiny_config, arm):
 def test_temporary_compaction_trains(tiny_config, compaction):
     tiny_config.memory.compaction = compaction
     tiny_config.memory.compact_records = 1
-    a = SDKBAgent(tiny_config)
+    a = SchnitzelAgent(tiny_config)
     e = make_episode(3, distractors=0)
     records = [a.produce(a.text_ids(s.text, source=True)) for s in e.supports]
     result = a(a.prompt_ids(e.query), a.target_ids(e.answer), records, [0, 1], compact=True)

@@ -6,19 +6,19 @@ import pytest
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.training import train
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.training import train
+from schnitz.trajectories import file_sha256
 
 
 def test_probe_overlay_preserves_reader_and_checks_source(tmp_path, tiny_config):
-    from sdkb.evaluation_adapter import load_frozen_agent
+    from schnitz.evaluation_adapter import load_frozen_agent
     tiny_config.train.steps = 1
     source = tmp_path / 'source'
     train(tiny_config, source)
     checkpoint = resolve_checkpoint(source, verify=True)
-    original = SDKBAgent(tiny_config).eval()
+    original = SchnitzelAgent(tiny_config).eval()
     load_model(original, str(checkpoint / 'model.safetensors'))
     weights = {'key.weight': original.key_head.weight.detach().clone(),
                'address.weight': original.address_maps[0].weight.detach().clone(),
@@ -47,13 +47,13 @@ def test_probe_overlay_preserves_reader_and_checks_source(tmp_path, tiny_config)
 def test_probe_choice_and_generation_share_bank_identity(tmp_path, tiny_config, with_count):
     import importlib.util
     from pathlib import Path
-    from sdkb.data import make_multiuse_world, save_episodes
+    from schnitz.data import make_multiuse_world, save_episodes
     tiny_config.train.steps = 1
     tiny_config.train.max_prompt_tokens = 1500
     source = tmp_path / 'source'
     train(tiny_config, source)
     checkpoint = resolve_checkpoint(source, verify=True)
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     load_model(agent, str(checkpoint / 'model.safetensors'))
     probe = tmp_path / 'probe.pt'
     torch.save({'step': 1, 'identity': {'steps': 1, 'checkpoint_manifest_sha256': file_sha256(checkpoint / 'manifest.json')},
@@ -95,9 +95,9 @@ def test_probe_choice_and_generation_share_bank_identity(tmp_path, tiny_config, 
 
 
 def test_legacy_episode_evaluator_uses_independent_routing_query(tmp_path, tiny_config, monkeypatch):
-    from sdkb.data import make_episode, save_episodes
-    from sdkb.store import DiskStore
-    from sdkb.training import evaluate_episode_file
+    from schnitz.data import make_episode, save_episodes
+    from schnitz.store import DiskStore
+    from schnitz.training import evaluate_episode_file
     tiny_config.memory.independent_routing_query = True
     tiny_config.train.retrieval = 'learned'
     tiny_config.train.steps = 1
@@ -105,7 +105,7 @@ def test_legacy_episode_evaluator_uses_independent_routing_query(tmp_path, tiny_
     train(tiny_config, source)
     path = tmp_path / 'episodes.jsonl'
     save_episodes(path, [make_episode(3, distractors=1)])
-    pair, search = SDKBAgent.query_pair, DiskStore.search
+    pair, search = SchnitzelAgent.query_pair, DiskStore.search
     expected = []
     def capture(self, *args, **kwargs):
         reader_query, routing_query = pair(self, *args, **kwargs)
@@ -114,19 +114,19 @@ def test_legacy_episode_evaluator_uses_independent_routing_query(tmp_path, tiny_
     def checked_search(self, query, **kwargs):
         torch.testing.assert_close(query, expected[0])
         return search(self, query, **kwargs)
-    monkeypatch.setattr(SDKBAgent, 'query_pair', capture)
-    monkeypatch.setattr(SDKBAgent, 'query', lambda *args: pytest.fail('Legacy path bypassed routing query'))
+    monkeypatch.setattr(SchnitzelAgent, 'query_pair', capture)
+    monkeypatch.setattr(SchnitzelAgent, 'query', lambda *args: pytest.fail('Legacy path bypassed routing query'))
     monkeypatch.setattr(DiskStore, 'search', checked_search)
     evaluate_episode_file(source, path)
 
 
 def test_count_policy_binding_and_budget(tmp_path, tiny_config):
-    from sdkb.evaluation_adapter import attach_read_count_policy
+    from schnitz.evaluation_adapter import attach_read_count_policy
     tiny_config.train.steps = 1
     source = tmp_path / 'source'
     train(tiny_config, source)
     checkpoint = resolve_checkpoint(source, verify=True)
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     path = tmp_path / 'count.pt'
     state = {'step': 2, 'identity': {'steps': 2, 'representation': 'reader_query', 'choices': [1, 2],
              'source_identity': {'checkpoint_manifest_sha256': file_sha256(checkpoint / 'manifest.json')}},

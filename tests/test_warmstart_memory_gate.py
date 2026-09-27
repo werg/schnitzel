@@ -7,8 +7,8 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.training import train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.training import train
 
 
 def native(config):
@@ -90,7 +90,7 @@ def test_gate_override_requires_explicit_warmstart(tmp_path, tiny_config):
 
 
 def test_gate_override_is_exercised_by_model_preflight(tiny_config):
-    from sdkb.probes import model_probe
+    from schnitz.probes import model_probe
     config = native(tiny_config)
     config.train.warmstart_memory_gate = .3
     report = model_probe(config)

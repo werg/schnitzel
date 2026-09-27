@@ -181,7 +181,7 @@ class TrainConfig:
     archive_keep_checkpoints: int = 3
     min_free_disk_bytes: int = 1024 ** 3
     wandb_mode: str = 'disabled'  # opt-in: offline or online
-    wandb_project: str = 'sdkb'
+    wandb_project: str = 'schnitz'
     wandb_entity: str | None = None
     wandb_group: str | None = None
 

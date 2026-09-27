@@ -17,7 +17,7 @@ def centered():
 
 
 def test_calibration_ignores_targets_and_rejects_future_sources(centered):
-    from sdkb.data import make_multiuse_world
+    from schnitz.data import make_multiuse_world
     episodes = make_multiuse_world(1, bindings=2)
     original = centered.calibrate(episodes, width=64, seed=11)
     changed = [replace(e, answer='unrelated target', choices=('other',), required_ids=()) for e in episodes]

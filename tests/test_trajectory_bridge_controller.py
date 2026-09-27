@@ -5,9 +5,9 @@ import runpy
 
 import yaml
 
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.operations import request_stop
-from sdkb.trajectories import file_sha256
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.operations import request_stop
+from schnitz.trajectories import file_sha256
 
 
 def test_bridge_resume_after_preflight_stop_and_completed_stage(tmp_path, tiny_config, monkeypatch):

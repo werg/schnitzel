@@ -57,7 +57,7 @@ def _accept_unpacked_shortconv_calls() -> None:
     """Let the embedding model's bidirectional conv patch ignore ``seq_idx``.
 
     Its remote code replaces ``Lfm2ShortConv`` process-wide, so this teacher must
-    never share a process with the causal SDKB LFM2 student. Teacher batches are
+    never share a process with the causal SCHNITZELJAGD LFM2 student. Teacher batches are
     padded, not packed, so the omitted packed-sequence index is always ``None``.
     """
     from transformers.models.lfm2 import modeling_lfm2

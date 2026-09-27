@@ -6,8 +6,8 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.training import train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.training import train
 
 
 @pytest.mark.parametrize('width_factor', [1, 2])

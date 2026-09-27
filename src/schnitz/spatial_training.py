@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .bank_replay import BankWriterReplay
 from .key_geometry import BankLoad, koleo_loss, variance_covariance_loss
 from .record_gradients import GradientSink
@@ -36,7 +36,7 @@ class SpatialForwardResult:
     geometry: Tensor | None = None
 
 
-def _trajectory_write_outputs(agent: SDKBAgent, hidden: Tensor,
+def _trajectory_write_outputs(agent: SchnitzelAgent, hidden: Tensor,
                               rows: list[dict[str, Any]]) -> tuple[Tensor, ...] | None:
     states = []
     slots = agent.config.memory.write_slots + 1
@@ -107,7 +107,7 @@ class _LoadedSpace:
     supplied_ids: tuple[tuple[str, ...], ...] = ()
 
 
-def _validate_layout(agent: SDKBAgent, rows: list[dict[str, Any]],
+def _validate_layout(agent: SchnitzelAgent, rows: list[dict[str, Any]],
                      limits: tuple[int, ...], routing_candidates: int) -> tuple[int, tuple[int, ...]]:
     if not rows or routing_candidates < 1:
         raise ValueError("Spatial bank training needs rows and routing candidates")
@@ -131,7 +131,7 @@ def _validate_layout(agent: SDKBAgent, rows: list[dict[str, Any]],
     return site_count, levels
 
 
-def _begin_batch(agent: SDKBAgent, rows: list[dict[str, Any]], *,
+def _begin_batch(agent: SchnitzelAgent, rows: list[dict[str, Any]], *,
                  limits: tuple[int, ...], routing_candidates: int,
                  pad_token_id: int) -> _SpatialBatchState:
     site_count, levels = _validate_layout(agent, rows, limits, routing_candidates)
@@ -194,7 +194,7 @@ def _gate_record_summary(records: list[dict[str, list[float]]]) -> dict[str, lis
     return summary
 
 
-def _issue_wave(agent: SDKBAgent, state: _SpatialBatchState) -> _ReadWave | None:
+def _issue_wave(agent: SchnitzelAgent, state: _SpatialBatchState) -> _ReadWave | None:
     while state.execution.recurrent.completed < state.execution.recurrent.loops:
         pending = agent.spatial_recurrent_query(state.execution)
         if pending is not None:
@@ -326,7 +326,7 @@ def _load_wave(store: StoredReadBackend, index: BatchKeyIndexBackend, wave: _Rea
     return tuple(loaded)
 
 
-def _consume_wave(agent: SDKBAgent, index: BatchKeyIndexBackend,
+def _consume_wave(agent: SchnitzelAgent, index: BatchKeyIndexBackend,
                   state: _SpatialBatchState,
                   wave: _ReadWave, loaded: tuple[_LoadedSpace, ...], *,
                   limits: tuple[int, ...],
@@ -535,7 +535,7 @@ def _wave_replay_ids(wave: _ReadWave, loaded: tuple[_LoadedSpace, ...], *,
     return tuple(dict.fromkeys(priority))[:replay_budget * len(wave.metadata)]
 
 
-def _finish_batch(agent: SDKBAgent, state: _SpatialBatchState) -> SpatialForwardResult:
+def _finish_batch(agent: SchnitzelAgent, state: _SpatialBatchState) -> SpatialForwardResult:
     hidden = agent.finish_spatial_recurrent(state.execution)
     write_outputs = _trajectory_write_outputs(agent, hidden, state.rows)
     supervised = state.labels >= 0
@@ -628,7 +628,7 @@ def _finish_batch(agent: SDKBAgent, state: _SpatialBatchState) -> SpatialForward
     return SpatialForwardResult(loss, nll, routing, metrics, write_outputs, geometry)
 
 
-def spatial_bank_forward(agent: SDKBAgent, store: StoredReadBackend,
+def spatial_bank_forward(agent: SchnitzelAgent, store: StoredReadBackend,
                          index: BatchKeyIndexBackend,
                          rows: list[dict[str, Any]], *, limits: tuple[int, ...],
                          routing_candidates: int, pad_token_id: int = 0,
@@ -836,7 +836,7 @@ def spatial_bank_forward(agent: SDKBAgent, store: StoredReadBackend,
 
 
 def spatial_bank_pipeline_forward(
-        agent: SDKBAgent, store: StoredReadBackend, index: BatchKeyIndexBackend,
+        agent: SchnitzelAgent, store: StoredReadBackend, index: BatchKeyIndexBackend,
         rows: list[dict[str, Any]], *, limits: tuple[int, ...],
         routing_candidates: int, microbatch_size: int, inflight: int,
         pad_token_id: int = 0,
@@ -885,7 +885,7 @@ def spatial_bank_pipeline_forward(
         return loaded, started, time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=min(inflight, len(chunks)),
-                            thread_name_prefix="sdkb-bank-read") as pool:
+                            thread_name_prefix="schnitz-bank-read") as pool:
         def launch(index_in_step: int) -> None:
             state = _begin_batch(
                 agent, chunks[index_in_step], limits=limits,

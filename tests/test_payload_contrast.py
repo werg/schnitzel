@@ -4,16 +4,16 @@ import json
 import torch
 from safetensors.torch import load_file
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import Episode, Source, save_episodes
-from sdkb.operations import request_stop
-from sdkb.replay import ReplayTape
-from sdkb.training import stored_channel, train
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import Episode, Source, save_episodes
+from schnitz.operations import request_stop
+from schnitz.replay import ReplayTape
+from schnitz.training import stored_channel, train
 
 
 def test_source_swap_loss_accumulates_both_writer_paths_before_step(tiny_config):
-    from sdkb.training import payload_contrast_loss
+    from schnitz.training import payload_contrast_loss
     config = copy.deepcopy(tiny_config)
     config.model.tiny_layers = 3
     config.model.recurrence_mode = 'middle_block'
@@ -26,7 +26,7 @@ def test_source_swap_loss_accumulates_both_writer_paths_before_step(tiny_config)
     config.memory.neighbors = [2, 1]
     config.train.arm = 'memory'
     config.train.retrieval = 'oracle'
-    full = SDKBAgent(config)
+    full = SchnitzelAgent(config)
     replayed = copy.deepcopy(full)
     texts = ['Passage: the marker is aqua.', 'Passage: the marker is copper.']
 

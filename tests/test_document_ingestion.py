@@ -1,4 +1,4 @@
-from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+from schnitz.document_ingestion import (grouped_ingestion_prefixes,
     holistic_ingestion_messages, holistic_write_count, prompted_write_messages,
     source_ingestion_groups, split_document, streaming_ingestion_messages,
     writer_prefix_ids)

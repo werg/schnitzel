@@ -6,18 +6,18 @@ from pathlib import Path
 
 import torch
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes, counterfactual_multiuse, save_episodes
-from sdkb.evaluation import build_shared_bank
-from sdkb.evaluation_interventions import TargetedPayloadStore
-from sdkb.evaluation_adapter import load_frozen_agent, attach_read_count_policy
-from sdkb.frozen_scoring import FrozenScorer
-from sdkb.offline_bank import canonical_json
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore, ReadPlan, Selection
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes, counterfactual_multiuse, save_episodes
+from schnitz.evaluation import build_shared_bank
+from schnitz.evaluation_interventions import TargetedPayloadStore
+from schnitz.evaluation_adapter import load_frozen_agent, attach_read_count_policy
+from schnitz.frozen_scoring import FrozenScorer
+from schnitz.offline_bank import canonical_json
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore, ReadPlan, Selection
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 @torch.no_grad()

@@ -12,9 +12,9 @@ import statistics
 
 import torch
 
-from sdkb import optimizers
-from sdkb.training import train, config_from_run
-from sdkb.probes import model_probe
+from schnitz import optimizers
+from schnitz.training import train, config_from_run
+from schnitz.probes import model_probe
 
 
 def profile(source, output, checkpointing, updates, trace):

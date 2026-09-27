@@ -2,17 +2,17 @@
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.11-py3
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
-LABEL org.opencontainers.image.title="SDKB" \
-      org.opencontainers.image.description="Spatially Superposed Differentiable Knowledge Base"
+LABEL org.opencontainers.image.title="SCHNITZELJAGD" \
+      org.opencontainers.image.description="Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders"
 ENV PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
     HF_HOME=/cache/huggingface HF_HUB_DISABLE_TELEMETRY=1 \
     NVIDIA_IMEX_CHANNELS=0 TOKENIZERS_PARALLELISM=false
-WORKDIR /workspace/sdkb
-COPY pyproject.toml /workspace/sdkb/
-COPY src /workspace/sdkb/src
+WORKDIR /workspace/schnitz
+COPY pyproject.toml /workspace/schnitz/
+COPY src /workspace/schnitz/src
 COPY scripts/install_in_ngc.sh /tmp/install_in_ngc.sh
-RUN printf '%s\n' "$BASE_IMAGE" >/opt/sdkb-base-image.txt \
-    && bash /tmp/install_in_ngc.sh /workspace/sdkb
-ENV PATH=/opt/sdkb-venv/bin:$PATH \
-    PIP_CONSTRAINT=/opt/sdkb-runtime-constraints.txt
+RUN printf '%s\n' "$BASE_IMAGE" >/opt/schnitz-base-image.txt \
+    && bash /tmp/install_in_ngc.sh /workspace/schnitz
+ENV PATH=/opt/schnitz-venv/bin:$PATH \
+    PIP_CONSTRAINT=/opt/schnitz-runtime-constraints.txt
 CMD ["bash"]

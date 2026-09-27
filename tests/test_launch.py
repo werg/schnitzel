@@ -3,11 +3,11 @@ from pathlib import Path
 import json
 import pytest
 import yaml
-from sdkb.launch import prepare_launch, launch
-from sdkb.agent import SDKBAgent
-from sdkb.data import load_episodes
-from sdkb.store import DiskStore
-from sdkb.trajectory_eval import build_teacher_bank, stored_teacher_evaluation
+from schnitz.launch import prepare_launch, launch
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import load_episodes
+from schnitz.store import DiskStore
+from schnitz.trajectory_eval import build_teacher_bank, stored_teacher_evaluation
 
 ROOT = Path(__file__).parents[1]
 
@@ -47,7 +47,7 @@ def test_full_three_stages_and_idempotent_resume(tmp_path, tiny_config):
 
 
 def test_teacher_evaluation_stop_does_not_publish_stage_marker(tmp_path, tiny_config, monkeypatch):
-    import sdkb.trajectory_eval as teacher_eval
+    import schnitz.trajectory_eval as teacher_eval
     recipe, out = make_recipe(tmp_path, tiny_config), tmp_path / 'run'
     calls = []
     def evaluator(run, episodes, **kwargs):
@@ -64,7 +64,7 @@ def test_stored_teacher_reads_cannot_call_producer(tmp_path, tiny_config, monkey
     recipe = make_recipe(tmp_path, tiny_config)
     prepare_launch(recipe, tmp_path / 'prepared')
     es = load_episodes(tmp_path / 'prepared/data/validation.jsonl')[:2]
-    agent, store = SDKBAgent(tiny_config).eval(), DiskStore(tmp_path / 'bank.sqlite')
+    agent, store = SchnitzelAgent(tiny_config).eval(), DiskStore(tmp_path / 'bank.sqlite')
     assert build_teacher_bank(agent, store, es)['writer_calls'] > 0
     def forbidden(*args, **kwargs):
         raise AssertionError('Writer invoked on read path')
@@ -75,7 +75,7 @@ def test_stored_teacher_reads_cannot_call_producer(tmp_path, tiny_config, monkey
 
 
 def test_explicit_target_limit(tiny_config):
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     agent.config.train.max_target_tokens = 5
     with pytest.raises(ValueError, match='Target uses'):
         agent.target_ids('This is a long complete answer')
@@ -90,7 +90,7 @@ def test_namespace_scripts_and_documented_docker():
 
 def test_interrupted_preparation_rejects_changed_recipe(tmp_path, tiny_config, monkeypatch):
     import importlib
-    module = importlib.import_module('sdkb.launch')
+    module = importlib.import_module('schnitz.launch')
     recipe = make_recipe(tmp_path, tiny_config)
     with monkeypatch.context() as m:
         def fail(*args, **kwargs):
@@ -106,7 +106,7 @@ def test_interrupted_preparation_rejects_changed_recipe(tmp_path, tiny_config, m
 
 
 def test_causal_and_binding_evaluations_resume_independently(tmp_path, tiny_config, monkeypatch):
-    import sdkb.evaluation as evaluation
+    import schnitz.evaluation as evaluation
     recipe = make_recipe(tmp_path, tiny_config)
     r = yaml.safe_load(recipe.read_text())
     r['evaluation']['causal_worlds'] = 1

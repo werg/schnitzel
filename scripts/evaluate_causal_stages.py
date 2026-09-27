@@ -11,11 +11,11 @@ import json
 from pathlib import Path
 import time
 
-from sdkb.checkpoints import resolve_checkpoint, stop_on_signal
-from sdkb.config import load_config
-from sdkb.evaluation import evaluate_transfer_run
-from sdkb.launch import file_sha256
-from sdkb.operations import atomic_json, run_lock, run_status, stop_requested
+from schnitz.checkpoints import resolve_checkpoint, stop_on_signal
+from schnitz.config import load_config
+from schnitz.evaluation import evaluate_transfer_run
+from schnitz.launch import file_sha256
+from schnitz.operations import atomic_json, run_lock, run_status, stop_requested
 
 
 def wait_for_completion(run, *, startup_timeout=60):

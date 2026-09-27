@@ -2,7 +2,7 @@ import copy
 import pytest
 import torch
 
-from sdkb.readers import SetReader, MultiSpaceReader, merge_statistics
+from schnitz.readers import SetReader, MultiSpaceReader, merge_statistics
 
 
 def reader(kind="mlp", **kwargs):
@@ -107,7 +107,7 @@ def test_bf16_autocast_finite():
 
 
 def test_attention_zero_multiplicity_gradient_matches_explicit_formula():
-    from sdkb.readers import AttentionRound, Statistics
+    from schnitz.readers import AttentionRound, Statistics
     import math
     block = AttentionRound(4, 3, 6, 2).double()
     x = torch.randn(1, 3, 4, dtype=torch.double)
@@ -125,7 +125,7 @@ def test_attention_zero_multiplicity_gradient_matches_explicit_formula():
 
 
 def test_zero_mass_statistics_backward_is_finite():
-    from sdkb.readers import Statistics
+    from schnitz.readers import Statistics
     numerator = torch.zeros(1, 2, 8, requires_grad=True)
     mass = torch.zeros(1, 2, 1, requires_grad=True)
     stats = Statistics(numerator, mass, torch.zeros_like(mass))
@@ -155,7 +155,7 @@ def test_saturated_mlp_gate_has_finite_backward(autocast):
 
 
 def test_tiny_positive_gate_preserves_conditional_mean_mass_and_gradients():
-    from sdkb.readers import MLPRound, Statistics
+    from schnitz.readers import MLPRound, Statistics
     torch.manual_seed(3)
     block = MLPRound(4, 3, 8, 2)
     with torch.no_grad():

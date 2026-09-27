@@ -1,14 +1,14 @@
 import hashlib
 import json
 
-from sdkb.backbones import ByteTokenizer
-from sdkb.data import load_episodes
-from sdkb.corpus_data import prepare_squad
+from schnitz.backbones import ByteTokenizer
+from schnitz.data import load_episodes
+from schnitz.corpus_data import prepare_squad
 
 
 def test_short_reconstruction_keeps_source_before_query_and_target_out_of_prompt():
-    from sdkb.corpus_data import short_reconstruction
-    from sdkb.data import Source
+    from schnitz.corpus_data import short_reconstruction
+    from schnitz.data import Source
     source = Source('opaque-source', 'Title: Example\nPassage: Alpha beta gamma delta epsilon.', 1, 'passage')
     episode = short_reconstruction(source, max_words=3)
     assert episode.supports == (source,)
@@ -19,8 +19,8 @@ def test_short_reconstruction_keeps_source_before_query_and_target_out_of_prompt
 
 
 def test_short_reconstruction_respects_complete_target_token_budget():
-    from sdkb.corpus_data import short_reconstruction
-    from sdkb.data import Source
+    from schnitz.corpus_data import short_reconstruction
+    from schnitz.data import Source
     tokenizer = ByteTokenizer()
     source = Source('opaque', 'Title: Example\nPassage: alpha beta gamma delta', 1, 'passage')
     episode = short_reconstruction(source, max_words=4, tokenizer=tokenizer, max_target_tokens=8)
@@ -30,15 +30,15 @@ def test_short_reconstruction_respects_complete_target_token_budget():
 
 
 def test_short_reconstruction_preserves_source_whitespace():
-    from sdkb.corpus_data import short_reconstruction
-    from sdkb.data import Source
+    from schnitz.corpus_data import short_reconstruction
+    from schnitz.data import Source
     source = Source('opaque', 'Title: Example\nPassage: Alpha  beta\ngamma.', 1, 'passage')
     assert short_reconstruction(source, max_words=2).answer == 'Alpha  beta'
 
 
 def test_eligible_distractor_preserves_verified_target_and_causal_identity():
-    from sdkb.corpus_data import short_reconstruction, with_distractor
-    from sdkb.data import Source
+    from schnitz.corpus_data import short_reconstruction, with_distractor
+    from schnitz.data import Source
     primary = Source('a', 'Title: A\nPassage: Alpha beta.', 1, 'passage')
     decoy = Source('b', 'Title: B\nPassage: Copper silver.', 1, 'passage')
     original = short_reconstruction(primary)
@@ -51,8 +51,8 @@ def test_eligible_distractor_preserves_verified_target_and_causal_identity():
 
 
 def test_title_located_question_retains_target_and_prior_source():
-    from sdkb.corpus_data import title_located_question
-    from sdkb.data import Episode, Source
+    from schnitz.corpus_data import title_located_question
+    from schnitz.data import Episode, Source
     source = Source('source', 'Title: Helios\nPassage: Helios uses the code aqua.', 1, 'passage')
     original = Episode('q', 'squad-train', (source,), 'What code does it use?', 'aqua',
                        ('source',), False, 0, 0, 2, 'passage_qa', (),
@@ -67,8 +67,8 @@ def test_title_located_question_retains_target_and_prior_source():
 
 def test_title_locator_rejects_answer_hidden_by_underscores():
     import pytest
-    from sdkb.corpus_data import title_located_question
-    from sdkb.data import Episode, Source
+    from schnitz.corpus_data import title_located_question
+    from schnitz.data import Episode, Source
     source = Source('source', 'Title: Royal_Institute_of_British_Architects', 1, 'passage')
     original = Episode('q', 'squad-train', (source,), 'What does RIBA stand for?',
                        'Royal Institute of British Architects', ('source',), False,

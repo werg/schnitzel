@@ -1,4 +1,4 @@
-"""Canonical visible memory-tool events for trajectory-native SDKB training.
+"""Canonical visible memory-tool events for trajectory-native SCHNITZELJAGD training.
 
 The transcript carries opaque metadata and tool syntax. Latent tensors remain in a
 separate attachment store and are referenced by ID from a search result.

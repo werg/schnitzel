@@ -23,21 +23,21 @@ from safetensors.torch import load_file, load_model
 import torch
 from torch.nn import functional as F
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_coherence import verify_refresh_coverage
-from sdkb.checkpoints import resolve_checkpoint, save_checkpoint
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.keyspace_distillation import (LexicalField, StandardizedHead,
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_coherence import verify_refresh_coverage
+from schnitz.checkpoints import resolve_checkpoint, save_checkpoint
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.keyspace_distillation import (LexicalField, StandardizedHead,
                                         convert_to_direct, field_kl, flat_positives,
                                         lexical_field_loss, recall_summary,
                                         source_disjoint_split, support_ranks,
                                         union_field_loss)
-from sdkb.operations import atomic_json
-from sdkb.optimizers import make_optimizer
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training import autocast_context, config_from_run
-from sdkb.training_bank import TrainingBank
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json
+from schnitz.optimizers import make_optimizer
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training import autocast_context, config_from_run
+from schnitz.training_bank import TrainingBank
+from schnitz.trajectories import file_sha256
 
 LIMITS = (16, 8, 4, 4)
 
@@ -380,7 +380,7 @@ def warmup_run(args) -> dict:
             direct_state[f'{kind}.{space}.weight'] = weight.cpu()
             direct_state[f'{kind}.{space}.bias'] = bias.cpu()
     config.memory.key_interface = 'direct'
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     # load_model restores tied tensors that a raw safetensors state omits.
     missing, unexpected = load_model(agent, str(checkpoint / 'model.safetensors'),
                                      strict=False)
@@ -477,7 +477,7 @@ def warmup_run(args) -> dict:
 
 
 def _reproduce_keys(agent, config, bank_manifest, sources: Path, ids: list[str], index) -> dict:
-    from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+    from schnitz.document_ingestion import (grouped_ingestion_prefixes,
                                          source_ingestion_groups, writer_prefix_ids)
     rows = [json.loads(line) for line in sources.open(encoding='utf-8')]
     source_rows = {row['record_id']: row for row in rows}

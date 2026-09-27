@@ -1,4 +1,6 @@
-# SDKB
+# SCHNITZELJAGD
+
+> Formerly SDKB (`sdkb`). Historical experiment records retain their original names.
 
 [Research status](docs/research-status.md) summarizes what is established and what
 remains open, including the completed reader-capacity and real-trajectory studies.
@@ -56,9 +58,9 @@ find weaker character access through the reader than in its input payloads. The
 now training matched reset readers of two widths; its capability results are pending.
 The [bgkit audit](docs/bgkit-audit.md) records storage, recovery and runtime adoption.
 
-**Spatially Superposed Differentiable Knowledge Base**
+**Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders**
 
-SDKB trains a small language model to write experiences into stored latent values,
+SCHNITZELJAGD trains a small language model to write experiences into stored latent values,
 compose selected values through a recurrent set reader, and use the result on later
 questions or actions. Selective replay trains the writer without retaining every
 source graph. Compaction learns to replace groups with synthetic records while
@@ -67,15 +69,15 @@ preserving their conditional contributions.
 **Version 0.4.0 · Student `LiquidAI/LFM2.5-230M` · Initial GPU validation: DGX Spark.**
 The Python runtime supports CPU/CUDA; Spark-specific checks live in the container wrapper.
 The Python package, CLI, agent class, scripts, container and active documentation now
-use SDKB (`sdkb`, `SDKBAgent`). Historical experiment logs remain immutable evidence.
+use SCHNITZELJAGD (`schnitz`, `SchnitzelAgent`). Historical experiment logs remain immutable evidence.
 
 ## Start on the Spark
 
 Clone the upstream repository using your existing access:
 
 ```bash
-git clone git@github.com:werg/sdkb.git sdkb
-cd sdkb
+git clone git@github.com:werg/schnitzel.git schnitzel
+cd schnitzel
 ./scripts/start_spark.sh --recipe recipes/looped_smoke.yaml --output /runs/looped-smoke
 ```
 
@@ -92,8 +94,8 @@ a capability experiment. After inspecting its outputs, start the main curriculum
 |---|---:|---|
 | `text_bootstrap` | 200 | Adapt the student to the recorded target format with the same selected evidence rendered as text. |
 | `recurrence_bridge` | 200 | Two middle-core passes, frozen parent, live bridge, and one-pass parent distribution anchoring. |
-| `latent_warmup` | 400 | Two passes with an actual inter-pass SDKB read; freeze the base while training the latent interface. |
-| `recurrent_joint` | 400 | Sample 2/3 passes; update shared core + SDKB modules, retain one-pass text anchoring. |
+| `latent_warmup` | 400 | Two passes with an actual inter-pass SCHNITZELJAGD read; freeze the base while training the latent interface. |
+| `recurrent_joint` | 400 | Sample 2/3 passes; update shared core + SCHNITZELJAGD modules, retain one-pass text anchoring. |
 
 The Muon starter uses native Muon for eligible matrices and AdamW for embedding,
 output, slot and other excluded tensors. It requires a runtime providing native
@@ -143,7 +145,7 @@ To download, pin and inspect data without loading the training model:
 | `tiny_looped_smoke.yaml` | Tiny CPU recurrent curriculum and fresh causal worlds, no downloads. |
 
 The previous `starter.yaml`, `causal.yaml`, and dataset-specific recipes remain one-pass controls; the `looped_` recipes explicitly enable recurrent conversion. `smollm2_looped_causal.yaml` is the attention-only conversion comparison. Paths are under `recipes/`. Sources/configurations/licenses and exact parsing are in
-[the dataset guide](docs/datasets.md); `sdkb datasets` prints the executable catalog.
+[the dataset guide](docs/datasets.md); `schnitz datasets` prints the executable catalog.
 See [training](docs/training.md) and [Spark setup](docs/spark.md) for operations.
 
 **Two separate data protocols are implemented.** Prefix memory encodes earlier
@@ -160,11 +162,11 @@ The build script pulls `linux/arm64`, verifies architecture, resolves an immutab
 image digest and preserves NVIDIA's torch/CUDA installation. An isolated venv adds
 Transformers 5.17.0 and datasets 5.0.1 without replacing the GPU runtime.
 
-SDKB does not require Unsloth model patches, FlashAttention, bitsandbytes or custom
+SCHNITZELJAGD does not require Unsloth model patches, FlashAttention, bitsandbytes or custom
 convolution wheels. It uses the public Transformers embedding interface and the
 ordinary pretrained path as its one-pass baseline. A documented base image is not
 proof that the complete assembled stack has run here: build-time imports and the
-real-device model/gradient preflight verify it on the Spark. `SDKB_BASE_IMAGE` is an
+real-device model/gradient preflight verify it on the Spark. `SCHNITZELJAGD_BASE_IMAGE` is an
 explicit override for another tested NVIDIA image.
 
 ## Implemented architecture
@@ -181,7 +183,7 @@ inference: stored payloads only; no producer encoding on the read path
 ```
 
 The new main experiment retains LFM's 14 layers, repeats layers `[4:10]`, and
-reads SDKB between core passes. The one-pass plain-input path exactly preserves the
+reads SCHNITZELJAGD between core passes. The one-pass plain-input path exactly preserves the
 parent at installation. The writer stays at one pass while consumer depth changes.
 Native masks and positional conventions are retained; no KV/conv cache crosses a
 loop. The initial gates are small but live, not zeroed across all extra computation.
@@ -221,8 +223,8 @@ With Python 3.11+ and CPU PyTorch installed:
 ```bash
 python -m pip install -e '.[dev]'
 python -m pytest -q
-sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline
-sdkb launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline --resume
+schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline
+schnitz launch --recipe recipes/tiny_looped_smoke.yaml --output runs/offline --resume
 ```
 
 Core tests do not download models/data. Current execution and capability evidence

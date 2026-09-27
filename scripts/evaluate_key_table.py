@@ -58,19 +58,19 @@ from safetensors.torch import load_model
 import torch
 from torch.nn import functional as F
 
-from sdkb.agent import SDKBAgent
-from sdkb.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
+from schnitz.agent import SchnitzelAgent
+from schnitz.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
                                      writer_prefix_ids)
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import writer_prompt_generation
-from sdkb.operations import atomic_json
-from sdkb.recurrence import SpatialReadSite
-from sdkb.routing import cosine_similarities
-from sdkb.spatial_data import SpatialTrajectoryIndex, validate_spatial_row
-from sdkb.store import DiskStore, ReadPlan, Selection
-from sdkb.training import autocast_context, config_from_run
-from sdkb.training_bank import TrainingBank
-from sdkb.trajectories import file_sha256
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import writer_prompt_generation
+from schnitz.operations import atomic_json
+from schnitz.recurrence import SpatialReadSite
+from schnitz.routing import cosine_similarities
+from schnitz.spatial_data import SpatialTrajectoryIndex, validate_spatial_row
+from schnitz.store import DiskStore, ReadPlan, Selection
+from schnitz.training import autocast_context, config_from_run
+from schnitz.training_bank import TrainingBank
+from schnitz.trajectories import file_sha256
 
 
 def _checkpoint(run: Path, step: int | None) -> Path:
@@ -198,7 +198,7 @@ def _evaluate(run: Path, bank_dir: Path, data_path: Path, output: Path, *,
         array.keys[:] = table['keys'][space].float().numpy()
     index.invalidate()
 
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     agent.eval()
     data = SpatialTrajectoryIndex(data_path)

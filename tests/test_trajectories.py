@@ -2,10 +2,10 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import pytest
-from sdkb.backbones import ByteTokenizer
-from sdkb.data import load_episodes, make_episode, save_episodes
-from sdkb.episode_index import EpisodeIndex
-from sdkb.trajectories import (normalize_message, normalize_trajectory, trajectory_episodes,
+from schnitz.backbones import ByteTokenizer
+from schnitz.data import load_episodes, make_episode, save_episodes
+from schnitz.episode_index import EpisodeIndex
+from schnitz.trajectories import (normalize_message, normalize_trajectory, trajectory_episodes,
                                prepare_trajectories, split_for, chunk_message, CATALOG)
 
 

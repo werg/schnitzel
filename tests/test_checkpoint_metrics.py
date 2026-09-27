@@ -2,7 +2,7 @@ import json
 
 
 def test_probe_metrics_reconcile_to_saved_step_and_drop_torn_tail(tmp_path):
-    from sdkb.checkpoints import reconcile_metrics
+    from schnitz.checkpoints import reconcile_metrics
     path = tmp_path / 'metrics.jsonl'
     path.write_text('{"step": 20, "loss": 1}\n{"step": 40, "loss": 0.5}\n{"step":')
     reconcile_metrics(tmp_path, 25)

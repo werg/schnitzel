@@ -1,15 +1,12 @@
-"""Compatibility package for code that still imports the former ``sdkb`` name."""
+"""SCHNITZELJAGD latent memory system. No downloads on import."""
 from __future__ import annotations
 
-import schnitz as _schnitz
-
-__version__ = _schnitz.__version__
-__path__ = _schnitz.__path__
+__version__ = "0.4.0"
 __all__ = ["SchnitzelAgent", "SDKBAgent", "__version__"]
 
 
 def __getattr__(name: str):
     if name in {"SchnitzelAgent", "SDKBAgent"}:
-        from schnitz.agent import SchnitzelAgent
+        from .agent import SchnitzelAgent
         return SchnitzelAgent
     raise AttributeError(name)

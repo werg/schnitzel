@@ -1,4 +1,4 @@
-"""Synchronous staged SDKB training with immutable inputs and resumable stages."""
+"""Synchronous staged SCHNITZELJAGD training with immutable inputs and resumable stages."""
 from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict
@@ -176,7 +176,7 @@ def prepare_launch(recipe_path, output, *, resume=False):
     if (data / 'normalized.jsonl').exists():
         files.append('data/normalized.jsonl')
     files += [s['name'] + '.yaml' for s in stages]
-    manifest = dict(format=1, project='SDKB', input_identity=identity, recipe=recipe, stages=stages,
+    manifest = dict(format=1, project='SCHNITZELJAGD', input_identity=identity, recipe=recipe, stages=stages,
                     resolved_model_revision=base.model.revision, backend=base.model.backend,
                     prepared_checksums={f: file_sha256(output / f) for f in files}, prepared_at_unix=time.time())
     atomic_json(manifest_path, manifest)

@@ -1,6 +1,6 @@
 import torch
 
-from sdkb.routing import AdaptiveDistanceGate, union_support_loss
+from schnitz.routing import AdaptiveDistanceGate, union_support_loss
 
 
 def test_distance_gate_is_density_relative_and_trains_both_keys():

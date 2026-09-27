@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from sdkb.operations import control_dir, run_status
+from schnitz.operations import control_dir, run_status
 
 
 # Variable trajectory and writer lengths otherwise leave many differently sized

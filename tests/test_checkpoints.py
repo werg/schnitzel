@@ -6,9 +6,9 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training import train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training import train
 
 
 def test_interrupted_resume_matches_uninterrupted_with_cache_and_noise(tmp_path, tiny_config):
@@ -50,7 +50,7 @@ def test_interrupted_resume_matches_uninterrupted_with_cache_and_noise(tmp_path,
 
 
 def test_partial_publish_keeps_old_checkpoint(tmp_path, tiny_config, monkeypatch):
-    import sdkb.checkpoints as checkpoints
+    import schnitz.checkpoints as checkpoints
     run = tmp_path / 'run'
     original = checkpoints._atomic_text
     writes = 0
@@ -135,8 +135,8 @@ def test_compactor_only_does_not_move_raw_system(tmp_path, tiny_config):
 
 @pytest.mark.parametrize('native_compaction', [False, 'interleaved', 'paired'])
 def test_mid_accumulation_emergency_resume_is_exact(tmp_path, tiny_config, monkeypatch, native_compaction):
-    from sdkb.operations import request_stop
-    from sdkb.replay import ReplayTape
+    from schnitz.operations import request_stop
+    from schnitz.replay import ReplayTape
     config = copy.deepcopy(tiny_config)
     config.train.steps = 3
     config.train.gradient_accumulation = 3
@@ -207,12 +207,12 @@ def test_immutable_checkpoint_is_not_a_training_output(tmp_path, tiny_config):
 def test_direct_restore_checks_dataset_identity(tmp_path, tiny_config):
     import hashlib
     import random
-    from sdkb.agent import SDKBAgent
-    from sdkb.checkpoints import restore_checkpoint
-    from sdkb.optimizers import make_optimizer
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.checkpoints import restore_checkpoint
+    from schnitz.optimizers import make_optimizer
     run = tmp_path/'run'
     train(tiny_config, run)
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     with pytest.raises(ValueError, match='Episode contents changed'):
         restore_checkpoint(agent, make_optimizer(agent), resolve_checkpoint(run), random.Random(1), 'changed')
     checkpoint = resolve_checkpoint(run)
@@ -247,8 +247,8 @@ def test_incomplete_legacy_state_requires_explicit_warm_start(tmp_path, tiny_con
 
 @pytest.mark.parametrize('stop_at_saved_step', [0, 1])
 def test_stop_during_save_reuses_that_committed_state(tmp_path, tiny_config, monkeypatch, stop_at_saved_step):
-    from sdkb import training
-    from sdkb.operations import request_stop
+    from schnitz import training
+    from schnitz.operations import request_stop
     config = copy.deepcopy(tiny_config)
     config.train.steps = 3
     config.train.checkpoint_every = 1 if stop_at_saved_step else 10000
@@ -284,8 +284,8 @@ def test_stop_during_save_reuses_that_committed_state(tmp_path, tiny_config, mon
 
 
 def test_stopped_resume_commits_an_extended_step_budget(tmp_path, tiny_config, monkeypatch):
-    from sdkb import training
-    from sdkb.operations import request_stop
+    from schnitz import training
+    from schnitz.operations import request_stop
     config = copy.deepcopy(tiny_config)
     run = tmp_path/'run'
     train(config, run, stop_after=1)

@@ -18,16 +18,16 @@ import time
 from safetensors.torch import load_model, save_file
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
                                      writer_prefix_ids)
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import writer_prompt_generation
-from sdkb.operations import atomic_json
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import writer_prompt_generation
+from schnitz.operations import atomic_json
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def build(run: Path, bank: Path, sources: Path, *, batch_size: int = 32,
@@ -43,7 +43,7 @@ def build(run: Path, bank: Path, sources: Path, *, batch_size: int = 32,
     if output.exists():
         raise FileExistsError(output)
     config = config_from_run(run)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     agent.eval()
     rows = {}

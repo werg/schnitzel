@@ -11,9 +11,9 @@ import re
 import shutil
 import uuid
 
-from sdkb.corpus_data import short_reconstruction
-from sdkb.data import Source
-from sdkb.trajectories import file_sha256
+from schnitz.corpus_data import short_reconstruction
+from schnitz.data import Source
+from schnitz.trajectories import file_sha256
 
 REVISION = '40cb2ad3b3044d5a41eee083a6103c8b523afa45'
 

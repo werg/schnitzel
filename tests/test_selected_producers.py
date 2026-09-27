@@ -5,10 +5,10 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.training import train
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.training import train
 
 
 @pytest.mark.parametrize('family', ['identifier', 'action'])
@@ -31,12 +31,12 @@ def test_selected_producers_preserve_updates_rng_and_full_selected_evidence(tmp_
     tiny_config.train.steps = 2
     tiny_config.train.gradient_accumulation = 2
     tiny_config.memory.noise_std = .02
-    original = SDKBAgent.produce
+    original = SchnitzelAgent.produce
     calls = []
     def produce(self, source_ids):
         calls.append(source_ids.clone())
         return original(self, source_ids)
-    monkeypatch.setattr(SDKBAgent, 'produce', produce)
+    monkeypatch.setattr(SchnitzelAgent, 'produce', produce)
     reference = tmp_path/'reference'
     train(tiny_config, reference)
     reference_calls = len(calls)

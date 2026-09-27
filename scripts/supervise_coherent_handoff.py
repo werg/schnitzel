@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 
-from sdkb.operations import run_status, stop_requested
+from schnitz.operations import run_status, stop_requested
 
 
 def complete(run: Path) -> bool:

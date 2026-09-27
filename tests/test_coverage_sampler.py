@@ -4,8 +4,8 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.training import EpisodeSampler, train
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.training import EpisodeSampler, train
 
 
 def test_shuffled_passes_cover_every_episode_before_repeating():
@@ -20,8 +20,8 @@ def test_shuffled_passes_cover_every_episode_before_repeating():
 
 
 def test_shuffled_passes_resume_exactly_after_partial_update(tmp_path, tiny_config, monkeypatch):
-    from sdkb.operations import request_stop
-    from sdkb.replay import ReplayTape
+    from schnitz.operations import request_stop
+    from schnitz.replay import ReplayTape
 
     config = copy.deepcopy(tiny_config)
     config.train.steps = 3

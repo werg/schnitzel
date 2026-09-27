@@ -9,9 +9,9 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from sdkb.config import load_config
-from sdkb.episode_index import EpisodeIndex
-from sdkb.text import render_prompt
+from schnitz.config import load_config
+from schnitz.episode_index import EpisodeIndex
+from schnitz.text import render_prompt
 
 
 def build(config_path: Path, episodes_path: Path, output: Path) -> dict:

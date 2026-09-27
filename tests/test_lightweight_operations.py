@@ -15,7 +15,7 @@ class NoML(importlib.abc.MetaPathFinder):
         if fullname.split('.')[0] in {'torch', 'safetensors'}:
             raise AssertionError('ML dependency imported by host operation: '+fullname)
 sys.meta_path.insert(0, NoML())
-from sdkb.cli import main
+from schnitz.cli import main
 main(sys.argv[1:])
 """
 

@@ -16,8 +16,8 @@ import sys
 
 import yaml
 
-from sdkb.config import load_config
-from sdkb.data import make_boolean_world, save_episodes
+from schnitz.config import load_config
+from schnitz.data import make_boolean_world, save_episodes
 
 
 def run(command: list[str], log: Path) -> dict:
@@ -68,13 +68,13 @@ def reproduce(output: Path, *, resume: bool = False, max_steps: int | None = Non
         path = output / f'{name}.yaml'
         path.write_text(yaml.safe_dump(asdict(config), sort_keys=False))
         directory = output / name
-        command = [sys.executable, '-m', 'sdkb.cli', 'train', '--config', str(path), '--output', str(directory)]
+        command = [sys.executable, '-m', 'schnitz.cli', 'train', '--config', str(path), '--output', str(directory)]
         if (directory / 'CURRENT').exists():
             command.append('--resume')
         elif init:
             command.extend(['--init-from', str(output / init)])
         trained = run(command, output / f'{name}-training.txt')
-        command = [sys.executable, '-m', 'sdkb.cli', 'evaluate-transfer', '--run', str(directory),
+        command = [sys.executable, '-m', 'schnitz.cli', 'evaluate-transfer', '--run', str(directory),
                    '--episodes', str(output / f'{test}.jsonl')]
         if name == 'warm':
             command.extend(['--drop-supports', '--boolean-counterfactuals'])

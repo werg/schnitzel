@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from sdkb.store import (DiskStore, StoredRecord, ReadPlan, Selection, AsyncRetriever, lookup_record)
+from schnitz.store import (DiskStore, StoredRecord, ReadPlan, Selection, AsyncRetriever, lookup_record)
 
 
 def record(rid, key, **kwargs):

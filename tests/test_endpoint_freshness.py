@@ -25,8 +25,8 @@ def test_slot_major_corpora_match_draws_and_source_prefix(tmp_path):
     assert a['families'] == b['families']
     assert set(a['families']) == {'multiuse/identifier', 'multiuse/action', 'multiuse/permission', 'multiuse/restoration'}
     assert a['families']['multiuse/identifier'] > a['families']['multiuse/action']
-    from sdkb.data import save_episodes
-    from sdkb.episode_index import EpisodeIndex
+    from schnitz.data import save_episodes
+    from schnitz.episode_index import EpisodeIndex
     path = tmp_path/'episodes.jsonl'
     save_episodes(path, small)
     assert len(EpisodeIndex(path)) == len(small)

@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 import shutil
 
-from sdkb.corpus_data import prepare_squad
-from sdkb.operations import atomic_json
-from sdkb.trajectories import file_sha256
+from schnitz.corpus_data import prepare_squad
+from schnitz.operations import atomic_json
+from schnitz.trajectories import file_sha256
 
 
 REVISION = '40cb2ad3b3044d5a41eee083a6103c8b523afa45'

@@ -23,7 +23,7 @@ The model process uses three narrow capabilities:
 3. `MutableRecoveryBackend` exposes the small cursor token, exact rollback, checkpoint
    pins, and revision garbage collection.
 
-These protocols are defined in `sdkb.storage_contract`. The SQLite implementation is
+These protocols are defined in `schnitz.storage_contract`. The SQLite implementation is
 the correctness reference. Stored sessions, corpus training, and spatial training now
 depend on the public read/search protocols rather than a SQLite connection.
 
@@ -88,7 +88,7 @@ validated selection-conditioned representation exists.
 ## 3. Quality and promotion
 
 Contribution loss trains compactors, but it does not prove useful compaction.
-`sdkb.compaction_quality.assess_compaction` records a held-out raw/compact comparison:
+`schnitz.compaction_quality.assess_compaction` records a held-out raw/compact comparison:
 
 * raw-to-compact output KL;
 * argmax disagreement;

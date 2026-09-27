@@ -11,11 +11,11 @@ import torch
 from torch import nn
 
 from probe_routing_features import AddressProbe
-from sdkb.data import load_episodes
-from sdkb.operations import atomic_json
-from sdkb.training import autocast_context
-from sdkb.trajectories import file_sha256
-from sdkb.config import Config
+from schnitz.data import load_episodes
+from schnitz.operations import atomic_json
+from schnitz.training import autocast_context
+from schnitz.trajectories import file_sha256
+from schnitz.config import Config
 
 
 def evaluate(root, output):

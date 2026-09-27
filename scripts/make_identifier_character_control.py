@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 import re
 
-from sdkb.data import evidence_ids, load_episodes, save_episodes
-from sdkb.episode_index import EpisodeIndex
-from sdkb.trajectories import file_sha256
+from schnitz.data import evidence_ids, load_episodes, save_episodes
+from schnitz.episode_index import EpisodeIndex
+from schnitz.trajectories import file_sha256
 
 
 FULL_QUERY = 'What endpoint is specified by the selected earlier record? Return only the endpoint.'

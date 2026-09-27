@@ -1,6 +1,6 @@
 import sqlite3
 
-from sdkb.task_verifiers import (call_match, code_match, extract_block, knights_knaves_match,
+from schnitz.task_verifiers import (call_match, code_match, extract_block, knights_knaves_match,
                                  sql_match, value_match)
 
 

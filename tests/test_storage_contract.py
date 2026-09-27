@@ -1,7 +1,7 @@
 import torch
 
-from sdkb.storage_contract import KeySearchBackend, StoredReadBackend
-from sdkb.store import DiskStore, ReadPlan, Selection, StoredRecord, lookup_record
+from schnitz.storage_contract import KeySearchBackend, StoredReadBackend
+from schnitz.store import DiskStore, ReadPlan, Selection, StoredRecord, lookup_record
 
 
 class PublicReadProxy:

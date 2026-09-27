@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 import torch
 
-from .agent import SDKBAgent, answer_distribution_kl
+from .agent import SchnitzelAgent, answer_distribution_kl
 from .routing import cosine_scores, group_plan_loss
 from .training import autocast_context, environment_report, resource_report
 
@@ -15,7 +15,7 @@ def model_probe(config) -> dict:
     torch.manual_seed(config.train.seed)
     from .runtime import configure_memory
     configure_memory(config.train)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     if config.train.warmstart_memory_gate is not None:
         value = config.train.warmstart_memory_gate
         with torch.no_grad():

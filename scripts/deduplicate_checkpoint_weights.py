@@ -3,8 +3,8 @@ import argparse
 import json
 from pathlib import Path
 
-from sdkb.checkpoint_dedup import deduplicate_weights
-from sdkb.operations import atomic_json
+from schnitz.checkpoint_dedup import deduplicate_weights
+from schnitz.operations import atomic_json
 
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 """B2 of the BGKit restart: the frozen S2 decoder learns to generate BGKit spans.
 
 The decoder (with its S2 LoRA) is frozen. Trainable: the span marker, its
-continuous ratio code, the rep head and the emit/stop head (``sdkb.bgkit_span``).
+continuous ratio code, the rep head and the emit/stop head (``schnitz.bgkit_span``).
 Teacher-forced on the B1 cache: the writer sequence is
 
     chat(user: <write prompt> + passage) <|bg|>(rho) R_1 ... R_k
@@ -23,7 +23,7 @@ passage and KL to its own reading of the teacher reps.
 
 B3 options (all off by default, so the defaults are B2): ``--init-writer`` starts
 from a B2 ``writer.pt``; ``--adapter-rank`` adds the span-gated write adapter
-(``sdkb.bgkit_span.attach_write_adapter``: active only at span positions of a
+(``schnitz.bgkit_span.attach_write_adapter``: active only at span positions of a
 write, so reading and ordinary text stay S2); ``--rollout-passes``/``--sample-*``
 train on the writer's own reps (parallel passes, each feeding the previous
 pass's reps at a ramping fraction of span positions); ``--gate-open-start`` /
@@ -44,7 +44,7 @@ Evaluation on held-out bank sources at each space ratio and on BGKit's eval
 stores at x4/x16/x64: task NLL with no context, full text, teacher reps, student
 teacher-forced reps and student free-running reps (fed back, teacher length), the
 captured fraction of the full-text gain, and the free-running stop-length error. Training-only; runs in the
-``sdkb-bgkit`` container.
+``schnitz-bgkit`` container.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from sdkb.bgkit_span import (MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
+from schnitz.bgkit_span import (MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
                              attach_write_adapter, span_mask, span_targets)
 
 SPACES = ('s0', 's1', 's2', 's3')

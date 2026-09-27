@@ -17,7 +17,7 @@ import time
 import torch
 from safetensors.torch import load_model
 
-from .agent import SDKBAgent, answer_distribution_kl, answer_state_alignment
+from .agent import SchnitzelAgent, answer_distribution_kl, answer_state_alignment
 from .checkpoints import save_checkpoint, restore_checkpoint, resolve_checkpoint, stop_on_signal
 from .config import Config
 from .data import Episode, Source, counterfactual, make_episode, save_episodes, load_episodes, evidence_ids
@@ -111,7 +111,7 @@ def reset_resource_peaks(device: str | None = None):
         torch.cuda.reset_peak_memory_stats()
 
 
-def stored_channel(agent: SDKBAgent, outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+def stored_channel(agent: SchnitzelAgent, outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     dtype = getattr(torch, agent.config.memory.storage_dtype)
     # Cast is part of the captured forward. Cached and live payloads pass through
     # the same representational precision, then return to the resident compute dtype.
@@ -128,13 +128,13 @@ def payload_contrast_loss(base_loss: torch.Tensor, correct_nll: torch.Tensor,
     return base_loss + weight * contrast, contrast
 
 
-def persist_outputs(store: DiskStore, agent: SDKBAgent, source: Source,
+def persist_outputs(store: DiskStore, agent: SchnitzelAgent, source: Source,
                     outputs: tuple[torch.Tensor, ...], namespace: str, generation: str) -> None:
     for record in output_records(agent, source, outputs, namespace, generation):
         store.put(record)
 
 
-def output_records(agent: SDKBAgent, source: Source, outputs: tuple[torch.Tensor, ...],
+def output_records(agent: SchnitzelAgent, source: Source, outputs: tuple[torch.Tensor, ...],
                    namespace: str, generation: str):
     dtype = getattr(torch, agent.config.memory.storage_dtype)
     for space in range(len(agent.config.memory.payload_dims)):
@@ -143,7 +143,7 @@ def output_records(agent: SDKBAgent, source: Source, outputs: tuple[torch.Tensor
             generation=generation, created_at=source.created_at, source_id=source.record_id)
 
 
-def read_cached(store: DiskStore, agent: SDKBAgent, source: Source,
+def read_cached(store: DiskStore, agent: SchnitzelAgent, source: Source,
                 namespace: str, generation: str) -> tuple[torch.Tensor, ...]:
     outputs = []
     for space in range(len(agent.config.memory.payload_dims)):
@@ -260,7 +260,7 @@ def _train(config, output, *, resume, stop_after, init_from, stop_output, stop, 
     runtime_limits = configure_memory(config.train)
     reset_resource_peaks(config.train.device)
     rng = random.Random(config.train.seed)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     agent.train()
     if init_from is not None:
         source_checkpoint = resolve_checkpoint(init_from, verify=True)
@@ -763,7 +763,7 @@ def config_from_run(path: Path) -> Config:
 
 
 @torch.no_grad()
-def build_evaluation_store(agent: SDKBAgent, store: DiskStore,
+def build_evaluation_store(agent: SchnitzelAgent, store: DiskStore,
                            episodes: list[Episode], generation: str) -> None:
     if agent.training:
         raise ValueError("Freeze the writer in eval mode before building an evaluation bank")
@@ -780,7 +780,7 @@ def build_evaluation_store(agent: SDKBAgent, store: DiskStore,
 
 
 @torch.no_grad()
-def stored_evaluation(agent: SDKBAgent, store: DiskStore, episodes: list[Episode],
+def stored_evaluation(agent: SchnitzelAgent, store: DiskStore, episodes: list[Episode],
                       generation: str, *, generate: bool = False) -> dict:
     """Stored-only causal interventions. Full-sequence scoring; no writer calls."""
     from .evaluation import score_answers
@@ -858,7 +858,7 @@ def evaluate_run(run: str | Path, *, count: int | None = None, generate: bool = 
     from .runtime import configure_memory
     configure_memory(config.train)
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     load_model(agent, str(resolve_checkpoint(run) / "model.safetensors"), device=config.train.device)
     agent.eval()
     episodes = [make_episode(i, split=f"heldout-{config.train.seed}", distractors=config.train.distractors)
@@ -893,7 +893,7 @@ def evaluate_episode_file(run: str | Path, path: str | Path) -> dict:
         raise ValueError("Use evaluate-transfer, evaluate-teachers or evaluate-depths for native in-loop reads")
     episodes = load_episodes(path)
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device)
+    agent = SchnitzelAgent(config).to(config.train.device)
     load_model(agent, str(resolve_checkpoint(run) / "model.safetensors"), device=config.train.device)
     agent.eval()
     output = run / ("transfer-" + str(time.time_ns()))

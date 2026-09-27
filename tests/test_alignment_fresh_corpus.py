@@ -4,7 +4,7 @@ import runpy
 
 import pytest
 
-from sdkb.data import load_episodes, make_multiuse_world, save_episodes
+from schnitz.data import load_episodes, make_multiuse_world, save_episodes
 
 
 def test_fresh_alignment_corpus_excludes_sources_and_both_endpoint_versions(tmp_path):

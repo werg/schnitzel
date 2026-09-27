@@ -3,17 +3,17 @@ from dataclasses import asdict
 import json
 from safetensors.torch import load_file, load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import Episode, Source, save_episodes
-from sdkb.offline_bank import ensure_offline_shard, publish_offline_generation
-from sdkb.store import DiskStore, lookup_record
-from sdkb.training import output_records, stored_channel, train
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import Episode, Source, save_episodes
+from schnitz.offline_bank import ensure_offline_shard, publish_offline_generation
+from schnitz.store import DiskStore, lookup_record
+from schnitz.training import output_records, stored_channel, train
+from schnitz.trajectories import file_sha256
 
 
 def test_stored_corpus_forward_uses_only_prefix_and_frozen_payloads(tmp_path, tiny_config):
-    from sdkb.corpus_training import stored_corpus_forward, stored_corpus_forward_batch
+    from schnitz.corpus_training import stored_corpus_forward, stored_corpus_forward_batch
     tiny_config.model.tiny_layers = 3
     tiny_config.model.recurrence_mode = 'middle_block'
     tiny_config.model.recurrent_start = 1
@@ -28,7 +28,7 @@ def test_stored_corpus_forward_uses_only_prefix_and_frozen_payloads(tmp_path, ti
     tiny_config.train.routing_warmup = 0
     tiny_config.train.routing_weight = .1
     tiny_config.train.bank_routing_candidates = 3
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     store = DiskStore(tmp_path / 'bank.sqlite')
     sources = [Source(f's{i}', f'Passage {i}: the private marker is {i}x.', 1, 'passage')
                for i in range(3)]
@@ -136,7 +136,7 @@ def test_bank_training_warmstarts_exact_writer_and_resumes(tmp_path, tiny_config
     bank_dir = tmp_path / 'bank'
     bank_dir.mkdir()
     store = DiskStore(bank_dir / 'bank.sqlite')
-    agent = SDKBAgent(config).eval()
+    agent = SchnitzelAgent(config).eval()
     load_model(agent, str(checkpoint / 'model.safetensors'), device='cpu')
     identity = {'writer_checkpoint_sha256': file_sha256(checkpoint / 'model.safetensors'),
                 'model': asdict(config.model), 'memory': asdict(config.memory),

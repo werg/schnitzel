@@ -1,4 +1,4 @@
-"""Offline lexical address control; not the learned single-vector SDKB router."""
+"""Offline lexical address control; not the learned single-vector SCHNITZELJAGD router."""
 import argparse
 from collections import Counter, defaultdict
 import hashlib
@@ -9,8 +9,8 @@ import re
 import sqlite3
 from urllib.parse import quote
 
-from sdkb.data import load_episodes
-from sdkb.trajectories import file_sha256
+from schnitz.data import load_episodes
+from schnitz.trajectories import file_sha256
 
 
 def terms(text):
@@ -76,9 +76,9 @@ def support_metrics(episode, selected):
 
 
 def run(bank, corpus, reference, output):
-    from sdkb.archiving import ensure_free
-    from sdkb.checkpoints import _atomic_text
-    from sdkb.operations import run_lock, stop_requested
+    from schnitz.archiving import ensure_free
+    from schnitz.checkpoints import _atomic_text
+    from schnitz.operations import run_lock, stop_requested
     output.mkdir(parents=True, exist_ok=True)
     with run_lock(output, clear_stop=False):
         if stop_requested(output):

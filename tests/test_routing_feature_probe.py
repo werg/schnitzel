@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 
 import torch
-from sdkb.routing import group_plan_loss
+from schnitz.routing import group_plan_loss
 
 
 def test_feature_probe_pair_objective_and_gradient():

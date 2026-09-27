@@ -7,14 +7,14 @@ from contextlib import contextmanager
 import torch
 from torch import Tensor
 
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .replay import ReplayTape
 from .store import StoredRecord
 from .training_bank import TrainingBank
 
 
 class BankWriterReplay:
-    def __init__(self, agent: SDKBAgent, writer_inputs: Mapping[str, Tensor], *,
+    def __init__(self, agent: SchnitzelAgent, writer_inputs: Mapping[str, Tensor], *,
                  verify_outputs: bool = True, checkpoint_backward: bool = True,
                  capture_batch_size: int = 16) -> None:
         if capture_batch_size < 1:

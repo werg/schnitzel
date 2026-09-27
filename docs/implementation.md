@@ -49,7 +49,7 @@ recurrent boundaries in a deterministic order. Its microbatch size and in-flight
 limit are recorded in the run fingerprint.
 
 The implemented target run has two microbatches in flight. Live Spark sampling with
-the local resident-key/NVMe bank shows continuous SDKB GPU activity and low sustained
+the local resident-key/NVMe bank shows continuous SCHNITZELJAGD GPU activity and low sustained
 I/O wait, so this is adequate for the current regime. It is not evidence that remote
 or network-bank latency is hidden. The pipeline still has a same-wave join before
 combined writer capture, a bounded two-state queue, and a synchronous post-update
@@ -105,7 +105,7 @@ Operational details are in [development-v0.2.md](development-v0.2.md).
 
 ## Shared writer, query and decoder
 
-`SDKBAgent` uses a shared pretrained backbone (or the offline tiny model). A
+`SchnitzelAgent` uses a shared pretrained backbone (or the offline tiny model). A
 source is tokenized using the student tokenizer, followed by `write_slots + 1`
 learned input embeddings. The first resulting state produces the single canonical
 key; the remaining states produce a fixed sequence of canonical value vectors.
@@ -331,7 +331,7 @@ be pinned before training. Different runs can otherwise fetch different initial
 weights/tokenizers even though their YAML strings look identical.
 
 
-## SDKB 0.3 trajectory implementation
+## SCHNITZELJAGD 0.3 trajectory implementation
 
 Current operations: [training](training.md), [datasets](datasets.md), [Spark](spark.md).
 `launch.py` pins/prepares inputs, verifies the backbone, and runs independent resumable
@@ -339,7 +339,7 @@ stages and evaluations. `trajectories.py` provides explicit upstream adapters an
 causal source/target construction. `episode_index.py` validates identities/hashes
 while keeping byte offsets rather than all episode text. `trajectory_eval.py` separates
 source materialization from writer-free stored reads and scores full target likelihood.
-The command/package is `sdkb` and the model class is `SDKBAgent`.
+The command/package is `schnitz` and the model class is `SchnitzelAgent`.
 
 Real-data supports are marked provided context, not verified sufficient groups. Loss
 is recorded-assistant imitation, not environment reward or unavailable teacher logits.

@@ -1,9 +1,10 @@
 # Project name: SCHNITZELJAGD
 
-**Status, 23 September 2026:** chosen name, rename not yet carried out. The code,
-package, CLI and docs still use `sdkb` / `SDKBAgent`.
+**Status, 27 September 2026:** repository renamed; package, CLI, imports, agent class and
+active documentation now use `schnitz` / `SchnitzelAgent`. Legacy `sdkb` import and CLI
+aliases remain for compatibility with existing training processes and checkpoints.
 
-The project will be renamed from SDKB (Spatially Superposed Differentiable Knowledge
+The project is renamed from SDKB (Spatially Superposed Differentiable Knowledge
 Base) to **SCHNITZELJAGD**:
 
 > **S**tigmergic **C**ompactable **H**olographic **N**eural **I**ndexed

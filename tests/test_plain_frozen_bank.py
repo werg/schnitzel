@@ -7,10 +7,10 @@ import runpy
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode, save_episodes
-from sdkb.operations import request_stop
-from sdkb.store import DiskStore
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode, save_episodes
+from schnitz.operations import request_stop
+from schnitz.store import DiskStore
 
 
 def fixture(tmp_path, tiny_config, monkeypatch):
@@ -21,7 +21,7 @@ def fixture(tmp_path, tiny_config, monkeypatch):
     (checkpoint/'manifest.json').write_text('{}')
     data = tmp_path/'episodes.jsonl'
     save_episodes(data, [make_episode(0)])
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     variables = inspect.unwrap(build).__globals__
     monkeypatch.setitem(variables, 'resolve_checkpoint', lambda *a, **kw: checkpoint)
     monkeypatch.setitem(variables, 'config_from_run', lambda *a: tiny_config)

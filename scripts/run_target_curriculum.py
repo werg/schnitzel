@@ -10,11 +10,11 @@ import sys
 
 import yaml
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.config import load_config
-from sdkb.operations import atomic_json
-from sdkb.training import train
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.config import load_config
+from schnitz.operations import atomic_json
+from schnitz.training import train
+from schnitz.trajectories import file_sha256
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:

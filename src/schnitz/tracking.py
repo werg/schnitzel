@@ -31,7 +31,7 @@ class Tracking:
             try:
                 import wandb
             except ImportError as exc:
-                raise RuntimeError('W&B requested: install sdkb[tracking] or disable wandb_mode') from exc
+                raise RuntimeError('W&B requested: install schnitz[tracking] or disable wandb_mode') from exc
             directory = self.output / 'tracking'
             directory.mkdir(exist_ok=True)
             self.run = wandb.init(project=t.wandb_project, entity=t.wandb_entity,

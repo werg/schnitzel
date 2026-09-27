@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from sdkb.comparison import compare_transfer_results, compare_generation_results
+from schnitz.comparison import compare_transfer_results, compare_generation_results
 
 
 if __name__ == '__main__':

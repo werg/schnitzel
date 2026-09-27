@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from sdkb.key_geometry import (RetrievalLoad, effective_rank, geometry_summary, koleo_loss,
+from schnitz.key_geometry import (RetrievalLoad, effective_rank, geometry_summary, koleo_loss,
                                mean_direction_cosine, occurrence_statistics, uniformity,
                                variance_covariance_loss)
 
@@ -83,7 +83,7 @@ def test_retrieval_load_penalizes_only_hubs_and_explores_cold_records():
 
 
 def test_bank_load_uses_step_snapshots_and_restores_by_bank_identity():
-    from sdkb.key_geometry import BankLoad
+    from schnitz.key_geometry import BankLoad
     load = BankLoad(['a', 'b', 'c', 'd'], spaces=2, decay=0.5, threshold=1.5)
     load.begin_step()
     load.record(0, ['a', 'a', 'b'])
@@ -107,7 +107,7 @@ def test_bank_load_uses_step_snapshots_and_restores_by_bank_identity():
 
 
 def test_read_selection_forces_gold_into_the_tail_and_keeps_size():
-    from sdkb.spatial_training import _read_selection, _site_uniform
+    from schnitz.spatial_training import _read_selection, _site_uniform
     found = ('x1', 'g1', 'x2', 'x3', 'x4')
     chosen, missing = _read_selection(found, ('g1', 'g2'), (), 4, True)
     assert missing == ('g2',) and chosen == ('g1', 'g2', 'x1', 'x2')
@@ -126,7 +126,7 @@ def test_read_selection_forces_gold_into_the_tail_and_keeps_size():
 
 
 def test_gate_additive_floor_keeps_gradient_and_density_scales_with_reads():
-    from sdkb.routing import AdaptiveDistanceGate
+    from schnitz.routing import AdaptiveDistanceGate
     torch.manual_seed(0)
     query = torch.randn(1, 8)
     candidates = torch.linspace(0.9, -0.5, 64)[None]

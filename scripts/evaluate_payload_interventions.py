@@ -14,12 +14,12 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import evidence_ids, load_episodes
-from sdkb.operations import atomic_json
-from sdkb.training import autocast_context, config_from_run, stored_channel
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import evidence_ids, load_episodes
+from schnitz.operations import atomic_json
+from schnitz.training import autocast_context, config_from_run, stored_channel
+from schnitz.trajectories import file_sha256
 
 
 def evaluate(run: Path, episodes_file: Path, output: Path, *, count: int = 128) -> dict:
@@ -27,7 +27,7 @@ def evaluate(run: Path, episodes_file: Path, output: Path, *, count: int = 128) 
         raise ValueError('Intervention output must be fresh')
     checkpoint = resolve_checkpoint(run, verify=True)
     config = config_from_run(run)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     episodes = load_episodes(episodes_file)[:count]
     if len(episodes) < 2:

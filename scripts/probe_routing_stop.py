@@ -14,15 +14,15 @@ from torch import nn
 from torch.nn import functional as F
 
 from probe_routing_features import AddressProbe, pair_loss
-from sdkb.data import load_episodes
-from sdkb.operations import atomic_json, control_dir, run_lock, stop_requested
-from sdkb.optimizers import MuonAdamW, optimizer_report
-from sdkb.runtime import compute_watchdog, available_host_memory, configure_memory, memory_metrics
-from sdkb.tracking import Tracking
-from sdkb.training import autocast_context, config_from_run
-from sdkb.probe_state import restore_probe_state, save_probe_state
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.trajectories import file_sha256
+from schnitz.data import load_episodes
+from schnitz.operations import atomic_json, control_dir, run_lock, stop_requested
+from schnitz.optimizers import MuonAdamW, optimizer_report
+from schnitz.runtime import compute_watchdog, available_host_memory, configure_memory, memory_metrics
+from schnitz.tracking import Tracking
+from schnitz.training import autocast_context, config_from_run
+from schnitz.probe_state import restore_probe_state, save_probe_state
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.trajectories import file_sha256
 
 
 def stop_pair_loss(scores, stop, required, lengths):

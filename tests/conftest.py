@@ -10,7 +10,7 @@ def deterministic_cpu():
 
 @pytest.fixture
 def tiny_config():
-    from sdkb.config import Config, ModelConfig, MemoryConfig, TrainConfig
+    from schnitz.config import Config, ModelConfig, MemoryConfig, TrainConfig
     return Config(
         ModelConfig(backend="tiny", tiny_width=32, tiny_layers=1, tiny_heads=4,
                     gradient_checkpointing=False),

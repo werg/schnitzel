@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from sdkb.trajectory_memory import (
+from schnitz.trajectory_memory import (
     search_call,
     search_result,
     validate_memory_transcript,

@@ -8,18 +8,18 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.evaluation import stored_transfer_evaluation
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import (assert_bank_reader_compatible, canonical_json,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.evaluation import stored_transfer_evaluation
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import (assert_bank_reader_compatible, canonical_json,
                                publish_offline_generation)
-from sdkb.operations import atomic_json
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore, ReadPlan, Selection
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore, ReadPlan, Selection
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def supplied_mixed_plans(agent, searcher, episodes, *, namespace: str,
@@ -139,7 +139,7 @@ def evaluate(run: Path, bank_dir: Path, episodes_file: Path, output: Path, *,
     config.memory.neighbors = list(limits)
     config.validate()
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     def forbidden_writer(*_args, **_kwargs):
         raise AssertionError('Published-bank evaluation must not re-encode a source')

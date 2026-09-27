@@ -6,10 +6,10 @@ import json
 import torch
 from safetensors.torch import load_file
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.operations import request_stop
-from sdkb.replay import ReplayTape
-from sdkb.training import train, config_from_run
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.operations import request_stop
+from schnitz.replay import ReplayTape
+from schnitz.training import train, config_from_run
 
 
 def equal_state(a, b):

@@ -6,16 +6,16 @@ import re
 
 import torch
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.cluster_store import ClusterBank, state_fingerprint
-from sdkb.data import load_episodes
-from sdkb.evaluation_adapter import load_frozen_agent
-from sdkb.frozen_scoring import FrozenScorer
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.cluster_store import ClusterBank, state_fingerprint
+from schnitz.data import load_episodes
+from schnitz.evaluation_adapter import load_frozen_agent
+from schnitz.frozen_scoring import FrozenScorer
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 @torch.no_grad()

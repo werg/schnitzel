@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-image="${SDKB_IMAGE:-sdkb-spark:0.4}"
-configured_cache="${SDKB_CACHE_DIR:-}"
+image="${SCHNITZELJAGD_IMAGE:-${SDKB_IMAGE:-schnitz-spark:0.4}}"
+configured_cache="${SCHNITZELJAGD_CACHE_DIR:-${SDKB_CACHE_DIR:-}}"
 if [[ -z "$configured_cache" && -f "$root/.sdkb/cache-dir" ]]; then
   IFS= read -r configured_cache < "$root/.sdkb/cache-dir" || true
-  [[ -n "$configured_cache" ]] || { echo 'Empty .sdkb/cache-dir storage setting.' >&2; exit 1; }
+elif [[ -z "$configured_cache" && -f "$root/.schnitz/cache-dir" ]]; then
+  IFS= read -r configured_cache < "$root/.schnitz/cache-dir" || true
+  [[ -n "$configured_cache" ]] || { echo 'Empty .schnitz/cache-dir storage setting.' >&2; exit 1; }
 fi
-cache="${configured_cache:-$HOME/.cache/sdkb}"
-configured_runs="${SDKB_RUNS_DIR:-}"
+cache="${configured_cache:-$HOME/.cache/schnitz}"
+if [[ -z "$configured_cache" && ! -d "$cache" && -d "$HOME/.cache/sdkb" ]]; then cache="$HOME/.cache/sdkb"; fi
+configured_runs="${SCHNITZELJAGD_RUNS_DIR:-${SDKB_RUNS_DIR:-}}"
 if [[ -z "$configured_runs" && -f "$root/.sdkb/runs-dir" ]]; then
   IFS= read -r configured_runs < "$root/.sdkb/runs-dir" || true
-  [[ -n "$configured_runs" ]] || { echo 'Empty .sdkb/runs-dir storage setting.' >&2; exit 1; }
+elif [[ -z "$configured_runs" && -f "$root/.schnitz/runs-dir" ]]; then
+  IFS= read -r configured_runs < "$root/.schnitz/runs-dir" || true
+  [[ -n "$configured_runs" ]] || { echo 'Empty .schnitz/runs-dir storage setting.' >&2; exit 1; }
 fi
 runs="${configured_runs:-$root/runs}"
-archive="${SDKB_ARCHIVE_DIR:-}"
+archive="${SCHNITZELJAGD_ARCHIVE_DIR:-${SDKB_ARCHIVE_DIR:-}}"
 if [[ -z "$archive" && -f "$root/.sdkb/archive-dir" ]]; then
   IFS= read -r archive < "$root/.sdkb/archive-dir" || true
-  [[ -n "$archive" ]] || { echo 'Empty .sdkb/archive-dir storage setting.' >&2; exit 1; }
+elif [[ -z "$archive" && -f "$root/.schnitz/archive-dir" ]]; then
+  IFS= read -r archive < "$root/.schnitz/archive-dir" || true
+  [[ -n "$archive" ]] || { echo 'Empty .schnitz/archive-dir storage setting.' >&2; exit 1; }
 fi
-container="${SDKB_CONTAINER:-sdkb-training}"
+container="${SCHNITZELJAGD_CONTAINER:-${SDKB_CONTAINER:-schnitz-training}}"
 command="${1:-shell}"
 shift || true
 case "$command" in
@@ -27,14 +34,14 @@ case "$command" in
     [[ "$(uname -m)" == aarch64 || "$(uname -m)" == arm64 ]] || {
       echo 'Build natively on Spark/ARM64, not under x86 emulation.' >&2; exit 1;
     }
-    base="${SDKB_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}"
+    base="${SCHNITZELJAGD_BASE_IMAGE:-${SDKB_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}}"
     docker pull --platform linux/arm64 "$base"
     [[ "$(docker image inspect --format '{{.Architecture}}' "$base")" == arm64 ]] || {
       echo 'Base image is not ARM64.' >&2; exit 1;
     }
     pinned="$(docker image inspect --format '{{index .RepoDigests 0}}' "$base")"
-    mkdir -p "$root/.sdkb"
-    printf '%s\n' "$pinned" >"$root/.sdkb/base-image.txt"
+    mkdir -p "$root/.schnitz"
+    printf '%s\n' "$pinned" >"$root/.schnitz/base-image.txt"
     exec docker build --platform linux/arm64 -f "$root/docker/Dockerfile.spark" \
       --build-arg "BASE_IMAGE=$pinned" -t "$image" "$root"
     ;;
@@ -52,7 +59,7 @@ case "$command" in
       mkdir -p "$cache"
     fi
     mkdir -p "$cache"/{tmp,xdg,triton,cuda,torchinductor,torch,wandb}
-    if [[ "$command" == start || ( "${1:-}" == sdkb && ( "${2:-}" == launch || "${2:-}" == train || ( "${2:-}" == runs && "${3:-}" == start ) ) ) ]]; then
+    if [[ "$command" == start || ( ( "${1:-}" == schnitz || "${1:-}" == sdkb ) && ( "${2:-}" == launch || "${2:-}" == train || ( "${2:-}" == runs && "${3:-}" == start ) ) ) ]]; then
       previous=""
       for argument in "$@"; do
         if [[ "$previous" == --output || "$argument" == --output=* ]]; then
@@ -72,9 +79,9 @@ case "$command" in
       --env XDG_CACHE_HOME=/cache/xdg --env TRITON_CACHE_DIR=/cache/triton \
       --env CUDA_CACHE_PATH=/cache/cuda --env TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
       --env TORCH_HOME=/cache/torch --env WANDB_CACHE_DIR=/cache/wandb --env TMPDIR=/cache/tmp \
-      --mount "type=bind,src=$root,dst=/workspace/sdkb" \
+      --mount "type=bind,src=$root,dst=/workspace/schnitz" \
       --mount "type=bind,src=$cache,dst=/cache" \
-      --mount "type=bind,src=$runs,dst=/runs" --workdir /workspace/sdkb)
+      --mount "type=bind,src=$runs,dst=/runs" --workdir /workspace/schnitz)
     if [[ -n "$archive" ]]; then
       [[ -d "$archive" ]] || { echo 'Archive directory must exist on the mounted disk.' >&2; exit 1; }
       flags+=(--mount "type=bind,src=$archive,dst=/archive")
@@ -87,8 +94,8 @@ case "$command" in
     [[ -z "${WANDB_API_KEY:-}" ]] || flags+=(--env WANDB_API_KEY)
     [[ -z "${WANDB_BASE_URL:-}" ]] || flags+=(--env WANDB_BASE_URL)
     if [[ "$command" == start ]]; then
-      [[ $# -gt 0 ]] || { echo 'Supply sdkb launch arguments after start.' >&2; exit 2; }
-      exec docker run --detach --name "$container" "${flags[@]}" "$image" sdkb launch "$@"
+      [[ $# -gt 0 ]] || { echo 'Supply schnitz launch arguments after start.' >&2; exit 2; }
+      exec docker run --detach --name "$container" "${flags[@]}" "$image" schnitz launch "$@"
     fi
     flags+=(--rm)
     if [[ "$command" == shell ]]; then
@@ -99,6 +106,6 @@ case "$command" in
     ;;
   status) exec docker inspect --format '{{.State.Status}} exit={{.State.ExitCode}}' "$container" ;;
   logs) exec docker logs --follow "$container" ;;
-  stop) exec docker stop --time "${SDKB_STOP_TIMEOUT:-600}" "$container" ;;
+  stop) exec docker stop --time "${SCHNITZELJAGD_STOP_TIMEOUT:-${SDKB_STOP_TIMEOUT:-600}}" "$container" ;;
   *) echo 'Usage: scripts/spark.sh build|shell|run COMMAND...|start LAUNCH_ARGS...|status|logs|stop' >&2; exit 2 ;;
 esac

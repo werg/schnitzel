@@ -3,9 +3,9 @@ import torch
 
 
 def test_frozen_cache_requires_exact_inputs_and_does_not_mutate_scores(tiny_config, monkeypatch):
-    from sdkb.agent import SDKBAgent
-    from sdkb.frozen_scoring import FrozenScorer
-    agent = SDKBAgent(tiny_config).eval().requires_grad_(False)
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.frozen_scoring import FrozenScorer
+    agent = SchnitzelAgent(tiny_config).eval().requires_grad_(False)
     cache = FrozenScorer(agent)
     prompt = agent.prompt_ids('Question')
     calls = []
@@ -48,16 +48,16 @@ def test_frozen_cache_requires_exact_inputs_and_does_not_mutate_scores(tiny_conf
 
 
 def test_frozen_cache_observes_every_recurrent_event_and_precision(tiny_config):
-    from sdkb.agent import SDKBAgent
-    from sdkb.frozen_scoring import FrozenScorer
-    from sdkb.recurrence import LoopMemory
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.frozen_scoring import FrozenScorer
+    from schnitz.recurrence import LoopMemory
     c = tiny_config
     c.model.tiny_layers = 4
     c.model.recurrence_mode = 'middle_block'
     c.model.recurrent_start, c.model.recurrent_end = 1, 3
     c.model.loops = 3
     c.memory.read_timing = 'loop_boundary'
-    agent = SDKBAgent(c).eval().requires_grad_(False)
+    agent = SchnitzelAgent(c).eval().requires_grad_(False)
     cache = FrozenScorer(agent)
     prompt = agent.prompt_ids('Question')
     first, second = torch.randn(1, 2, 32), torch.randn(1, 2, 32)

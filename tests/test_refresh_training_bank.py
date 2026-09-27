@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from sdkb.bank_coherence import verify_refresh_coverage
+from schnitz.bank_coherence import verify_refresh_coverage
 
 
 def test_refresh_coverage_requires_new_heads_for_every_space(tmp_path):

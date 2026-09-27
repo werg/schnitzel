@@ -8,9 +8,9 @@ import random
 import runpy
 import shutil
 
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.episode_index import EpisodeIndex
-from sdkb.trajectories import file_sha256
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.episode_index import EpisodeIndex
+from schnitz.trajectories import file_sha256
 
 
 def build(worlds, split):

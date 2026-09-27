@@ -11,8 +11,8 @@ import shlex
 
 import yaml
 
-from sdkb.config import load_config
-from sdkb.data import make_multiuse_world, save_episodes
+from schnitz.config import load_config
+from schnitz.data import make_multiuse_world, save_episodes
 
 
 def prepare(config_path, output, *, steps=200, worlds=64, eval_worlds=32, bindings=2, seeds=(17,)):
@@ -49,8 +49,8 @@ def prepare(config_path, output, *, steps=200, worlds=64, eval_worlds=32, bindin
             name = f'{arm}-seed{seed}'
             path, run = output / f'{name}.yaml', output / name
             path.write_text(yaml.safe_dump(asdict(config), sort_keys=False))
-            train = ['sdkb','train','--config',str(path),'--output',str(run)]
-            evaluate = ['sdkb','evaluate-transfer','--run',str(run),'--episodes',str(test_path)]
+            train = ['schnitz','train','--config',str(path),'--output',str(run)]
+            evaluate = ['schnitz','evaluate-transfer','--run',str(run),'--episodes',str(test_path)]
             commands.extend([f'echo {shlex.quote(name)}',
                              f'if [[ -f {shlex.quote(str(run / "CURRENT"))} ]]; then',
                              '  ' + shlex.join(train + ['--resume']), 'else',

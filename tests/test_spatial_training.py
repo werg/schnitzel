@@ -4,15 +4,15 @@ import threading
 
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_replay import BankWriterReplay
-from sdkb.data import make_episode
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.routing_curriculum import RoutingCandidateIndex
-from sdkb.spatial_data import pack_spatial_trajectory
-from sdkb.spatial_training import spatial_bank_forward, spatial_bank_pipeline_forward
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training_bank import TrainingBank
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_replay import BankWriterReplay
+from schnitz.data import make_episode
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.routing_curriculum import RoutingCandidateIndex
+from schnitz.spatial_data import pack_spatial_trajectory
+from schnitz.spatial_training import spatial_bank_forward, spatial_bank_pipeline_forward
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training_bank import TrainingBank
 
 
 class StableChatTokenizer:
@@ -37,7 +37,7 @@ def test_spatial_bank_forward_reads_all_sites_without_writer(tiny_config, tmp_pa
     tiny_config.memory.read_timing = "loop_boundary"
     tiny_config.memory.neighbors = [3]
     tiny_config.train.routing_weight = .1
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episodes = [make_episode(index, distractors=0) for index in range(2)]
     row = pack_spatial_trajectory(StableChatTokenizer(), episodes, read_slots=2,
                                   generation="g1", levels=(1, 1))
@@ -79,7 +79,7 @@ def test_routing_curriculum_keeps_reader_selection_and_trains_address(tiny_confi
     tiny_config.model.recurrent_end = 1
     tiny_config.memory.read_timing = 'loop_boundary'
     tiny_config.memory.neighbors = [2]
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episodes = [make_episode(index, distractors=0) for index in range(2)]
     row = pack_spatial_trajectory(StableChatTokenizer(), episodes, read_slots=2,
                                   generation='g1', levels=(1, 1))
@@ -129,7 +129,7 @@ def test_stored_routing_is_stable_when_live_writer_keys_drift(tiny_config, tmp_p
     tiny_config.memory.neighbors = [2]
     tiny_config.train.key_stability_weight = .2
     tiny_config.train.writer_replay_records_per_site = 2
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episode = make_episode(0, distractors=0)
     row = pack_spatial_trajectory(StableChatTokenizer(), [episode],
                                   read_slots=2, generation='g1')
@@ -204,7 +204,7 @@ def test_spatial_forward_projects_only_supervised_positions(tiny_config, tmp_pat
     tiny_config.model.recurrent_start = 0
     tiny_config.model.recurrent_end = 1
     tiny_config.memory.read_timing = "loop_boundary"
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episode = make_episode(0, distractors=0)
     row = pack_spatial_trajectory(StableChatTokenizer(), [episode], read_slots=2,
                                   generation="g1")
@@ -236,7 +236,7 @@ def test_integrated_write_states_depend_on_earlier_read_results(tiny_config, tmp
     tiny_config.model.recurrent_start = 0
     tiny_config.model.recurrent_end = 1
     tiny_config.memory.read_timing = 'loop_boundary'
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episode = make_episode(0, distractors=0)
     row = pack_spatial_trajectory(
         StableChatTokenizer(), [episode], read_slots=2, generation='g1',
@@ -273,7 +273,7 @@ def test_spatial_distance_gates_use_density_and_receive_task_gradients(tiny_conf
     tiny_config.memory.distance_gating = True
     tiny_config.memory.gate_density_k = 2
     tiny_config.train.support_gate_floor = .1
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episode = make_episode(0, distractors=1)
     row = pack_spatial_trajectory(StableChatTokenizer(), [episode], read_slots=2,
                                   generation='g1')
@@ -303,7 +303,7 @@ def test_inflight_microbatches_match_reference_gradients_and_overlap_reads(
     tiny_config.memory.read_timing = "loop_boundary"
     tiny_config.memory.neighbors = [4]
     tiny_config.train.routing_weight = .1
-    reference = SDKBAgent(tiny_config)
+    reference = SchnitzelAgent(tiny_config)
     pipelined = copy.deepcopy(reference)
     episodes = [make_episode(index, distractors=0) for index in range(2)]
     rows = [pack_spatial_trajectory(
@@ -364,7 +364,7 @@ def test_spatial_pipeline_replays_selected_writer_keys_and_payloads(
     tiny_config.memory.neighbors = [2]
     tiny_config.memory.distance_gating = True
     tiny_config.train.writer_replay_records_per_site = 2
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episodes = [make_episode(index, distractors=0) for index in range(2)]
     rows = [pack_spatial_trajectory(
         StableChatTokenizer(), [episode], read_slots=2, generation='g1')
@@ -397,7 +397,7 @@ def test_spatial_pipeline_replays_selected_writer_keys_and_payloads(
 
 
 def test_pipeline_forced_gold_exploration_and_spreading_terms(tiny_config, tmp_path):
-    from sdkb.key_geometry import BankLoad
+    from schnitz.key_geometry import BankLoad
     tiny_config.model.loops = 2
     tiny_config.model.recurrence_mode = 'middle_block'
     tiny_config.model.recurrent_start = 0
@@ -407,7 +407,7 @@ def test_pipeline_forced_gold_exploration_and_spreading_terms(tiny_config, tmp_p
     tiny_config.memory.distance_gating = True
     tiny_config.train.writer_replay_records_per_site = 3
     tiny_config.train.routing_live_weight = 1.0
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     episodes = [make_episode(index, distractors=3) for index in range(3)]
     rows = [pack_spatial_trajectory(
         StableChatTokenizer(), [episode], read_slots=2, generation='g1')

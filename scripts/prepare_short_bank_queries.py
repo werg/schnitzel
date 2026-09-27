@@ -11,8 +11,8 @@ import re
 import shutil
 import uuid
 
-from sdkb.data import episode_from_dict
-from sdkb.trajectories import file_sha256
+from schnitz.data import episode_from_dict
+from schnitz.trajectories import file_sha256
 
 
 def located_span(row: dict, *, locator_words: int = 6, span_words: int = 8):

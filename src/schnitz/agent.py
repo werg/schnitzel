@@ -63,7 +63,7 @@ class SpatialExecution:
     batch: int
 
 
-class SDKBAgent(nn.Module):
+class SchnitzelAgent(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.config = config
@@ -1002,3 +1002,6 @@ class SDKBAgent(nn.Module):
                 break
             generated.append(next_id)
         return self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+
+# Keep historical checkpoints and external training scripts source compatible.
+SDKBAgent = SchnitzelAgent

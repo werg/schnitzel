@@ -5,20 +5,20 @@ import numpy as np
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.keyspace_distillation import (LexicalField, convert_to_direct, field_kl,
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.keyspace_distillation import (LexicalField, convert_to_direct, field_kl,
                                         lexical_field_loss, recall_summary,
                                         source_disjoint_split, support_ranks,
                                         union_field_loss)
-from sdkb.keyspace_views import causal_prefix_text, query_view, source_view
-from sdkb.offline_bank import stored_memory_identity
-from sdkb.routing_curriculum import RoutingCandidateIndex
-from sdkb.spatial_data import pack_spatial_trajectory
-from sdkb.spatial_training import spatial_bank_forward
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.teacher_encoders import pool
+from schnitz.keyspace_views import causal_prefix_text, query_view, source_view
+from schnitz.offline_bank import stored_memory_identity
+from schnitz.routing_curriculum import RoutingCandidateIndex
+from schnitz.spatial_data import pack_spatial_trajectory
+from schnitz.spatial_training import spatial_bank_forward
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.teacher_encoders import pool
 
 
 class StableChatTokenizer:
@@ -48,10 +48,10 @@ def _spatial(config):
 
 
 def _pair(config):
-    shared = SDKBAgent(config)
+    shared = SchnitzelAgent(config)
     direct_config = copy.deepcopy(config)
     direct_config.memory.key_interface = 'direct'
-    direct = SDKBAgent(direct_config)
+    direct = SchnitzelAgent(direct_config)
     direct.load_state_dict(convert_to_direct(shared.state_dict(), 2), strict=True)
     return shared, direct
 
@@ -182,7 +182,7 @@ def test_last_token_pooling_handles_left_and_right_padding():
 
 
 def test_standardized_head_is_exact_at_init_and_folds_back():
-    from sdkb.keyspace_distillation import StandardizedHead
+    from schnitz.keyspace_distillation import StandardizedHead
     states = torch.randn(20, 8) * .1 + 5.0  # nearly collinear, like writer key slots
     weight, bias = torch.randn(3, 8), torch.zeros(3)
     head = StandardizedHead(weight, bias, states.mean(0), states.std(0))
@@ -212,7 +212,7 @@ def test_key_slot_last_isolates_payloads_from_key_training(tiny_config):
     config.memory.key_dims = [16, 8]
     config.memory.distance_gating = True
     config.validate()
-    agent = SDKBAgent(config).eval()
+    agent = SchnitzelAgent(config).eval()
     ids = [torch.tensor([[1, 2, 3, 4]]), torch.tensor([[5, 6]])]
     with torch.no_grad():
         before = agent.produce_batch(ids)
@@ -237,11 +237,11 @@ def test_key_widths_require_direct_heads(tiny_config):
 def test_widened_direct_conversion_keeps_folded_rows(tiny_config):
     config = _spatial(tiny_config)
     config.memory.distance_gating = True
-    shared = SDKBAgent(config)
+    shared = SchnitzelAgent(config)
     direct_config = copy.deepcopy(config)
     direct_config.memory.key_interface = 'direct'
     direct_config.memory.key_dims = [20, 16]
-    direct = SDKBAgent(direct_config)
+    direct = SchnitzelAgent(direct_config)
     state = convert_to_direct(shared.state_dict(), 2, (20, 16), seed=3)
     direct.load_state_dict(state, strict=True)
     folded = convert_to_direct(shared.state_dict(), 2)

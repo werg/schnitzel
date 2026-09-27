@@ -11,14 +11,14 @@ import json
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.evaluation_adapter import load_frozen_agent, attach_read_count_policy
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes, evidence_ids
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.evaluation_adapter import load_frozen_agent, attach_read_count_policy
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes, evidence_ids
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 @torch.no_grad()
@@ -45,7 +45,7 @@ def evaluate(run, bank, episodes_path, worlds, max_new_tokens, *, learned_world=
     else:
         if independent_routing_query:
             raise ValueError('Supply a routing probe for the independent query override')
-        agent = SDKBAgent(config).to(config.train.device).eval()
+        agent = SchnitzelAgent(config).to(config.train.device).eval()
         load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     count_policy = (attach_read_count_policy(agent, checkpoint, read_count_policy)
                     if read_count_policy is not None else None)

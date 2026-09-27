@@ -8,7 +8,7 @@ from pathlib import Path
 from safetensors.torch import load_model
 import torch
 
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .runtime import configure_memory
 from .trajectories import file_sha256
 
@@ -31,7 +31,7 @@ def load_frozen_agent(config, checkpoint, *, routing_probe=None, independent_rou
         config.memory.independent_routing_query = independent_routing_query
     elif independent_routing_query:
         raise ValueError('Supply a routing probe for this evaluation override')
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     missing, unexpected = load_model(agent, str(checkpoint / 'model.safetensors'), strict=False,
                                      device=config.train.device)
     expected = {'routing_query_head.weight'} if state is not None and independent_routing_query else set()

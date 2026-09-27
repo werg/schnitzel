@@ -7,7 +7,7 @@ value lists and table contents (Spider, BIRD) and BIRD's evidence notes,
 worked examples and rules (Knights and Knaves). An episode keeps the R6 schema
 (``query``, ``answer``, ``required_ids``, ``sufficient_groups``, ``supports``,
 ``provenance``) with a long teacher ``answer`` (calls, SQL, reasoning) and a
-``verify`` spec for ``sdkb.task_verifiers``. ``required_ids`` are the records the
+``verify`` spec for ``schnitz.task_verifiers``. ``required_ids`` are the records the
 answer depends on; ``supports`` add the causally available related records.
 
 Records are created before every query (``created_at`` 1, queries at 2); none is
@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from public_corpus_common import Writer, clean, record_id  # noqa: E402
 
-from sdkb.task_verifiers import run_sql  # noqa: E402
+from schnitz.task_verifiers import run_sql  # noqa: E402
 
 RAW = Path('/archive/raw')
 RECORD_CHARS = 1500

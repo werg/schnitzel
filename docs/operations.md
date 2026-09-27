@@ -10,18 +10,18 @@ runtime merely to use the optional logging extra.
 Foreground execution works with a terminal, a scheduler, or a container:
 
 ```bash
-sdkb launch --recipe recipes/looped_causal.yaml --output /fast/sdkb-runs/causal
+schnitz launch --recipe recipes/looped_causal.yaml --output /fast/schnitz-runs/causal
 # Resume the identical recipe and output:
-sdkb launch --recipe recipes/looped_causal.yaml --output /fast/sdkb-runs/causal --resume
+schnitz launch --recipe recipes/looped_causal.yaml --output /fast/schnitz-runs/causal --resume
 ```
 
 For a local detached process, use the same Python environment that will train:
 
 ```bash
-sdkb runs start --recipe recipes/looped_causal.yaml --output /fast/sdkb-runs/causal
-sdkb runs status --output /fast/sdkb-runs/causal
-sdkb runs stop --output /fast/sdkb-runs/causal
-sdkb runs start --recipe recipes/looped_causal.yaml --output /fast/sdkb-runs/causal --resume
+schnitz runs start --recipe recipes/looped_causal.yaml --output /fast/schnitz-runs/causal
+schnitz runs status --output /fast/schnitz-runs/causal
+schnitz runs stop --output /fast/schnitz-runs/causal
+schnitz runs start --recipe recipes/looped_causal.yaml --output /fast/schnitz-runs/causal --resume
 ```
 
 Status, cooperative stop, archive/restore and checkpoint relocation inspect metadata
@@ -30,8 +30,8 @@ checkout, a host with Python and PyYAML can inspect container runs through their
 shared host paths:
 
 ```bash
-PYTHONPATH=src python3 -m sdkb runs status --output /mnt/external/sdkb-archive/runs/STUDY/STAGE
-PYTHONPATH=src python3 -m sdkb runs stop --output /mnt/external/sdkb-archive/runs/STUDY/STAGE
+PYTHONPATH=src python3 -m schnitz runs status --output /mnt/external/schnitz-archive/runs/STUDY/STAGE
+PYTHONPATH=src python3 -m schnitz runs stop --output /mnt/external/schnitz-archive/runs/STUDY/STAGE
 ```
 
 Training and model save/load still require the native ML environment. For jobs
@@ -76,14 +76,14 @@ spawn a stage. The stage itself preserves any stop written during model, index, 
 checkpoint initialization, so a startup-time request cannot be cleared when the run
 lock is acquired later.
 
-Inside Docker, run `sdkb launch` in the foreground and let Docker own process
+Inside Docker, run `schnitz launch` in the foreground and let Docker own process
 lifetime; do not detach a child inside an ephemeral `docker run --rm` container.
 On Spark:
 
 ```bash
-export SDKB_RUNS_DIR=/mnt/external/sdkb-runs       # existing mounted external storage
-export SDKB_ARCHIVE_DIR=/mnt/external/sdkb-archive # optional separate archive directory
-export SDKB_CONTAINER=sdkb-causal
+export SCHNITZELJAGD_RUNS_DIR=/mnt/external/schnitz-runs       # existing mounted external storage
+export SCHNITZELJAGD_ARCHIVE_DIR=/mnt/external/schnitz-archive # optional separate archive directory
+export SCHNITZELJAGD_CONTAINER=schnitz-causal
 ./scripts/spark.sh build
 ./scripts/spark.sh start --recipe recipes/looped_causal.yaml --output /runs/causal
 ./scripts/spark.sh status
@@ -92,9 +92,9 @@ export SDKB_CONTAINER=sdkb-causal
 ```
 
 The detached container is retained for inspection. After it exits, remove that
-specific stopped container with `docker rm "$SDKB_CONTAINER"`, then repeat `start`
+specific stopped container with `docker rm "$SCHNITZELJAGD_CONTAINER"`, then repeat `start`
 with `--resume`. Logs can be detached without stopping training. Docker stop allows
-600 seconds by default (`SDKB_STOP_TIMEOUT` overrides this); an expired grace
+600 seconds by default (`SCHNITZELJAGD_STOP_TIMEOUT` overrides this); an expired grace
 period becomes a hard kill. Existing unrelated GPU services are never stopped.
 
 ## Checkpoint frequency and storage placement
@@ -105,10 +105,10 @@ checkpoints belong on the external disk. New runs can live entirely there, with
 move their checkpoint directories without changing dataset or result paths:
 
 ```bash
-mkdir -p /mnt/external/sdkb-checkpoints/my-stage
-sdkb relocate-checkpoints --run /fast/run/my-stage \
-  --destination /mnt/external/sdkb-checkpoints/my-stage
-sdkb runs configure --output /fast/run --checkpoint-every 1000 --no-archive
+mkdir -p /mnt/external/schnitz-checkpoints/my-stage
+schnitz relocate-checkpoints --run /fast/run/my-stage \
+  --destination /mnt/external/schnitz-checkpoints/my-stage
+schnitz runs configure --output /fast/run --checkpoint-every 1000 --no-archive
 ```
 
 Relocation verifies every retained checkpoint, publishes the external directory,
@@ -178,13 +178,13 @@ checkpoint intact. Reserve checks reduce disk-exhaustion risk; they cannot reser
 space against other processes writing to the same disk.
 
 ```bash
-sdkb storage --path /fast/sdkb-runs/causal
-sdkb storage --path /mnt/external/sdkb-archive
+schnitz storage --path /fast/schnitz-runs/causal
+schnitz storage --path /mnt/external/schnitz-archive
 # Manual copy of a stopped stage into an existing dedicated archive directory:
-sdkb archive --run /fast/sdkb-runs/causal/recurrent_joint --destination /archive/manual-stage
+schnitz archive --run /fast/schnitz-runs/causal/recurrent_joint --destination /archive/manual-stage
 # Restore into a NEW directory, then resume using its committed config:
-sdkb restore --archive /archive/RUN_UUID --output /fast/recovered-stage
-sdkb train --output /fast/recovered-stage --resume
+schnitz restore --archive /archive/RUN_UUID --output /fast/recovered-stage
+schnitz train --output /fast/recovered-stage --resume
 ```
 
 Archives hold checkpoint sets, including the stale training cache and run identity.
@@ -201,12 +201,12 @@ command runs automatically.
 
 ## Optional W&B
 
-Install `sdkb[tracking]` into the project environment; the Spark installer includes
+Install `schnitz[tracking]` into the project environment; the Spark installer includes
 it while constraining the NVIDIA runtime. Logging is disabled by default. Configure:
 
 ```yaml
 wandb_mode: offline # disabled / offline / online
-wandb_project: sdkb
+wandb_project: schnitz
 wandb_entity: null
 wandb_group: causal-mlp-seed17
 ```
@@ -238,7 +238,7 @@ timeout to an SDK call that never returns.
 Bgkit's runbook, trainer and checkpoint archiver document failures from writing
 large checkpoints synchronously to slow external storage, treating an archive's
 existence as proof of completeness, mixing retention across runs, and losing run
-identity during resume. SDKB adopts bounded flushing, verified atomic publication,
+identity during resume. SCHNITZELJAGD adopts bounded flushing, verified atomic publication,
 independent retention, durable identities and graceful stopping. It keeps the
 implementation independent of bgkit's model code, Hydra configuration, absolute
 mount paths and Spark-only optimizations.
@@ -258,13 +258,13 @@ both optimizers, actual per-group learning rates and settings, momentum/moments,
 parameter names/order and all accumulation state. `optimizer.json` reports the
 settings actually loaded after resume. Changed training hyperparameters are
 rejected on exact resume; an optimizer switch is an explicit warm-start into a
-new run. `sdkb train --output RUN --resume` loads the saved config automatically.
-There is no LR scheduler or early-stopping controller in SDKB yet; no scheduler
+new run. `schnitz train --output RUN --resume` loads the saved config automatically.
+There is no LR scheduler or early-stopping controller in SCHNITZELJAGD yet; no scheduler
 state is implied. W&B identity and random episode-sampling position also survive.
 
 Resume into the mutable run directory, never a `checkpoints/step-*` directory.
 Training rejects an immutable checkpoint as its output before creating run state.
-Use `sdkb restore` to recover an archive into a new mutable run directory. Direct
+Use `schnitz restore` to recover an archive into a new mutable run directory. Direct
 checkpoint paths remain valid for evaluation, warm-starts and read-only state loading;
 the latter still verifies the dataset and base-model revision.
 

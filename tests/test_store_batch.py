@@ -4,11 +4,11 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_multiuse_world
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-from sdkb.trajectory_eval import build_teacher_bank
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_multiuse_world
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+from schnitz.trajectory_eval import build_teacher_bank
 
 
 def record(name, **kwargs):
@@ -116,7 +116,7 @@ def test_offline_batch_matches_reference_bank_and_reads(tmp_path, tiny_config, t
         def put_many(self, records):
             for r in records:
                 self.put(r)
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(0, bindings=2)
     reference = IndividualStore(tmp_path / 'reference.sqlite')
     bulk = DiskStore(tmp_path / 'bulk.sqlite')

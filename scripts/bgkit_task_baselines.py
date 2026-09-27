@@ -1,9 +1,9 @@
 """Single-pass baselines of S2 (and its base LFM2.5-350M) on candidate B9 tasks.
 
-Greedy generation, scored with ``sdkb.task_verifiers``, with and without the
+Greedy generation, scored with ``schnitz.task_verifiers``, with and without the
 reference information a knowledge base would supply (tool documentation, database
 schema, BIRD evidence, a worked example). Picks stretch-goal slices: low but
-nonzero without the reference, clearly higher with it. Runs in ``sdkb-bgkit``.
+nonzero without the reference, clearly higher with it. Runs in ``schnitz-bgkit``.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import time
 
 import torch
 
-from sdkb.task_verifiers import call_match, code_match, knights_knaves_match, sql_match
+from schnitz.task_verifiers import call_match, code_match, knights_knaves_match, sql_match
 
 AGENTIC = Path('/archive/raw/agentic-20260927')
 WORLDS = Path('/archive/raw/worlds-20260927')

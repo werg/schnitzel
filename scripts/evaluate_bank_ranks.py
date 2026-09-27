@@ -10,18 +10,18 @@ import statistics
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_coherence import verify_refresh_coverage
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import (assert_bank_reader_compatible, canonical_json,
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_coherence import verify_refresh_coverage
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import (assert_bank_reader_compatible, canonical_json,
                                publish_offline_generation, stored_memory_identity)
-from sdkb.operations import atomic_json
-from sdkb.store import DiskStore
-from sdkb.training_bank import TrainingBank
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json
+from schnitz.store import DiskStore
+from schnitz.training_bank import TrainingBank
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def evaluate(run: Path, bank_dir: Path, episodes_file: Path, output: Path, *,
@@ -59,7 +59,7 @@ def evaluate(run: Path, bank_dir: Path, episodes_file: Path, output: Path, *,
         TrainingBank(store, mutable, index)
         journal_state = staged_manifest['journal_state']
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     checkpoint = resolve_checkpoint(run, verify=True)
     if journal is None:
         compatibility = assert_bank_reader_compatible(

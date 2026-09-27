@@ -5,15 +5,15 @@ from pathlib import Path
 
 import torch
 
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.evaluation import build_shared_bank
-from sdkb.evaluation_adapter import load_frozen_agent, attach_read_count_policy
-from sdkb.offline_bank import canonical_json
-from sdkb.operations import atomic_json, run_lock
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.evaluation import build_shared_bank
+from schnitz.evaluation_adapter import load_frozen_agent, attach_read_count_policy
+from schnitz.offline_bank import canonical_json
+from schnitz.operations import atomic_json, run_lock
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run
+from schnitz.trajectories import file_sha256
 
 
 @torch.no_grad()

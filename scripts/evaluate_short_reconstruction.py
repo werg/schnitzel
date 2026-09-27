@@ -8,15 +8,15 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-from sdkb.operations import atomic_json
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+from schnitz.operations import atomic_json
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def evaluate(run: Path, episodes_file: Path, output: Path, *,
@@ -32,7 +32,7 @@ def evaluate(run: Path, episodes_file: Path, output: Path, *,
     if config.train.arm != 'memory' or config.train.retrieval != 'oracle':
         raise ValueError('Short reconstruction needs the oracle memory interface')
     torch.set_num_threads(config.train.threads)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     checkpoint = resolve_checkpoint(run, verify=True)
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
     episodes = load_episodes(episodes_file)[:max_episodes]

@@ -9,7 +9,7 @@ import time
 import torch
 from safetensors.torch import load_model
 
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .checkpoints import resolve_checkpoint
 from .data import load_episodes
 from .evaluation import build_shared_bank, stored_transfer_evaluation
@@ -76,7 +76,7 @@ def evaluate_depths(run: str | Path, episodes_file: str | Path, output: str | Pa
             return dict(status='checkpointed', directory=str(directory))
         torch.set_num_threads(config.train.threads)
         torch.manual_seed(config.train.seed)
-        agent = SDKBAgent(config).to(config.train.device).eval()
+        agent = SchnitzelAgent(config).to(config.train.device).eval()
         load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
         store = DiskStore(directory / 'bank.sqlite')
         bank_file = directory / 'bank-progress.json'

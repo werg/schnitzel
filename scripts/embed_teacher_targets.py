@@ -14,11 +14,11 @@ import time
 from safetensors.torch import save_file
 import torch
 
-from sdkb.document_ingestion import source_ingestion_groups
-from sdkb.keyspace_views import query_view, source_view
-from sdkb.operations import atomic_json
-from sdkb.teacher_encoders import TEACHERS, TeacherEncoder
-from sdkb.trajectories import file_sha256
+from schnitz.document_ingestion import source_ingestion_groups
+from schnitz.keyspace_views import query_view, source_view
+from schnitz.operations import atomic_json
+from schnitz.teacher_encoders import TEACHERS, TeacherEncoder
+from schnitz.trajectories import file_sha256
 
 
 def _load(paths: list[Path]) -> list[dict]:

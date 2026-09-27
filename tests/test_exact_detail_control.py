@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from sdkb.data import make_multiuse_world
+from schnitz.data import make_multiuse_world
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 try:

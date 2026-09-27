@@ -2,14 +2,14 @@ import json
 
 import pytest
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode, make_multiuse_world
-from sdkb.store import DiskStore
-from sdkb.trajectory_eval import build_teacher_bank, stored_teacher_evaluation
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode, make_multiuse_world
+from schnitz.store import DiskStore
+from schnitz.trajectory_eval import build_teacher_bank, stored_teacher_evaluation
 
 
 def test_teacher_bank_manifest_reuses_frozen_records_without_writer(tmp_path, tiny_config, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(7, bindings=1)
     store = DiskStore(tmp_path / 'bank.sqlite')
     identity = 'checkpoint-model-sha256'
@@ -27,7 +27,7 @@ def test_teacher_bank_manifest_reuses_frozen_records_without_writer(tmp_path, ti
 
 
 def test_teacher_score_progress_preserves_original_plans_and_skips_completed_rows(tmp_path, tiny_config, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(8, bindings=1)[:1]
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_teacher_bank(agent, store, episodes)
@@ -41,12 +41,12 @@ def test_teacher_score_progress_preserves_original_plans_and_skips_completed_row
     assert stored_teacher_evaluation(agent, store, episodes, progress=progress,
                                      want_stop=stop) is None
     assert len(saved['rows']) == 1 and episodes[0].episode_id in saved['plans']
-    original = SDKBAgent.conditioned_nll
+    original = SchnitzelAgent.conditioned_nll
     calls = []
     def counted(self, *args, **kwargs):
         calls.append(True)
         return original(self, *args, **kwargs)
-    monkeypatch.setattr(SDKBAgent, 'conditioned_nll', counted)
+    monkeypatch.setattr(SchnitzelAgent, 'conditioned_nll', counted)
     resumed = stored_teacher_evaluation(agent, store, episodes, rows=saved['rows'],
                                         saved_plans=saved['plans'], progress=progress)
     assert len(calls) == 3
@@ -55,8 +55,8 @@ def test_teacher_score_progress_preserves_original_plans_and_skips_completed_row
 
 
 def test_teacher_bank_namespace_failure_leaves_only_committed_scopes(tmp_path, tiny_config, monkeypatch):
-    import sdkb.offline_bank as offline_bank
-    agent = SDKBAgent(tiny_config).eval()
+    import schnitz.offline_bank as offline_bank
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(1, bindings=1) + make_multiuse_world(2, bindings=1)
     store = DiskStore(tmp_path / 'bank.sqlite')
     original = offline_bank.ensure_offline_records
@@ -78,8 +78,8 @@ def test_teacher_bank_namespace_failure_leaves_only_committed_scopes(tmp_path, t
 
 
 def test_teacher_bank_cooperative_stop_resumes_committed_namespace(tmp_path, tiny_config, monkeypatch):
-    import sdkb.offline_bank as offline_bank
-    agent = SDKBAgent(tiny_config).eval()
+    import schnitz.offline_bank as offline_bank
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(11, bindings=1) + make_multiuse_world(12, bindings=1)
     store = DiskStore(tmp_path / 'bank.sqlite')
     original = offline_bank.ensure_offline_records
@@ -97,12 +97,12 @@ def test_teacher_bank_cooperative_stop_resumes_committed_namespace(tmp_path, tin
 
 
 def test_teacher_run_resumes_without_rewriting_checkpoint_or_scored_rows(tmp_path, tiny_config, monkeypatch):
-    from sdkb.checkpoints import resolve_checkpoint
-    from sdkb.data import save_episodes
-    from sdkb.operations import request_stop
-    from sdkb.training import train
-    from sdkb.trajectory_eval import evaluate_teacher_run
-    from sdkb.trajectories import file_sha256
+    from schnitz.checkpoints import resolve_checkpoint
+    from schnitz.data import save_episodes
+    from schnitz.operations import request_stop
+    from schnitz.training import train
+    from schnitz.trajectory_eval import evaluate_teacher_run
+    from schnitz.trajectories import file_sha256
     tiny_config.train.steps = 1
     source_run = tmp_path / 'trained'
     train(tiny_config, source_run)
@@ -111,25 +111,25 @@ def test_teacher_run_resumes_without_rewriting_checkpoint_or_scored_rows(tmp_pat
     episodes = tmp_path / 'episodes.jsonl'
     save_episodes(episodes, make_multiuse_world(9, bindings=1)[:1])
     output = tmp_path / 'teacher-score'
-    original = SDKBAgent.conditioned_nll
+    original = SchnitzelAgent.conditioned_nll
     calls = []
     def interrupted(self, *args, **kwargs):
         calls.append(True)
         value = original(self, *args, **kwargs)
         request_stop(output)
         return value
-    monkeypatch.setattr(SDKBAgent, 'conditioned_nll', interrupted)
+    monkeypatch.setattr(SchnitzelAgent, 'conditioned_nll', interrupted)
     assert evaluate_teacher_run(checkpoint, episodes, output=output)['status'] == 'checkpointed'
     assert len(calls) == 1 and not (output/'results.json').exists()
     assert len(json.loads((output/'progress.json').read_text())['rows']) == 1
     def counted(self, *args, **kwargs):
         calls.append(True)
         return original(self, *args, **kwargs)
-    monkeypatch.setattr(SDKBAgent, 'conditioned_nll', counted)
+    monkeypatch.setattr(SchnitzelAgent, 'conditioned_nll', counted)
     complete = evaluate_teacher_run(checkpoint, episodes, output=output)
     assert complete['status'] == 'complete' and len(calls) == 4
     assert before == {p.name: file_sha256(p) for p in checkpoint.iterdir() if p.is_file()}
-    monkeypatch.setattr(SDKBAgent, '__init__', lambda *a, **k: pytest.fail('Completed evaluation rebuilt model'))
+    monkeypatch.setattr(SchnitzelAgent, '__init__', lambda *a, **k: pytest.fail('Completed evaluation rebuilt model'))
     assert evaluate_teacher_run(checkpoint, episodes, output=output) == complete
     episodes.write_text(episodes.read_text() + '\n')
     with pytest.raises(ValueError, match='identity changed'):
@@ -138,8 +138,8 @@ def test_teacher_run_resumes_without_rewriting_checkpoint_or_scored_rows(tmp_pat
 
 def test_teacher_writer_and_scoring_guard_compute_but_not_progress_io(tmp_path, tiny_config, monkeypatch):
     from contextlib import contextmanager
-    import sdkb.runtime as runtime
-    agent = SDKBAgent(tiny_config).eval()
+    import schnitz.runtime as runtime
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(14, bindings=1)[:1]
     store = DiskStore(tmp_path/'bank.sqlite')
     armed = []
@@ -171,7 +171,7 @@ def assert_disarmed(armed):
 
 
 def test_teacher_offline_writer_bounds_cached_encoded_sources(tmp_path, tiny_config):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = [make_episode(i, distractors=0) for i in range(70)]
     store = DiskStore(tmp_path/'bank.sqlite')
     report = build_teacher_bank(agent, store, episodes, writer_identity='frozen')
@@ -182,7 +182,7 @@ def test_teacher_offline_writer_bounds_cached_encoded_sources(tmp_path, tiny_con
 
 
 def test_teacher_wrong_value_scopes_reuse_serialized_peer_values(tmp_path, tiny_config, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(15, bindings=1) + make_multiuse_world(16, bindings=1)
     reference, managed = DiskStore(tmp_path/'reference.sqlite'), DiskStore(tmp_path/'managed.sqlite')
     build_teacher_bank(agent, reference, episodes)

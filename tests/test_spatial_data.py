@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from sdkb.data import make_episode
-from sdkb.spatial_data import (
+from schnitz.data import make_episode
+from schnitz.spatial_data import (
     SpatialTrajectoryIndex,
     pack_spatial_trajectory,
     validate_spatial_row,

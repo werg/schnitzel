@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 import re
 
-from sdkb.data import load_episodes, save_episodes
-from sdkb.operations import atomic_json, run_lock
-from sdkb.trajectories import file_sha256
+from schnitz.data import load_episodes, save_episodes
+from schnitz.operations import atomic_json, run_lock
+from schnitz.trajectories import file_sha256
 
 
 def opaque(value):

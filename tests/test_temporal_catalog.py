@@ -1,8 +1,8 @@
 import torch
 
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.temporal_catalog import CatalogStore, GrowingCatalogIndex
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.temporal_catalog import CatalogStore, GrowingCatalogIndex
 
 
 def _record(record_id, key, payload, *, space, generation, created_at):

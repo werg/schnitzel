@@ -6,17 +6,17 @@ from pathlib import Path
 
 import torch
 
-from sdkb.archiving import ensure_free
-from sdkb.checkpoints import resolve_checkpoint, stop_on_signal
-from sdkb.data import load_episodes
-from sdkb.evaluation import build_shared_bank
-from sdkb.evaluation_adapter import load_frozen_agent
-from sdkb.offline_bank import canonical_json
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.runtime import available_host_memory, compute_watchdog
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.archiving import ensure_free
+from schnitz.checkpoints import resolve_checkpoint, stop_on_signal
+from schnitz.data import load_episodes
+from schnitz.evaluation import build_shared_bank
+from schnitz.evaluation_adapter import load_frozen_agent
+from schnitz.offline_bank import canonical_json
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.runtime import available_host_memory, compute_watchdog
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run
+from schnitz.trajectories import file_sha256
 
 
 @torch.no_grad()

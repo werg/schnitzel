@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from sdkb.store import DiskStore, StoredRecord
+from schnitz.store import DiskStore, StoredRecord
 
 spec = importlib.util.spec_from_file_location('global_diagnostic',
     Path(__file__).resolve().parents[1] / 'scripts/evaluate_global_routing.py')
@@ -35,7 +35,7 @@ def test_candidate_pool_rejects_invalid_scope(worlds, target, size):
 
 
 def test_query_subset_does_not_shrink_candidate_universe():
-    from sdkb.data import make_multiuse_world
+    from schnitz.data import make_multiuse_world
     episodes = [e for seed in range(4) for e in make_multiuse_world(seed, bindings=2)]
     selected, names = module.query_subset(episodes, 2)
     assert len(selected) == 20 and len(names) == 2

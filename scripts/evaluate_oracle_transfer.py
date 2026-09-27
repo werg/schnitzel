@@ -7,19 +7,19 @@ import re
 
 import torch
 
-from sdkb.archiving import ensure_free
-from sdkb.checkpoints import _atomic_text, resolve_checkpoint, stop_on_signal
-from sdkb.data import load_episodes, counterfactual_multiuse, evidence_ids
-from sdkb.evaluation import build_shared_bank, build_persistent_codes, stored_transfer_evaluation
-from sdkb.evaluation_adapter import load_frozen_agent
-from sdkb.frozen_scoring import FrozenScorer
-from sdkb.metrics import counterfactual_metrics
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.runtime import available_host_memory, compute_watchdog
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore, ReadPlan, Selection
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.archiving import ensure_free
+from schnitz.checkpoints import _atomic_text, resolve_checkpoint, stop_on_signal
+from schnitz.data import load_episodes, counterfactual_multiuse, evidence_ids
+from schnitz.evaluation import build_shared_bank, build_persistent_codes, stored_transfer_evaluation
+from schnitz.evaluation_adapter import load_frozen_agent
+from schnitz.frozen_scoring import FrozenScorer
+from schnitz.metrics import counterfactual_metrics
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.runtime import available_host_memory, compute_watchdog
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore, ReadPlan, Selection
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 def identifier_counterfactual(episode):

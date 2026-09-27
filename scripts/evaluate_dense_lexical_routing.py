@@ -10,11 +10,11 @@ import runpy
 
 import numpy as np
 
-from sdkb.archiving import ensure_free
-from sdkb.checkpoints import _atomic_text, stop_on_signal
-from sdkb.data import load_episodes
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.trajectories import file_sha256
+from schnitz.archiving import ensure_free
+from schnitz.checkpoints import _atomic_text, stop_on_signal
+from schnitz.data import load_episodes
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.trajectories import file_sha256
 
 
 LEXICAL = runpy.run_path(str(Path(__file__).with_name('evaluate_lexical_routing.py')))

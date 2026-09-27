@@ -15,7 +15,7 @@ import shutil
 
 import torch
 from safetensors.torch import load_model
-from .agent import SDKBAgent
+from .agent import SchnitzelAgent
 from .checkpoints import resolve_checkpoint, stop_on_signal
 from .episode_index import EpisodeIndex
 from .data import evidence_ids
@@ -280,7 +280,7 @@ def evaluate_teacher_run(run, episodes_file, *, max_episodes=64, generate_tokens
             return {'status': 'checkpointed', 'directory': str(directory)}
         reset_resource_peaks(config.train.device)
         torch.set_num_threads(config.train.threads)
-        agent = SDKBAgent(config).to(config.train.device).eval()
+        agent = SchnitzelAgent(config).to(config.train.device).eval()
         load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
         store = DiskStore(directory / 'bank.sqlite')
         writes = build_teacher_bank(agent, store, episodes,

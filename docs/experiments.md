@@ -50,7 +50,7 @@ observations out of its support. Split repositories/task families and remove
 near-duplicates. Teacher API execution and output-license management are outside
 the current runner.
 
-For new held-out JSONL use `sdkb evaluate-transfer`, which writes each source once
+For new held-out JSONL use `schnitz evaluate-transfer`, which writes each source once
 in a shared bank and reports choice or target NLL, missing-support/value ablations,
 and world-clustered paired metrics. The legacy `evaluate-episodes` remains available. Tool execution, code tests and
 reward models must be added as real verifiers rather than renamed likelihoods.

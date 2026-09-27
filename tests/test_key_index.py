@@ -1,11 +1,11 @@
 import torch
 import pytest
 
-from sdkb.store import DiskStore, StoredRecord
+from schnitz.store import DiskStore, StoredRecord
 
 
 def test_published_exact_keys_match_sqlite_selection_and_visibility(tmp_path):
-    from sdkb.key_index import PublishedKeyIndex
+    from schnitz.key_index import PublishedKeyIndex
     store = DiskStore(tmp_path / 'bank.sqlite')
     records = []
     for space in ('s0', 's1'):
@@ -54,7 +54,7 @@ def test_published_exact_keys_match_sqlite_selection_and_visibility(tmp_path):
 
 
 def test_published_index_rejects_incomplete_space(tmp_path):
-    from sdkb.key_index import PublishedKeyIndex
+    from schnitz.key_index import PublishedKeyIndex
     store = DiskStore(tmp_path / 'bank.sqlite')
     store.put(StoredRecord('a', torch.ones(2), torch.ones(3),
                            namespace='corpus', space='s0', generation='g1'))

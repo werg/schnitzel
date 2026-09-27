@@ -213,7 +213,7 @@ def start_run(recipe, run, *, resume=False):
                                                'output': str(run), 'started_at': time.time()})
         # Only this explicit start acknowledges an earlier stop, before spawn.
         (directory / 'STOP').unlink(missing_ok=True)
-        command = [sys.executable, '-m', 'sdkb.operations', str(recipe), str(run)]
+        command = [sys.executable, '-m', 'schnitz.operations', str(recipe), str(run)]
         if resume:
             command.append('--resume')
         try:

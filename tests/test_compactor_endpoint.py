@@ -6,15 +6,15 @@ import torch
 
 
 def test_compact_confirmation_requires_complete_source_bound_equal_budget_state(tmp_path, tiny_config, monkeypatch):
-    from sdkb.agent import SDKBAgent
-    from sdkb.cluster_store import state_fingerprint
-    from sdkb.compaction import SyntheticCompactor
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.cluster_store import state_fingerprint
+    from schnitz.compaction import SyntheticCompactor
     path = Path(__file__).parents[1] / 'scripts/evaluate_compact_transfer.py'
     monkeypatch.syspath_prepend(str(path.parent))
     spec = importlib.util.spec_from_file_location('compact_confirmation', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    agent = SDKBAgent(tiny_config).eval().requires_grad_(False)
+    agent = SchnitzelAgent(tiny_config).eval().requires_grad_(False)
     compactor = SyntheticCompactor(24, 24, 1)
     reader_hash = state_fingerprint(agent.reader)
     state = {'step': 2, 'identity': {'steps': 2, 'checkpoint_manifest_sha256': 'source',

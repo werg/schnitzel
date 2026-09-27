@@ -10,8 +10,8 @@ from pathlib import Path
 import shutil
 import uuid
 
-from sdkb.data import Source, episode_from_dict
-from sdkb.trajectories import file_sha256
+from schnitz.data import Source, episode_from_dict
+from schnitz.trajectories import file_sha256
 
 
 def prepare(episodes_file: Path, sources_file: Path, output: Path, *,

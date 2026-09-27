@@ -8,12 +8,12 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.operations import request_stop
-from sdkb.replay import ReplayTape
-from sdkb.training import stored_channel, train
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.operations import request_stop
+from schnitz.replay import ReplayTape
+from schnitz.training import stored_channel, train
 
 
 def native(config):
@@ -46,7 +46,7 @@ def equal(a, b):
 
 
 def test_distribution_kl_detaches_teacher_and_checks_answer_positions():
-    from sdkb.agent import answer_distribution_kl
+    from schnitz.agent import answer_distribution_kl
     student = torch.randn(1, 4, 17, requires_grad=True)
     teacher = torch.randn(1, 4, 17, requires_grad=True)
     loss = answer_distribution_kl(student, teacher)
@@ -74,10 +74,10 @@ def test_distillation_rejects_trainable_one_pass_teacher(tiny_config):
 
 
 def test_distillation_causal_states_and_full_graph_replay_gradients(tiny_config):
-    from sdkb.agent import answer_distribution_kl
+    from schnitz.agent import answer_distribution_kl
     config = native(tiny_config)
     config.memory.noise_std = .02
-    reference = SDKBAgent(config)
+    reference = SchnitzelAgent(config)
     replay = deepcopy(reference)
     rng = torch.get_rng_state()
     def backward(agent, use_replay):
@@ -171,8 +171,8 @@ def test_distillation_muon_partial_resume(tmp_path, tiny_config, monkeypatch):
 
 
 def test_missing_distillation_progress_rejected_before_weights(tmp_path, tiny_config, monkeypatch):
-    from sdkb.checkpoints import restore_checkpoint
-    from sdkb.optimizers import make_optimizer
+    from schnitz.checkpoints import restore_checkpoint
+    from schnitz.optimizers import make_optimizer
     import safetensors.torch
     config = native(tiny_config)
     config.train.gradient_accumulation = 2
@@ -195,7 +195,7 @@ def test_missing_distillation_progress_rejected_before_weights(tmp_path, tiny_co
     manifest_path.write_text(json.dumps(manifest))
     monkeypatch.setattr(safetensors.torch, 'load_model',
                         lambda *a, **k: pytest.fail('Invalid progress loaded model weights'))
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     with pytest.raises(ValueError, match='accumulation state'):
         restore_checkpoint(agent, make_optimizer(agent), output, random.Random(1),
                            manifest['dataset_sha256'], progress={})

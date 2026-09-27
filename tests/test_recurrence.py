@@ -5,21 +5,21 @@ import json
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.backbones import TinyBackbone
-from sdkb.data import make_episode
-from sdkb.evaluation import build_shared_bank
-from sdkb.recurrence import (
+from schnitz.agent import SchnitzelAgent
+from schnitz.backbones import TinyBackbone
+from schnitz.data import make_episode
+from schnitz.evaluation import build_shared_bank
+from schnitz.recurrence import (
     LoopMemory,
     LoopWrite,
     LoopWrites,
     MiddleBlockBackbone,
     SpatialReadSite,
 )
-from sdkb.replay import ReplayTape
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import stored_channel, train
+from schnitz.replay import ReplayTape
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import stored_channel, train
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ def test_extra_passes_are_live_and_bridge_receives_gradients():
 
 
 def test_fixed_writer_is_independent_of_consumer_loop_count(loop_config):
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     ids = agent.text_ids('Support: foo requires bar.', source=True)
     a = agent.produce(ids)
     agent.backbone.loops = 5
@@ -92,7 +92,7 @@ def test_fixed_writer_is_independent_of_consumer_loop_count(loop_config):
 @pytest.mark.parametrize('checkpoint', [False, True])
 def test_recurrent_prefix_is_causal_and_reads_never_see_targets(loop_config, checkpoint):
     loop_config.model.gradient_checkpointing = checkpoint
-    agent = SDKBAgent(loop_config).train()
+    agent = SchnitzelAgent(loop_config).train()
     prompt = agent.prompt_ids('Use the recorded rule.')
     records = [agent.produce(agent.text_ids(s, source=True)) for s in ['a: red', 'b: green']]
     queries = []
@@ -110,7 +110,7 @@ def test_recurrent_prefix_is_causal_and_reads_never_see_targets(loop_config, che
 
 
 def test_payloads_only_change_state_after_first_core(loop_config):
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     prompt = agent.prompt_ids('Question')
     shape = (1, loop_config.memory.read_slots, agent.width)
     zeros, changed = torch.zeros(shape), torch.randn(shape)
@@ -129,7 +129,7 @@ def test_payloads_only_change_state_after_first_core(loop_config):
 @pytest.mark.parametrize('kind', ['mlp', 'attention'])
 def test_integrated_training_matches_stored_prefix_plan(loop_config, tmp_path, monkeypatch, kind):
     loop_config.memory.reader = kind
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     e = make_episode(0, distractors=0)
     prompt, target = agent.prompt_ids(e.query), agent.target_ids(e.answer)
     records = [stored_channel(agent, agent.produce(agent.text_ids(s.text, source=True))) for s in e.supports]
@@ -157,7 +157,7 @@ def test_native_inloop_selective_replay_gradient_parity(loop_config, checkpoint,
     loop_config.train.routing_warmup = 0
     if retrieval == 'learned':
         loop_config.memory.read_steps = 1
-    a, e = SDKBAgent(loop_config), make_episode(2, distractors=2 if retrieval == 'learned' else 0)
+    a, e = SchnitzelAgent(loop_config), make_episode(2, distractors=2 if retrieval == 'learned' else 0)
     b = copy.deepcopy(a)
     sources = [a.text_ids(s.text, source=True) for s in e.supports]
     prompt, target = a.prompt_ids(e.query), a.target_ids(e.answer)
@@ -189,7 +189,7 @@ def test_native_inloop_selective_replay_gradient_parity(loop_config, checkpoint,
 
 def test_frozen_base_can_train_live_bridge_and_memory(loop_config):
     loop_config.model.freeze_backbone = True
-    a = SDKBAgent(loop_config)
+    a = SchnitzelAgent(loop_config)
     e = make_episode(0, distractors=0)
     records = [a.produce(a.text_ids(s.text, source=True)) for s in e.supports]
     a(a.prompt_ids(e.query), a.target_ids(e.answer), records, [0, 1]).loss.backward()
@@ -201,14 +201,14 @@ def test_frozen_base_can_train_live_bridge_and_memory(loop_config):
 
 def test_core_only_freezing_is_exact(loop_config):
     loop_config.model.backbone_train_scope = 'recurrent_core'
-    a = SDKBAgent(loop_config)
+    a = SchnitzelAgent(loop_config)
     for name, parameter in a.backbone.base.named_parameters():
         assert parameter.requires_grad == name.startswith(('layers.1.', 'layers.2.')), name
 
 
 def test_checkpoint_chunking_does_not_repeat_retrieval(loop_config):
     loop_config.model.gradient_checkpointing = True
-    a = SDKBAgent(loop_config).train()
+    a = SchnitzelAgent(loop_config).train()
     x = torch.randn(1, 15, a.width, requires_grad=True)
     memory = torch.randn(1, 2, a.width, requires_grad=True)
     calls = []
@@ -259,7 +259,7 @@ def test_spatial_result_workspaces_must_not_overlap():
 def test_whole_sequence_spatial_queries_are_batched_by_recurrence_level(loop_config):
     loop_config.model.loops = 3
     loop_config.memory.read_steps = 2
-    agent = SDKBAgent(loop_config)
+    agent = SchnitzelAgent(loop_config)
     ids = torch.randint(3, 100, (2, 28))
     ids[:, 5:7] = -1
     ids[:, 14:16] = -1
@@ -288,7 +288,7 @@ def test_whole_sequence_spatial_queries_are_batched_by_recurrence_level(loop_con
 def test_later_level_query_depends_on_earlier_spatial_result(loop_config):
     loop_config.model.loops = 3
     loop_config.memory.read_steps = 2
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     ids = torch.randint(3, 100, (1, 24))
     ids[:, 4:6] = -1
     ids[:, 18:20] = -1
@@ -376,7 +376,7 @@ def test_random_native_lfm_exact_split_and_causality(monkeypatch):
     from transformers.models.lfm2 import modeling_lfm2
     monkeypatch.setattr(modeling_lfm2, 'causal_conv1d_fn', inspect.unwrap(modeling_lfm2.causal_conv1d_fn))
     from transformers import Lfm2Config, Lfm2ForCausalLM
-    from sdkb.backbones import HFBackbone
+    from schnitz.backbones import HFBackbone
     from torch import nn
     c = Lfm2Config(vocab_size=259, hidden_size=32, intermediate_size=64,
         num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
@@ -404,7 +404,7 @@ def test_parent_distribution_anchor_never_changes_frozen_parent(loop_config):
     loop_config.train.arm = 'oracle_text'
     loop_config.train.parent_kl_weight = .1
     loop_config.validate()
-    agent = SDKBAgent(loop_config)
+    agent = SchnitzelAgent(loop_config)
     prompt, target = agent.prompt_ids('Earlier fact: A. What fact?'), agent.target_ids('A')
     before = agent.conditioned_logits(prompt, target, None, loops=1).detach().clone()
     result = agent(prompt, target, [], [])
@@ -416,7 +416,7 @@ def test_parent_distribution_anchor_never_changes_frozen_parent(loop_config):
 
 
 def test_bfloat16_recurrent_preflight(loop_config):
-    from sdkb.probes import model_probe
+    from schnitz.probes import model_probe
     loop_config.train.precision = 'bf16'
     result = model_probe(loop_config)
     assert result['one_loop_identity_max_error'] == 0
@@ -425,7 +425,7 @@ def test_bfloat16_recurrent_preflight(loop_config):
 
 
 def test_one_pass_stored_session_performs_no_read(loop_config, tmp_path, monkeypatch):
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     agent.backbone.loops = 1
     store = DiskStore(tmp_path / 'bank.sqlite')
     monkeypatch.setattr(store, 'search', lambda *a, **kw: pytest.fail('One-pass control read memory'))
@@ -437,8 +437,8 @@ def test_one_pass_stored_session_performs_no_read(loop_config, tmp_path, monkeyp
 def test_four_stage_curriculum_and_same_bank_depth_sweep(tmp_path):
     from pathlib import Path
     import yaml
-    from sdkb.launch import launch
-    from sdkb.depth_eval import evaluate_depths
+    from schnitz.launch import launch
+    from schnitz.depth_eval import evaluate_depths
     root = Path(__file__).resolve().parents[1]
     recipe = yaml.safe_load((root / 'recipes/tiny_looped_smoke.yaml').read_text())
     recipe['base_config'] = str(root / 'configs/tiny_looped_cpu.yaml')
@@ -462,7 +462,7 @@ def test_four_stage_curriculum_and_same_bank_depth_sweep(tmp_path):
 def test_random_native_llama_split_matches_parent():
     pytest.importorskip('transformers')
     from transformers import LlamaConfig, LlamaForCausalLM
-    from sdkb.backbones import HFBackbone
+    from schnitz.backbones import HFBackbone
     from torch import nn
     c = LlamaConfig(vocab_size=259, hidden_size=32, intermediate_size=64,
                     num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2)
@@ -482,7 +482,7 @@ def test_random_native_llama_split_matches_parent():
 def test_routing_only_training_preserves_payloads_and_oracle_outputs(tmp_path, loop_config, independent):
     loop_config.memory.independent_routing_query = independent
     from safetensors.torch import load_model
-    from sdkb.checkpoints import resolve_checkpoint
+    from schnitz.checkpoints import resolve_checkpoint
     loop_config.train.optimization_scope = 'routing'
     loop_config.train.retrieval = 'learned'
     loop_config.train.optimizer = 'muon'
@@ -496,10 +496,10 @@ def test_routing_only_training_preserves_payloads_and_oracle_outputs(tmp_path, l
     resumed_run = tmp_path / 'resumed-routing'
     train(partial, resumed_run)
     train(loop_config, resumed_run, resume=True)
-    resumed = SDKBAgent(copy.deepcopy(loop_config)).eval()
+    resumed = SchnitzelAgent(copy.deepcopy(loop_config)).eval()
     load_model(resumed, str(resolve_checkpoint(resumed_run, verify=True) / 'model.safetensors'))
     initial = next((run / 'checkpoints').glob('step-000000000-*'))
-    a, b = SDKBAgent(copy.deepcopy(loop_config)).eval(), SDKBAgent(copy.deepcopy(loop_config)).eval()
+    a, b = SchnitzelAgent(copy.deepcopy(loop_config)).eval(), SchnitzelAgent(copy.deepcopy(loop_config)).eval()
     load_model(a, str(initial / 'model.safetensors'))
     load_model(b, str(resolve_checkpoint(run, verify=True) / 'model.safetensors'))
     for name, value in b.state_dict().items():
@@ -541,7 +541,7 @@ def test_independent_routing_head_preserves_reader_query_and_causality(loop_conf
     loop_config.memory.read_timing = timing
     loop_config.memory.independent_routing_query = True
     loop_config.memory.read_steps = 1
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     e = make_episode(7, distractors=2)
     prompt = agent.prompt_ids(e.query)
     records = [stored_channel(agent, agent.produce(agent.text_ids(s.text, source=True))) for s in e.supports]
@@ -585,7 +585,7 @@ def test_independent_learned_routing_matches_stored_sessions(tmp_path, loop_conf
     loop_config.memory.independent_routing_query = True
     loop_config.train.retrieval = 'learned'
     loop_config.train.routing_warmup = 0
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     with torch.no_grad():
         agent.routing_query_head.weight.normal_()
     e = make_episode(4, distractors=2)
@@ -608,7 +608,7 @@ def test_learned_read_count_matches_stored_and_full_replay(tmp_path, loop_config
     loop_config.memory.independent_routing_query = True
     loop_config.train.retrieval = 'learned'
     loop_config.train.routing_warmup = 0
-    agent = SDKBAgent(loop_config).eval()
+    agent = SchnitzelAgent(loop_config).eval()
     agent.read_count_head = torch.nn.Linear(loop_config.memory.key_dim, 2).eval().requires_grad_(False)
     agent.read_count_choices = (1, 2)
     with torch.no_grad():
@@ -657,7 +657,7 @@ def test_inloop_temporary_compaction_replay_and_causal_queries(loop_config, kind
     c.model.gradient_checkpointing = checkpoint
     c.memory.checkpoint_chunks = checkpoint
     c.validate()
-    a = SDKBAgent(c).train()
+    a = SchnitzelAgent(c).train()
     b = copy.deepcopy(a)
     e = make_episode(2, distractors=2 if retrieval == 'learned' else 0)
     prompt, target = a.prompt_ids(e.query), a.target_ids(e.answer)
@@ -707,14 +707,14 @@ def test_inloop_temporary_compaction_replay_and_causal_queries(loop_config, kind
 @pytest.mark.parametrize('kind', ['mlp', 'attention'])
 @pytest.mark.parametrize('method', ['mean', 'synthetic'])
 def test_inloop_compaction_matches_persisted_codes(loop_config, tmp_path, monkeypatch, kind, method):
-    from sdkb.cluster_store import ClusterBank, state_fingerprint
-    from sdkb.store import ReadPlan, Selection
+    from schnitz.cluster_store import ClusterBank, state_fingerprint
+    from schnitz.store import ReadPlan, Selection
     c = loop_config
     c.memory.read_steps = 1
     c.memory.reader, c.memory.compaction = kind, method
     c.memory.compact_records = 1
     c.validate()
-    agent = SDKBAgent(c).eval()
+    agent = SchnitzelAgent(c).eval()
     e = make_episode(0, distractors=0)
     prompt, target = agent.prompt_ids(e.query), agent.target_ids(e.answer)
     records = [stored_channel(agent, agent.produce(agent.text_ids(s.text, source=True))) for s in e.supports]
@@ -753,7 +753,7 @@ def test_inloop_paired_objective_matches_separate_raw_compact_graphs(loop_config
     c.memory.compaction_loss_weight = .2
     c.memory.behavior_kl_weight = 0.
     c.validate()
-    paired = SDKBAgent(c).train()
+    paired = SchnitzelAgent(c).train()
     reference = copy.deepcopy(paired)
     reference.config.memory.compaction_objective = 'interleaved'
     e = make_episode(0, distractors=0)
@@ -785,7 +785,7 @@ def test_paired_value_ablation_removes_source_values_from_both_paths(loop_config
     c.memory.compaction, c.memory.compact_records = 'synthetic', 1
     c.memory.compaction_objective = 'paired'
     c.validate()
-    agent = SDKBAgent(c).eval()
+    agent = SchnitzelAgent(c).eval()
     e = make_episode(0, distractors=0)
     prompt, target = agent.prompt_ids(e.query), agent.target_ids(e.answer)
     with torch.no_grad():

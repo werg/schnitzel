@@ -9,13 +9,13 @@ import statistics
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import load_episodes
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore, Selection
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import load_episodes
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore, Selection
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 def difference(a, b):
@@ -40,7 +40,7 @@ def inspect(run, episodes_path, evaluation):
         raise ValueError('This diagnostic requires one space and one in-loop memory read boundary')
     torch.set_num_threads(config.train.threads)
     torch.manual_seed(config.train.seed)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
 
     def forbidden(*args, **kwargs):

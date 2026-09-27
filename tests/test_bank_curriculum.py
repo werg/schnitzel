@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.bank_curriculum import BankCurriculum
+from schnitz.agent import SchnitzelAgent
+from schnitz.bank_curriculum import BankCurriculum
 
 from test_record_gradients import _bank, _direct_agent
 
@@ -49,7 +49,7 @@ def test_curriculum_advances_on_stability_or_budget_and_round_trips():
 
 
 def test_index_restriction_limits_both_search_paths(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, _, _, index, cache = _bank(agent, tmp_path, count=4)
     queries = torch.randn(2, index.spaces['s0'].keys.shape[1])
     kwargs = dict(top_k=20, namespace='corpus', space='s0', generation='g1',
@@ -69,7 +69,7 @@ def test_index_restriction_limits_both_search_paths(tiny_config, tmp_path):
 
 
 def test_bank_load_respects_active_subset_and_query_eligibility():
-    from sdkb.key_geometry import BankLoad
+    from schnitz.key_geometry import BankLoad
     ids = [f'r{i:03d}' for i in range(100)]
     load = BankLoad(ids, 1, threshold=2.0)
     active = set(ids[:10])
@@ -92,7 +92,7 @@ def test_bank_load_respects_active_subset_and_query_eligibility():
 
 
 def test_index_eligible_mask_matches_eligible_ids(tiny_config, tmp_path):
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, _, _, index, cache = _bank(agent, tmp_path, count=4)
     index.restrict(cache.ids[::2])
     mask = index.eligible_mask('s0', domain='research', query_time=10)
@@ -104,9 +104,9 @@ def test_index_eligible_mask_matches_eligible_ids(tiny_config, tmp_path):
 
 
 def test_index_eligible_mask_cache_is_bounded_and_correct(tiny_config, tmp_path, monkeypatch):
-    import sdkb.key_index as key_index
+    import schnitz.key_index as key_index
     monkeypatch.setattr(key_index, 'ELIGIBLE_CACHE_ENTRIES', 2)
-    agent = SDKBAgent(_direct_agent(tiny_config))
+    agent = SchnitzelAgent(_direct_agent(tiny_config))
     _, _, _, index, _ = _bank(agent, tmp_path, count=4)
     first = index.eligible_mask('s0', domain='research', query_time=10).copy()
     for query_time in (0, 5, 10, 20, 1):

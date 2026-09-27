@@ -8,12 +8,12 @@ import pytest
 import torch
 from safetensors.torch import load_file
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.data import make_multiuse_world, save_episodes
-from sdkb.operations import request_stop
-from sdkb.replay import ReplayTape
-from sdkb.training import train, stored_channel
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.data import make_multiuse_world, save_episodes
+from schnitz.operations import request_stop
+from schnitz.replay import ReplayTape
+from schnitz.training import train, stored_channel
 
 
 def native(config):
@@ -45,7 +45,7 @@ def equal(a, b):
 
 
 def test_alignment_detaches_teacher_and_rejects_position_broadcast():
-    from sdkb.agent import answer_state_alignment
+    from schnitz.agent import answer_state_alignment
     student = torch.randn(1, 4, 8, requires_grad=True)
     teacher = torch.randn(1, 4, 8, requires_grad=True)
     loss = answer_state_alignment(student, teacher)
@@ -57,7 +57,7 @@ def test_alignment_detaches_teacher_and_rejects_position_broadcast():
 
 
 def test_alignment_states_are_next_token_causal_and_reads_ignore_targets(tiny_config):
-    agent = SDKBAgent(native(tiny_config)).eval()
+    agent = SchnitzelAgent(native(tiny_config)).eval()
     prompt = agent.prompt_ids('Which endpoint?')
     target = agent.target_ids('abcdef')
     changed = target.clone()
@@ -103,10 +103,10 @@ def test_alignment_rejects_evidence_not_yet_read(tmp_path, tiny_config):
 
 
 def test_alignment_full_graph_replay_gradients(tiny_config):
-    from sdkb.agent import answer_state_alignment
+    from schnitz.agent import answer_state_alignment
     config = native(tiny_config)
     config.memory.noise_std = .02
-    reference = SDKBAgent(config)
+    reference = SchnitzelAgent(config)
     replay = deepcopy(reference)
     rng = torch.get_rng_state()
     def backward(agent, use_replay):
@@ -184,8 +184,8 @@ def test_alignment_muon_partial_resume(tmp_path, tiny_config, monkeypatch):
 
 @pytest.mark.parametrize('missing', ['alignment_total', 'anchor_total', 'totals', 'loops', 'microbatches'])
 def test_partial_alignment_missing_totals_rejected_before_model_mutation(tmp_path, tiny_config, monkeypatch, missing):
-    from sdkb.checkpoints import restore_checkpoint
-    from sdkb.optimizers import make_optimizer
+    from schnitz.checkpoints import restore_checkpoint
+    from schnitz.optimizers import make_optimizer
     import safetensors.torch
     config = native(tiny_config)
     config.train.gradient_accumulation = 2
@@ -209,7 +209,7 @@ def test_partial_alignment_missing_totals_rejected_before_model_mutation(tmp_pat
     def forbidden(*args, **kwargs):
         raise AssertionError('Invalid accumulation must fail before loading model weights')
     monkeypatch.setattr(safetensors.torch, 'load_model', forbidden)
-    agent = SDKBAgent(config)
+    agent = SchnitzelAgent(config)
     with pytest.raises(ValueError, match='accumulation state'):
         restore_checkpoint(agent, make_optimizer(agent), output, random.Random(1),
                            manifest['dataset_sha256'], progress={})

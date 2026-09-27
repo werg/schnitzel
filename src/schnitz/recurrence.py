@@ -91,7 +91,7 @@ class AnchoredBridge(nn.Module):
     u = p + sigmoid(a) * RMS(p) * W([RMSNorm(h), RMSNorm(p)]).
     W starts as [I, -I]. Thus similar states require only a small correction, while
     the persistent prelude remains an anchor. No gate or projection is dead at init.
-    This is an SDKB adaptation, not a verbatim implementation of a cited paper.
+    This is an SCHNITZELJAGD adaptation, not a verbatim implementation of a cited paper.
     """
     def __init__(self, width: int, input_mix: float, update_mix: float):
         super().__init__()

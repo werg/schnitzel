@@ -16,20 +16,20 @@ import sqlite3
 import torch
 from safetensors.torch import load_model
 
-from sdkb.agent import SDKBAgent
-from sdkb.archiving import ensure_free
-from sdkb.bank_replay import BankWriterReplay
-from sdkb.bank_coherence import verify_refresh_coverage
-from sdkb.checkpoints import resolve_checkpoint, stop_on_signal
-from sdkb.document_ingestion import (grouped_ingestion_prefixes,
+from schnitz.agent import SchnitzelAgent
+from schnitz.archiving import ensure_free
+from schnitz.bank_replay import BankWriterReplay
+from schnitz.bank_coherence import verify_refresh_coverage
+from schnitz.checkpoints import resolve_checkpoint, stop_on_signal
+from schnitz.document_ingestion import (grouped_ingestion_prefixes,
                                      source_ingestion_groups, writer_prefix_ids)
-from sdkb.key_index import PublishedKeyIndex
-from sdkb.offline_bank import canonical_json, publish_offline_generation, writer_prompt_generation
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.training_bank import TrainingBank
-from sdkb.trajectories import file_sha256
+from schnitz.key_index import PublishedKeyIndex
+from schnitz.offline_bank import canonical_json, publish_offline_generation, writer_prompt_generation
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.training_bank import TrainingBank
+from schnitz.trajectories import file_sha256
 
 
 def refresh(run: Path, bank_dir: Path, sources: Path, output: Path, *,
@@ -104,7 +104,7 @@ def refresh(run: Path, bank_dir: Path, sources: Path, output: Path, *,
             return complete
         config = config_from_run(run)
         torch.set_num_threads(config.train.threads)
-        agent = SDKBAgent(config).to(config.train.device)
+        agent = SchnitzelAgent(config).to(config.train.device)
         load_model(agent, str(checkpoint / 'model.safetensors'), device=config.train.device)
         agent.eval()
         index = PublishedKeyIndex(

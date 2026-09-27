@@ -4,13 +4,13 @@ from dataclasses import replace
 import pytest
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode, make_boolean_world, save_episodes
-from sdkb.evaluation import build_shared_bank, evaluate_transfer_run
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import train
-from sdkb.trajectory_eval import evaluate_teacher_run
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode, make_boolean_world, save_episodes
+from schnitz.evaluation import build_shared_bank, evaluate_transfer_run
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import train
+from schnitz.trajectory_eval import evaluate_teacher_run
 
 
 @pytest.mark.parametrize('timing', ['prefix', 'loop_boundary'])
@@ -23,7 +23,7 @@ def test_fixed_plans_do_not_search_and_revalidate_visibility(tmp_path, tiny_conf
         c.model.recurrent_start, c.model.recurrent_end = 0, 1
         c.model.loops, c.model.writer_loops = 3, 1
         c.memory.read_timing = timing
-    agent = SDKBAgent(c).eval()
+    agent = SchnitzelAgent(c).eval()
     e = make_episode(0, distractors=2)
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_shared_bank(agent, store, [e])
@@ -91,7 +91,7 @@ def test_learned_routing_rejects_dataset_without_competing_candidates(tmp_path, 
 
 
 def test_all_live_training_skips_unused_cache_and_resumes_exactly(tmp_path, tiny_config, monkeypatch):
-    import sdkb.training as training
+    import schnitz.training as training
     c = copy.deepcopy(tiny_config)
     c.train.live_fraction = 1.
     monkeypatch.setattr(training, 'read_cached', lambda *a, **kw: pytest.fail('Unused cache read'))
@@ -107,11 +107,11 @@ def test_all_live_training_skips_unused_cache_and_resumes_exactly(tmp_path, tiny
 
 
 def test_legacy_evaluation_also_reuses_captured_plans(tmp_path, tiny_config, monkeypatch):
-    import sdkb.sessions as sessions
-    from sdkb.training import build_evaluation_store, stored_evaluation
+    import schnitz.sessions as sessions
+    from schnitz.training import build_evaluation_store, stored_evaluation
     tiny_config.train.retrieval = 'learned'
     tiny_config.memory.read_steps = 2
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     es = [make_episode(0, distractors=2)]
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_evaluation_store(agent, store, es, 'frozen')

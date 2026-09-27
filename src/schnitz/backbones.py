@@ -1,4 +1,4 @@
-"""Cache-free causal backbone adapters for SDKB recurrence.
+"""Cache-free causal backbone adapters for SCHNITZELJAGD recurrence.
 
 Native conversion exposes prelude, shared middle layers, and coda without changing
 the parent's normalization, mask, or positional behavior. The earlier full-stack

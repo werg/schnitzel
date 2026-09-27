@@ -1,10 +1,10 @@
 import pytest
 import torch
 
-from sdkb.compaction import (SyntheticCompactor, mean_and_mass, contribution_loss,
+from schnitz.compaction import (SyntheticCompactor, mean_and_mass, contribution_loss,
     adaptive_field_responsibilities, field_responsibilities, FullClusterCode,
     random_partition, storage_noise)
-from sdkb.readers import SetReader, merge_statistics
+from schnitz.readers import SetReader, merge_statistics
 
 
 @pytest.mark.parametrize("kind", ["mlp", "attention"])

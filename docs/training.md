@@ -1,4 +1,4 @@
-# SDKB training and causal-transfer protocol
+# SCHNITZELJAGD training and causal-transfer protocol
 
 Detached runs, graceful stops, W&B and external-disk checkpoint archives are
 described in [portable operations](operations.md).
@@ -104,7 +104,7 @@ committed writer checkpoint. It copies the stopped run's journal to external
 storage, encodes sources using the same prompted `memory.write` prefixes as the
 trainer, records chunk progress, and publishes a manifest only after every source
 has a new key and payload in each space. The original run and checkpoint are left
-intact. A new `sdkb` spatial stage can use `--bank-journal` with this complete
+intact. A new `schnitz` spatial stage can use `--bank-journal` with this complete
 manifest and `--init-from` the matching model checkpoint. The warm start resets
 optimizer state and saves its own bank-aligned step-zero checkpoint.
 
@@ -146,7 +146,7 @@ chunk policy, call IDs, and parent read IDs in the prepared artifact.
 
 ## Foreground staged launcher
 
-The entry point is `sdkb launch`, normally invoked through `scripts/start_spark.sh`.
+The entry point is `schnitz launch`, normally invoked through `scripts/start_spark.sh`.
 The same Python launcher is exercised in CPU integration tests; it is not a placeholder
 shell command. It resolves the model revision, loads its tokenizer, prepares immutable
 inputs, runs the model/gradient preflight, executes stage dependencies and evaluates
@@ -277,7 +277,7 @@ not silently overwritten.
 
 Completed stage/evaluation markers are independent. In particular, a failed binding
 evaluation after causal evaluation is retried without retraining or being skipped.
-The high-level recipe has fixed step counts; the lower-level `sdkb train --steps`
+The high-level recipe has fixed step counts; the lower-level `schnitz train --steps`
 can extend a compatible run deliberately. Do not advance a stage outside its sealed
 launch plan and then expect the launcher to reinterpret it as unchanged.
 
@@ -336,7 +336,7 @@ and AdamW for embeddings, output heads and other excluded parameters. They start
 fresh optimizer state; an AdamW checkpoint cannot become a Muon exact resume.
 See [optimizer ownership and resume](operations.md#optimizers-and-exact-resume) for details.
 
-`sdkb evaluate-transfer --binding-counterfactuals` flips permission or restoration
+`schnitz evaluate-transfer --binding-counterfactuals` flips permission or restoration
 rules consistently throughout each world. IDs, queries, timestamps and read plans
 remain fixed. Scores distinguish answer-changing branches from branches that
 should remain unchanged and report each task family separately. Fresh variant
@@ -355,7 +355,7 @@ training for the teacher bootstrap; learning retrieval from these data needs an
 explicit utility/sufficiency supervision protocol. Supplied context is not relabeled
 as sufficient merely to make the objective run.
 
-`sdkb evaluate-teachers --run RUN --episodes FILE` measures complete next-message
+`schnitz evaluate-teachers --run RUN --episodes FILE` measures complete next-message
 likelihood using a serialized stored-only bank and fixed-ID/key value ablations.
 It reports both token-weighted and per-example scores, plus trajectory-clustered
 uncertainty for paired memory benefits. Optional `--generate-tokens` saves generated
@@ -412,8 +412,8 @@ remain necessary. The starter does not claim those comparisons have already run.
 
 ```bash
 python -m pip install -e '.[dev]'
-sdkb launch --recipe recipes/offline_smoke.yaml --output runs/offline
-sdkb launch --recipe recipes/offline_smoke.yaml --output runs/offline --resume
+schnitz launch --recipe recipes/offline_smoke.yaml --output runs/offline
+schnitz launch --recipe recipes/offline_smoke.yaml --output runs/offline --resume
 python -m pytest -q
 ```
 
@@ -515,7 +515,7 @@ keys remain FP32. Raw records and manifests remain outside Git.
 For a bank-training fork, set `train.bank_dir` to a verified base snapshot,
 `train.bank_read_limits` to explicit counts within the per-space neighbor caps,
 `train.retrieval: learned`, `train.live_fraction: 0`, and keep the backbone frozen.
-Start with `sdkb train --config ... --output ... --init-from RUN` using the exact
+Start with `schnitz train --config ... --output ... --init-from RUN` using the exact
 writer checkpoint named by the bank. The current bank path supports the native
 two-pass, single-read model. It searches each space independently over the global
 bank, fixes the eligible read plan before backward, fetches only selected stored
@@ -565,7 +565,7 @@ the optimizer step. The fork requires one R=2 oracle read, no compaction and
 `live_fraction: 1`; `payload_contrast_loss` and `swapped_source_nll` are logged.
 The target NLL remains an anchor. Compare stored all/zero/wrong payload conditions
 on held-out sources before treating a lower training loss as memory use.
-Use `sdkb evaluate-teachers --output <fresh-directory>` for each checkpoint in a
+Use `schnitz evaluate-teachers --output <fresh-directory>` for each checkpoint in a
 fork; the result identity includes the checkpoint bytes and cannot be reused for
 a different step.
 

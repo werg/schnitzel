@@ -1,9 +1,9 @@
 import pytest
 import torch
 
-from sdkb.cluster_store import ClusterBank, state_fingerprint
-from sdkb.readers import SetReader
-from sdkb.store import DiskStore, StoredRecord, ReadPlan, Selection
+from schnitz.cluster_store import ClusterBank, state_fingerprint
+from schnitz.readers import SetReader
+from schnitz.store import DiskStore, StoredRecord, ReadPlan, Selection
 
 
 def setup_bank(tmp_path, domain='research'):
@@ -61,9 +61,9 @@ def test_state_fingerprint_detects_reader_change():
 
 @pytest.mark.parametrize('timing', ['prefix', 'loop_boundary'])
 def test_stored_codes_need_neither_writer_nor_compactor_at_read(tmp_path, tiny_config, monkeypatch, timing):
-    from sdkb.agent import SDKBAgent
-    from sdkb.data import make_boolean_world
-    from sdkb.evaluation import build_shared_bank, build_persistent_codes, stored_transfer_evaluation
+    from schnitz.agent import SchnitzelAgent
+    from schnitz.data import make_boolean_world
+    from schnitz.evaluation import build_shared_bank, build_persistent_codes, stored_transfer_evaluation
     tiny_config.memory.compaction = 'synthetic'
     tiny_config.memory.compact_records = 1
     if timing == 'loop_boundary':
@@ -75,7 +75,7 @@ def test_stored_codes_need_neither_writer_nor_compactor_at_read(tmp_path, tiny_c
         tiny_config.memory.read_steps, tiny_config.memory.read_top_k = 2, 1
         tiny_config.memory.compaction = 'none'
     tiny_config.validate()
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_boolean_world(0, operations=('a','b','xor'))
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_shared_bank(agent, store, episodes)
@@ -83,7 +83,7 @@ def test_stored_codes_need_neither_writer_nor_compactor_at_read(tmp_path, tiny_c
         codes, manifest = build_persistent_codes(agent, store, episodes)
     else:
         # Offline compaction is separate from the recurrent training config.
-        from sdkb.compaction import SyntheticCompactor
+        from schnitz.compaction import SyntheticCompactor
         compactor = SyntheticCompactor(24, 24, 1).eval()
         codes = ClusterBank(store, view='offline', reader_hash=state_fingerprint(agent.reader))
         plan = ReadPlan('global', 's0', 'frozen-v1', 'research', episodes[2].query_time,
@@ -112,7 +112,7 @@ def test_stored_codes_need_neither_writer_nor_compactor_at_read(tmp_path, tiny_c
         assert persistent[2]['payload_accounting'][0]['raw_fallback_ids']
         assert not persistent[2]['payload_accounting'][0]['clusters']
         assert not persistent[2]['payload_accounting'][1]['raw_fallback_ids']
-        from sdkb.sessions import read_session
+        from schnitz.sessions import read_session
         captured = []
         handle = agent.reader.register_forward_pre_hook(
             lambda _module, args: captured.append((args[0].clone(), args[2].clone())))

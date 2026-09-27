@@ -10,10 +10,10 @@ from pathlib import Path
 import shutil
 import uuid
 
-import sdkb.corpus_data as corpus_data
-from sdkb.corpus_data import short_reconstruction, with_distractor
-from sdkb.data import Source, episode_from_dict
-from sdkb.trajectories import file_sha256
+import schnitz.corpus_data as corpus_data
+from schnitz.corpus_data import short_reconstruction, with_distractor
+from schnitz.data import Source, episode_from_dict
+from schnitz.trajectories import file_sha256
 
 REVISION = '40cb2ad3b3044d5a41eee083a6103c8b523afa45'
 

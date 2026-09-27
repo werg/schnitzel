@@ -2,7 +2,7 @@ from copy import deepcopy
 
 import pytest
 
-from sdkb.comparison import compare_transfer_results
+from schnitz.comparison import compare_transfer_results
 
 
 def report():
@@ -80,7 +80,7 @@ def generation_report():
 
 
 def test_free_generation_comparison_keeps_world_and_control_pairing():
-    from sdkb.comparison import compare_generation_results
+    from schnitz.comparison import compare_generation_results
     old = generation_report()
     new = deepcopy(old)
     for row in new['generation_rows']:
@@ -94,7 +94,7 @@ def test_free_generation_comparison_keeps_world_and_control_pairing():
 
 @pytest.mark.parametrize('mutation', ['corpus', 'budget', 'incorrect_flag', 'duplicate', 'missing'])
 def test_free_generation_comparison_rejects_mismatched_evidence(mutation):
-    from sdkb.comparison import compare_generation_results
+    from schnitz.comparison import compare_generation_results
     old = generation_report()
     new = deepcopy(old)
     if mutation == 'corpus':

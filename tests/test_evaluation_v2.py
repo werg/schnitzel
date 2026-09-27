@@ -1,12 +1,12 @@
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_episode, make_multiuse_world, save_episodes, load_episodes
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation, score_answers
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore, StoredRecord
-from sdkb.training import build_evaluation_store, stored_evaluation
-from sdkb.metrics import paired_world_bootstrap
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_episode, make_multiuse_world, save_episodes, load_episodes
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation, score_answers
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore, StoredRecord
+from schnitz.training import build_evaluation_store, stored_evaluation
+from schnitz.metrics import paired_world_bootstrap
 
 
 def test_multiuse_roundtrip_and_unique_sources(tmp_path):
@@ -24,7 +24,7 @@ def test_multiuse_roundtrip_and_unique_sources(tmp_path):
 
 
 def test_write_once_stored_evaluation_and_shared_compute(tmp_path, tiny_config, monkeypatch):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episodes = make_multiuse_world(0, bindings=1) + make_multiuse_world(1, bindings=1)
     store = DiskStore(tmp_path / 'bank.sqlite')
     writes = build_shared_bank(agent, store, episodes)
@@ -44,7 +44,7 @@ def test_write_once_stored_evaluation_and_shared_compute(tmp_path, tiny_config, 
 
 
 def test_full_sequence_scoring_is_not_mean_scoring(tiny_config, monkeypatch):
-    agent = SDKBAgent(tiny_config)
+    agent = SchnitzelAgent(tiny_config)
     monkeypatch.setattr(agent, 'target_ids', lambda answer: torch.zeros(1, 1 if answer == 'short' else 5, dtype=torch.long))
     def loss(prompt, target, memory, *, reduction):
         assert reduction == 'sum'
@@ -55,7 +55,7 @@ def test_full_sequence_scoring_is_not_mean_scoring(tiny_config, monkeypatch):
 
 
 def test_branch_specific_support_and_counterfactuals(tmp_path, tiny_config):
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episode = make_episode(0, restore=True, allowed_capability=1, capability=0)
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_evaluation_store(agent, store, [episode], 'test')
@@ -69,7 +69,7 @@ def test_branch_specific_support_and_counterfactuals(tmp_path, tiny_config):
 def test_multiread_training_and_inference_agree(tmp_path, tiny_config):
     tiny_config.memory.read_steps = 3
     tiny_config.memory.read_top_k = 1
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episode = make_episode(0, distractors=0)
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_shared_bank(agent, store, [episode])
@@ -86,7 +86,7 @@ def test_stored_session_applies_adaptive_distance_weights(tmp_path, tiny_config,
                                                          monkeypatch):
     tiny_config.memory.distance_gating = True
     tiny_config.memory.gate_density_k = 4
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     episode = make_episode(0, distractors=4)
     store = DiskStore(tmp_path / 'gated-bank.sqlite')
     build_shared_bank(agent, store, [episode])

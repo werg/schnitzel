@@ -1,6 +1,6 @@
 import json
 
-from sdkb.routing_curriculum import RoutingCandidateIndex, routing_mix
+from schnitz.routing_curriculum import RoutingCandidateIndex, routing_mix
 
 
 def test_candidate_index_respects_time_domain_and_lexical_signal_is_soft(tmp_path):

@@ -7,19 +7,19 @@ import re
 import torch
 
 from probe_stored_compaction import persist_codes
-from sdkb.checkpoints import resolve_checkpoint
-from sdkb.cluster_store import ClusterBank, state_fingerprint
-from sdkb.compaction import SyntheticCompactor
-from sdkb.data import load_episodes, counterfactual_multiuse, save_episodes
-from sdkb.evaluation import build_shared_bank, score_answers
-from sdkb.evaluation_adapter import load_frozen_agent
-from sdkb.frozen_scoring import FrozenScorer
-from sdkb.metrics import summarize_rows, counterfactual_metrics
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.sessions import read_session
-from sdkb.store import DiskStore
-from sdkb.training import config_from_run, autocast_context
-from sdkb.trajectories import file_sha256
+from schnitz.checkpoints import resolve_checkpoint
+from schnitz.cluster_store import ClusterBank, state_fingerprint
+from schnitz.compaction import SyntheticCompactor
+from schnitz.data import load_episodes, counterfactual_multiuse, save_episodes
+from schnitz.evaluation import build_shared_bank, score_answers
+from schnitz.evaluation_adapter import load_frozen_agent
+from schnitz.frozen_scoring import FrozenScorer
+from schnitz.metrics import summarize_rows, counterfactual_metrics
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.sessions import read_session
+from schnitz.store import DiskStore
+from schnitz.training import config_from_run, autocast_context
+from schnitz.trajectories import file_sha256
 
 
 def load_compactor(agent, path, source_hash, reader_hash):

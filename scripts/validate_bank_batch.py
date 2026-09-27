@@ -6,13 +6,13 @@ import time
 
 import torch
 
-from sdkb.agent import SDKBAgent
-from sdkb.config import load_config
-from sdkb.data import make_multiuse_world
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-from sdkb.runtime import configure_memory
-from sdkb.store import DiskStore
-from sdkb.training import resource_report
+from schnitz.agent import SchnitzelAgent
+from schnitz.config import load_config
+from schnitz.data import make_multiuse_world
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+from schnitz.runtime import configure_memory
+from schnitz.store import DiskStore
+from schnitz.training import resource_report
 
 
 class IndividualStore(DiskStore):
@@ -27,7 +27,7 @@ def validate(config_path, output):
     configure_memory(config.train)
     torch.set_num_threads(config.train.threads)
     torch.manual_seed(23)
-    agent = SDKBAgent(config).to(config.train.device).eval()
+    agent = SchnitzelAgent(config).to(config.train.device).eval()
     episodes = [e for i in range(2) for e in
                 make_multiuse_world(i, split='batch-parity-20260919', bindings=2)]
     stores = {'individual': IndividualStore(output / 'individual.sqlite'),

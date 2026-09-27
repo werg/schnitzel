@@ -39,19 +39,19 @@ from safetensors.torch import load_file, load_model
 import torch
 from torch.nn import functional as F
 
-from sdkb.agent import SDKBAgent
-from sdkb.checkpoints import (resolve_checkpoint, restore_checkpoint, save_checkpoint,
+from schnitz.agent import SchnitzelAgent
+from schnitz.checkpoints import (resolve_checkpoint, restore_checkpoint, save_checkpoint,
                               stop_on_signal)
-from sdkb.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
+from schnitz.document_ingestion import (grouped_ingestion_prefixes, source_ingestion_groups,
                                      writer_prefix_ids)
-from sdkb.keyspace_distillation import (convert_to_direct, field_kl, flat_positives,
+from schnitz.keyspace_distillation import (convert_to_direct, field_kl, flat_positives,
                                         support_ranks, union_field_loss)
-from sdkb.operations import atomic_json, run_lock, stop_requested
-from sdkb.runtime import available_host_memory, reclaim_cuda_cache
-from sdkb.spatial_data import SYSTEM_PROMPT, SpatialTrajectoryIndex, _call, _tokens
-from sdkb.store import DiskStore
-from sdkb.training import autocast_context, config_from_run
-from sdkb.trajectories import file_sha256
+from schnitz.operations import atomic_json, run_lock, stop_requested
+from schnitz.runtime import available_host_memory, reclaim_cuda_cache
+from schnitz.spatial_data import SYSTEM_PROMPT, SpatialTrajectoryIndex, _call, _tokens
+from schnitz.store import DiskStore
+from schnitz.training import autocast_context, config_from_run
+from schnitz.trajectories import file_sha256
 
 
 class Targets:
@@ -171,7 +171,7 @@ def _query_prefix_ids(tokenizer, query: str, environment: str) -> tuple[int, ...
     return tuple(_tokens(tokenizer, messages)['input_ids'])
 
 
-def _prefix_features(agent: SDKBAgent, prefixes: list[tuple[int, ...]]) -> torch.Tensor:
+def _prefix_features(agent: SchnitzelAgent, prefixes: list[tuple[int, ...]]) -> torch.Tensor:
     """First-core-pass routing features at each prefix's final call token."""
     lengths = torch.tensor([len(p) for p in prefixes], device=agent.device)
     ids = torch.full((len(prefixes), int(lengths.max())), agent.tokenizer.pad_token_id or 0,
@@ -185,7 +185,7 @@ def _prefix_features(agent: SDKBAgent, prefixes: list[tuple[int, ...]]) -> torch
                                        positions])
 
 
-def _site_features(agent: SDKBAgent, rows: list[dict]) -> tuple[torch.Tensor, list[dict]]:
+def _site_features(agent: SchnitzelAgent, rows: list[dict]) -> tuple[torch.Tensor, list[dict]]:
     """Exact level-1 routing features from packed trajectories (first core pass)."""
     from cache_keyspace_states import _spatial_inputs
     ids, attention, sites = _spatial_inputs(agent, rows)
@@ -251,10 +251,10 @@ def train(args) -> dict:
                                                    torch.device(args.device).index or 0)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    reference = SDKBAgent(reference_config).to(args.device).eval()
+    reference = SchnitzelAgent(reference_config).to(args.device).eval()
     load_model(reference, str(init / 'model.safetensors'), device=args.device)
     reference.requires_grad_(False)
-    student = SDKBAgent(config).to(args.device)
+    student = SchnitzelAgent(config).to(args.device)
     if not args.resume:
         if output.exists():
             raise FileExistsError(output)
@@ -349,7 +349,7 @@ def train(args) -> dict:
     ]
     optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
     names = {id(p): n for n, p in trainable} | {id(log_scales): 'logit_scales'}
-    optimizer._sdkb_parameter_names = [[names[id(p)] for p in g['params']]
+    optimizer._schnitz_parameter_names = [[names[id(p)] for p in g['params']]
                                        for g in optimizer.param_groups]
     cache = DiskStore(output / 'training_cache.sqlite')
     rng = random.Random(args.seed)

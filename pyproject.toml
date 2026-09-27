@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sdkb"
+name = "schnitz"
 version = "0.4.0"
-description = "Spatially Superposed Differentiable Knowledge Base"
+description = "Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.6", "numpy>=1.26", "safetensors>=0.5", "PyYAML>=6"]
 
@@ -16,7 +16,8 @@ tracking = ["wandb>=0.19,<1"]
 dev = ["pytest>=8", "ruff>=0.11"]
 
 [project.scripts]
-sdkb = "sdkb.cli:main"
+schnitz = "schnitz.cli:main"
+sdkb = "schnitz.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

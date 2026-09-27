@@ -112,7 +112,7 @@ class CheckpointArchiver:
         self.closing = False
         self.error = None
         self.last_completed = None
-        self.thread = threading.Thread(target=self._work, name='sdkb-archive', daemon=True)
+        self.thread = threading.Thread(target=self._work, name='schnitz-archive', daemon=True)
         self.thread.start()
 
     def submit(self, checkpoint):

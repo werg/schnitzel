@@ -2,11 +2,11 @@ from dataclasses import replace
 
 import pytest
 
-from sdkb.agent import SDKBAgent
-from sdkb.data import make_multiuse_world, evidence_ids, save_episodes
-from sdkb.evaluation import build_shared_bank, stored_transfer_evaluation
-from sdkb.store import DiskStore
-from sdkb.training import train
+from schnitz.agent import SchnitzelAgent
+from schnitz.data import make_multiuse_world, evidence_ids, save_episodes
+from schnitz.evaluation import build_shared_bank, stored_transfer_evaluation
+from schnitz.store import DiskStore
+from schnitz.training import train
 
 
 def test_available_evidence_is_not_a_sufficiency_label_or_future_access():
@@ -27,14 +27,14 @@ def test_available_scope_reaches_training_and_stored_controls(tmp_path, tiny_con
     path = tmp_path / 'episodes.jsonl'
     save_episodes(path, [e])
     tiny_config.train.episodes_file = str(path)
-    seen, forward = [], SDKBAgent.forward
+    seen, forward = [], SchnitzelAgent.forward
     def capture(self, prompt, target, records, required, **kwargs):
         seen.append(tuple(required))
         return forward(self, prompt, target, records, required, **kwargs)
-    monkeypatch.setattr(SDKBAgent, 'forward', capture)
+    monkeypatch.setattr(SchnitzelAgent, 'forward', capture)
     train(tiny_config, tmp_path / 'run')
     assert seen == [(0, 1, 2, 3)]
-    agent = SDKBAgent(tiny_config).eval()
+    agent = SchnitzelAgent(tiny_config).eval()
     store = DiskStore(tmp_path / 'bank.sqlite')
     build_shared_bank(agent, store, [e])
     def forbidden(*args, **kwargs):
