@@ -10,6 +10,11 @@ concatenated reps (bf16, [total, 1024]) and per-source counts, plus
 ``shard-NNNNN.json`` with the source IDs, token counts and ratios. Shards are
 written atomically and skipped when present, so the job resumes.
 
+``--episodes`` (combiner targets, restart plan B7): one row per episode instead of
+per source, the text of its gold records (``required_ids``, in order, from
+``--sources``) joined by blank lines - the "BGKit encoding of all the relevant
+parts" that a gated read should reproduce.
+
 ``--schedule length`` (default) gives each source per-space ratios that scale
 with its length N: c_0(N) = clamp(sqrt(N)/2, 4, 32) and c_s = min(128, c_0 * 2^s)
 for spaces s0..s3, so short passages are compressed less. ``--schedule fixed``
@@ -45,6 +50,8 @@ def main() -> None:
     parser.add_argument('--experiment', default='bgkit2_s2_showcase')
     parser.add_argument('--sources', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--episodes', type=Path, help='encode gold-record concatenations '
+                        'of these episodes instead of the sources')
     parser.add_argument('--schedule', choices=('length', 'fixed'), default='length')
     parser.add_argument('--ratios', nargs='+', type=float,
                         default=[1 / 16, 1 / 32, 1 / 64, 1 / 128])
@@ -70,6 +77,14 @@ def main() -> None:
         for line in handle:
             row = json.loads(line)
             rows.append((row['record_id'], row['text']))
+    if args.episodes:
+        texts = dict(rows)
+        rows = []
+        with args.episodes.open(encoding='utf-8') as handle:
+            for line in handle:
+                row = json.loads(line)
+                rows.append((row['episode_id'],
+                             '\n\n'.join(texts[r] for r in row['required_ids'])))
     args.output.mkdir(parents=True, exist_ok=True)
     manifest = args.output / 'manifest.json'
     identity = {'checkpoint': str(args.checkpoint), 'experiment': args.experiment,
@@ -77,6 +92,8 @@ def main() -> None:
                 'schedule': args.schedule,
                 'ratios': args.ratios if args.schedule == 'fixed' else 'length_factors', 'shard_size': args.shard_size,
                 'prompt': 'reconstruct', 'max_tokens': args.max_tokens}
+    if args.episodes:
+        identity['episodes'] = str(args.episodes)
     if manifest.exists() and json.loads(manifest.read_text())['identity'] != identity:
         raise ValueError('Existing cache was built with different settings')
     if args.worker == 0:
