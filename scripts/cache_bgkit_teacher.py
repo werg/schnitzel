@@ -51,6 +51,8 @@ def main() -> None:
     parser.add_argument('--shard-size', type=int, default=8192)
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-tokens', type=int, default=1024)
+    parser.add_argument('--batch-tokens', type=int, default=262144,
+                        help='cap on rows x longest source per batch (long shards use fewer rows)')
     parser.add_argument('--cuda-fraction', type=float, default=0.10)
     parser.add_argument('--worker', type=int, default=0, help='this process handles shards '
                         'with index %% workers == worker')
@@ -99,6 +101,14 @@ def main() -> None:
             truncated += len(ids) > args.max_tokens
             encoded.append((record_id, torch.tensor(ids[:args.max_tokens], dtype=torch.long)))
         order = sorted(range(len(encoded)), key=lambda i: len(encoded[i][1]))
+        batches, start = [], 0
+        while start < len(order):
+            end = start + 1
+            while (end < len(order) and end - start < args.batch_size
+                   and (end - start + 1) * len(encoded[order[end]][1]) <= args.batch_tokens):
+                end += 1
+            batches.append(order[start:end])
+            start = end
         tensors, counts = {}, {}
         if args.schedule == 'fixed':
             plans = [(_tag(ratio), [ratio] * len(encoded)) for ratio in args.ratios]
@@ -107,8 +117,7 @@ def main() -> None:
             plans = [(f's{space}', [1 / f[space] for f in factors]) for space in range(4)]
         for tag, per_source in plans:
             reps, lengths = [None] * len(encoded), [0] * len(encoded)
-            for start in range(0, len(order), args.batch_size):
-                picked = order[start:start + args.batch_size]
+            for picked in batches:
                 samples = [Sample(ctx_ids=encoded[i][1], target_ids=encoded[i][1], task='reconstruct',
                                   store=0, doc=i, prompt_ids=prompt) for i in picked]
                 batch = collate(samples).to(core.device)
