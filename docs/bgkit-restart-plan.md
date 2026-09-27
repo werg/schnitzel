@@ -288,6 +288,38 @@ BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
   evals over text/soft input × text/soft output. Target: at least half of all
   tasks through the port.
 
+**B9 — Recursive improvement through memory (owner direction, 27 September).**
+After the combiner stage (feedback curriculum, related sources) and the B3 merge.
+On a hard, verifiable task with teacher trajectories, the model runs R = 3–4
+rounds per episode. Round t reads the KB: ground sources, related records, its
+own trajectory records from earlier rounds, trajectories of other episodes
+(distractors, so gates learn when prior attempts matter), and optionally the gold
+trajectory as a low-weight record. It attempts the task (answer and intermediate
+findings), and the writer stores the attempt as a new record; findings persist,
+so later episodes sharing rules or entities can use them.
+
+- *Supervision:* SFT - each round's target is the teacher trajectory, conditioned
+  on the KB at that round; RL on the verifiable outcome is optional on top. Later
+  rounds are weighted more, plus a term rewarding round t+1 over round t.
+- *Bridging the capability gap:* the student's own attempts may be far from the
+  target, so hints are annealed: heavily hinted seed rounds (partial teacher
+  trajectory or plan as round 0), and gold as a KB record at a forced low gate
+  (exact, same mechanism as the feedback curriculum) annealed to 0 over training.
+- *Gradient path:* written records are reps, so later-round losses reach the
+  writer of earlier rounds (truncated backprop over 2–3 rounds). Text
+  trajectories (sampled, then written) first; with the soft output port, attempts
+  go to the KB as soft tokens and the loop is fully differentiable.
+- *Causal boundary (invariant 2):* records are built only from the model's own
+  outputs (and explicitly marked hint/gold records); never from teacher-forced
+  targets.
+- *Controls:* same rounds with prior trajectories removed; prior trajectories
+  swapped with other episodes'; accuracy per round, to catch self-confirming
+  errors.
+- *Tasks (stretch goals for a 350M model; under review):* GSM8K-level math with
+  teacher chain-of-thought (worked solutions as know-how), ALFWorld with expert
+  trajectories (agentic, experience memory), Reasoning Gym for difficulty-
+  controlled supply.
+
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
 datasets) and periodic memory-use evaluation.
