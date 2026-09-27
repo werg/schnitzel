@@ -168,6 +168,40 @@ Then unfreeze further in steps (write adapter → upper layers), with a replay K
 to S2 on ordinary text and reading tasks. Gate: own-rep reading within a stated
 margin of teacher-rep reading; S2 reading and chat ability unchanged.
 
+Design (owner decision, 27 September; same script as B2, new options off by
+default; starts from the B2 writer). Gated first, then opened into a global
+adapter, then the whole decoder:
+
+1. *Gated write adapter.* A span-gated LoRA (`sdkb.bgkit_span.attach_write_adapter`,
+   rank 16 on every layer's attention, convolution and MLP projections,
+   zero-initialized output) adds its delta only at span positions (marker and
+   reps) of a write. Source text, reading layouts and ordinary text run the
+   unmodified S2 decoder, so no replay loss is needed yet; span positions attend
+   to the unmodified source states. Runs until capability shows: free-running
+   captured fraction within about 0.05 of teacher-rep reading per bank space and
+   at classical x4/x16.
+2. *Gate ramp.* The adapter's weight on non-span positions rises from 0 to 1
+   (`--gate-open-start`, `--gate-open-steps`, about 1–2k steps), turning it into
+   an ordinary global LoRA. From the first opened step a replay KL to a frozen S2
+   copy, on plain BGKit corpus text (no span) and on reading teacher reps, keeps
+   S2's behaviour outside spans; the functional loss keeps adapting the spans to
+   the moving source states. This replaces distilling into a separate global
+   adapter: the ramp optimizes the same objective (task at spans, S2 elsewhere)
+   from the gated model's own weights.
+3. *Merge and train the decoder* (`--merge-at`). The open adapter and S2's own
+   LoRA (layers 0–7) are folded into the weights (exact), the decoder moves to
+   fp32 master weights and trains whole at a low rate with a fresh warmup, the
+   same replay KL continuing. That replay becomes the preservation term of B4.
+
+Throughout: parallel rollout passes train on the writer's own reps (pass 0
+teacher-forced; each later pass feeds the previous pass's reps, detached, at a
+fraction of span positions ramping to 1; gradients through the last pass); the
+exact sequential rollout stays the evaluation arm; the functional loss dominates
+(cosine weight lowered); the KL target is S2 reading teacher reps; the classical
+context cap is lifted to BGKit's full range. The stop decision stays the two-way
+head through B3 and becomes the `<|rep|>` / `<|/bg|>` output rows in B4.
+Evaluation adds the replay KL to S2 next to the captured fractions.
+
 **B4 — General compression capability.** Mix BGKit's autoencode and task data
 with prompted compression ("compress at x16") and reading tasks over the model's
 own spans, so compressed output is a general skill, not only a memory write.

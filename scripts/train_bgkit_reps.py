@@ -21,6 +21,18 @@ Losses: cosine to the teacher rep; stop cross-entropy; functional - the frozen
 decoder reads the student reps in S2's reconstruct layout and pays NLL on the
 passage and KL to its own reading of the teacher reps.
 
+B3 options (all off by default, so the defaults are B2): ``--init-writer`` starts
+from a B2 ``writer.pt``; ``--adapter-rank`` adds the span-gated write adapter
+(``sdkb.bgkit_span.attach_write_adapter``: active only at span positions of a
+write, so reading and ordinary text stay S2); ``--rollout-passes``/``--sample-*``
+train on the writer's own reps (parallel passes, each feeding the previous
+pass's reps at a ramping fraction of span positions); ``--gate-open-start`` /
+``--gate-open-steps`` open the adapter on non-span positions from 0 to 1, so it
+becomes a global LoRA; ``--merge-at`` then folds it and S2's LoRA exactly into the
+weights and trains the whole decoder. Whenever the adapter acts outside spans or
+the decoder is unfrozen, a replay KL to a frozen S2 copy on plain corpus text and
+on reading teacher reps keeps S2's behaviour (``replay`` weight).
+
 Evaluation on held-out bank sources at each space ratio and on BGKit's eval
 stores at x4/x16/x64: task NLL with no context, full text, teacher reps, student
 teacher-forced reps and student free-running reps (fed back, teacher length), the
@@ -30,6 +42,7 @@ captured fraction of the full-text gain, and the free-running stop-length error.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -39,9 +52,11 @@ import time
 import torch
 import torch.nn.functional as F
 
-from sdkb.bgkit_span import MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter, span_targets
+from sdkb.bgkit_span import (MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
+                             attach_write_adapter, span_mask, span_targets)
 
 SPACES = ('s0', 's1', 's2', 's3')
+ADAPTER_TARGETS = ('q_proj', 'k_proj', 'v_proj', 'out_proj', 'in_proj', 'w1', 'w2', 'w3')
 
 
 def _heldout(record_id: str) -> bool:
@@ -117,6 +132,75 @@ class Model:
         self.instr = {task: ids.cpu() for task, ids in self.tpl.instr.items()}
         self.eos = torch.tensor([self.tpl.eos_id])
         self.device = core.device
+        # frozen S2 copy for the replay KL, taken before any hook is attached
+        opening = args.gate_open_start >= 0 or args.merge_at >= 0
+        self.reference = copy.deepcopy(self.decoder) if opening else None
+        self.gate, self.adapter, self.gate_value, self.merged = None, None, 0.0, False
+        if args.adapter_rank:
+            self.gate, self.adapter = attach_write_adapter(
+                self.decoder.base_lm.model.layers, ADAPTER_TARGETS, args.adapter_rank,
+                2.0 * args.adapter_rank)
+            self.adapter.to(self.device)
+
+    @property
+    def replaying(self) -> bool:
+        return self.reference is not None and (self.merged or self.gate_value > 0)
+
+    def merge(self) -> None:
+        """Fold the open write adapter and S2's LoRA into the weights; train the decoder."""
+        if self.adapter is not None:
+            if self.gate_value < 1.0:
+                raise ValueError('merge needs the write adapter fully open')
+            for adapter in self.adapter.values():
+                adapter.merge()
+        dec = self.decoder
+        if dec._has_adapter:
+            dec.lm = dec.lm.merge_and_unload()
+            dec._has_adapter = False
+        dec.base_lm.float()
+        for param in dec.base_lm.parameters():
+            param.requires_grad_(True)
+        self.gate, self.adapter, self.merged = None, None, True
+
+    def param_groups(self, args) -> list[dict]:
+        groups = [{'params': list(self.writer.parameters()), 'lr': args.lr}]
+        if self.adapter is not None:
+            groups.append({'params': list(self.adapter.parameters()), 'lr': args.adapter_lr})
+        if self.merged:
+            groups.append({'params': list(self.decoder.base_lm.parameters()),
+                           'lr': args.decoder_lr})
+        return groups
+
+    def trained_state(self) -> dict:
+        state = {'writer': self.writer.state_dict()}
+        if self.adapter is not None:
+            state['adapter'] = self.adapter.state_dict()
+        if self.merged:
+            state['merged'] = True
+            state['decoder'] = self.decoder.base_lm.state_dict()
+        return state
+
+    def load_trained(self, state: dict) -> None:
+        self.writer.load_state_dict(state['writer'])
+        if state.get('merged'):
+            self.gate_value = 1.0
+            self.merge()
+            self.decoder.base_lm.load_state_dict(state['decoder'])
+        elif 'adapter' in state and self.adapter is not None:
+            self.adapter.load_state_dict(state['adapter'])
+
+    def hidden(self, dec, inputs_embeds, attention_mask, spans=None) -> torch.Tensor:
+        """Final hidden states; the write adapter weighs span positions 1 and all
+        others ``gate_value`` (only on the trained decoder, never the reference)."""
+        if dec is not self.decoder or self.gate is None or (spans is None
+                                                           and self.gate_value == 0):
+            return dec._hidden(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        weights = torch.full(attention_mask.shape + (1,), self.gate_value,
+                             device=attention_mask.device)
+        if spans is not None:
+            weights = torch.maximum(weights, spans.float())
+        with self.gate.active(weights):
+            return dec._hidden(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
     def text_ids(self, text: str, limit: int = 1024) -> torch.Tensor:
         return torch.tensor(self.tok(text, add_special_tokens=False)['input_ids'][:limit])
@@ -142,7 +226,8 @@ class Model:
         for i, seq in enumerate(seqs):
             inputs[i, :seq.shape[0]] = seq.to(inputs.dtype)
             mask[i, :seq.shape[0]] = 1
-        hidden = self.decoder._hidden(inputs_embeds=inputs, attention_mask=mask)
+        spans = span_mask(starts, [1 + fed.shape[0] for fed in feed], width, self.device)
+        hidden = self.hidden(self.decoder, inputs, mask, spans)
         return [hidden[i, starts[i]:starts[i] + 1 + feed[i].shape[0]] for i in range(len(seqs))]
 
     def free_run(self, examples, lengths: list[int]):
@@ -173,9 +258,10 @@ class Model:
             out = self.core.encode(batch, ratio)
         return [out.reps[i][out.rep_mask[i]].to(torch.bfloat16) for i in range(len(samples))]
 
-    def read(self, examples, reps: list[torch.Tensor] | None, full: bool = False):
+    def read(self, examples, reps: list[torch.Tensor] | None, full: bool = False,
+             decoder=None, index: torch.Tensor | None = None):
         """S2 layout for each example's task; returns (target logits (N, V), target ids (N,))."""
-        dec = self.decoder
+        dec = decoder or self.decoder
         suffix = [torch.cat([self.instr[ex['task']], ex['target'], self.eos]) for ex in examples]
         start = [self.instr[ex['task']].shape[0] for ex in examples]
         prefix = [self.tpl.prefix.cpu()] * len(examples)
@@ -192,11 +278,28 @@ class Model:
                 mask[i, :r.shape[0]] = True
             batch = dec.build_batch(prefix, padded, mask, suffix, suffix_label_start=start,
                                     decoder_space=True)
-        hidden = dec._hidden(inputs_embeds=batch.inputs_embeds, attention_mask=batch.attention_mask)
+        hidden = self.hidden(dec, batch.inputs_embeds, batch.attention_mask)
         targets = batch.labels[:, 1:]
         valid = targets != -100
-        logits = dec.base_lm.lm_head(hidden[:, :-1][valid]).float()
-        return logits, targets[valid]
+        chosen = hidden[:, :-1][valid]
+        targets = targets[valid]
+        if index is not None:
+            chosen, targets = chosen[index], targets[index]
+        return dec.base_lm.lm_head(chosen).float(), targets
+
+    def text_logits(self, examples, decoder=None, index: torch.Tensor | None = None):
+        """Plain-text next-token logits over each example's source (no span, no chat)."""
+        dec = decoder or self.decoder
+        ids = [torch.cat([torch.tensor([self.tpl.bos_id]), ex['ids']]) for ex in examples]
+        width = max(x.shape[0] for x in ids)
+        batch = torch.full((len(ids), width), self.tpl.pad_id, dtype=torch.long)
+        mask = torch.zeros(len(ids), width, dtype=torch.long)
+        for i, x in enumerate(ids):
+            batch[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
+        batch, mask = batch.to(self.device), mask.to(self.device)
+        hidden = self.hidden(dec, dec.embed(batch), mask)
+        chosen = hidden[:, :-1][mask[:, 1:].bool()]
+        return dec.base_lm.lm_head(chosen if index is None else chosen[index]).float()
 
 
 def _example(cache: TeacherCache, model: Model, item, tag: str) -> dict:
@@ -237,35 +340,69 @@ def _batches(items, rng: random.Random, batch_size: int, budget: int):
         yield from groups
 
 
-def train_step(model: Model, examples, weights: dict) -> dict:
+def _kl(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return F.kl_div(F.log_softmax(logits, -1), F.log_softmax(target, -1), log_target=True,
+                    reduction='batchmean')
+
+
+def _subset(total: int, limit: int, device) -> torch.Tensor:
+    return torch.randperm(total, device=device)[:limit]
+
+
+def train_step(model: Model, examples, weights: dict, passes: int = 0,
+               sample: float = 0.0, replay_tokens: int = 1024) -> dict:
+    """One step. ``passes`` > 0 with ``sample`` > 0 trains on the writer's own reps: a
+    fixed random fraction ``sample`` of span inputs is replaced by the previous pass's
+    predictions (detached); gradients flow through the final pass."""
     writer = model.writer
+    teacher_feed = [ex['teacher'].to(model.device).float() for ex in examples]
+    feed = teacher_feed
     with model.core.autocast():
+        if passes and sample > 0:
+            own = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
+            for _ in range(passes):
+                with torch.no_grad():
+                    states = model.write(examples, feed)
+                    preds = [writer.rep(h[:-1]) for h in states]
+                feed = [torch.where(m, p, t) for m, p, t in zip(own, preds, teacher_feed)]
         # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop
-        full = model.write(examples, [ex['teacher'] for ex in examples])
-        counts = [ex['teacher'].shape[0] for ex in examples]
+        full = model.write(examples, feed)
+        counts = [t.shape[0] for t in teacher_feed]
         preds = [writer.rep(h[:-1]) for h in full]
-        teacher = torch.cat([ex['teacher'].to(model.device).float() for ex in examples])
         pred = torch.cat(preds)
-        cos = 1 - F.cosine_similarity(pred, teacher, dim=-1).mean()
+        cos = 1 - F.cosine_similarity(pred, torch.cat(teacher_feed), dim=-1).mean()
         stop_logits = writer.stop(torch.cat(full).float())
         stop = F.cross_entropy(stop_logits, span_targets(counts, model.device))
         logits, targets = model.read(examples, preds)
         nll = F.cross_entropy(logits, targets)
         with torch.no_grad():
-            t_logits, _ = model.read(examples, [ex['teacher'] for ex in examples])
-        kl = F.kl_div(F.log_softmax(logits, -1), F.log_softmax(t_logits, -1), log_target=True,
-                      reduction='batchmean')
-    loss = (weights['cos'] * cos + weights['stop'] * stop + weights['nll'] * nll
-            + weights['kl'] * kl)
+            t_logits, _ = model.read(examples, teacher_feed, decoder=model.reference)
+        kl = _kl(logits, t_logits)
+        loss = (weights['cos'] * cos + weights['stop'] * stop + weights['nll'] * nll
+                + weights['kl'] * kl)
+        result = {'cos': cos.item(), 'stop': stop.item(), 'nll': nll.item(), 'kl': kl.item()}
+        if model.replaying:
+            # replay: outside spans the decoder must still read teacher reps and text as S2
+            # on a random subset of positions, chosen before the LM head (memory)
+            pick = _subset(len(targets), replay_tokens, model.device)
+            read_now, _ = model.read(examples, teacher_feed, index=pick)
+            n_text = sum(ex['ids'].shape[0] for ex in examples)
+            text_pick = _subset(n_text, replay_tokens, model.device)
+            text_now = model.text_logits(examples, index=text_pick)
+            with torch.no_grad():
+                text_ref = model.text_logits(examples, decoder=model.reference, index=text_pick)
+            replay = _kl(read_now, t_logits[pick]) + _kl(text_now, text_ref)
+            loss = loss + weights.get('replay', 1.0) * replay
+            result['replay'] = replay.item()
     loss.backward()
-    return {'loss': loss.item(), 'cos': cos.item(), 'stop': stop.item(), 'nll': nll.item(),
-            'kl': kl.item(), 'reps': len(teacher)}
+    return {'loss': loss.item(), **result, 'reps': len(pred)}
 
 
 @torch.no_grad()
 def _score(model: Model, groups) -> dict:
     sums: dict[str, float] = {}
     tokens, count, length_err, stop_hits = 0, 0, 0.0, 0
+    replay, replay_n = 0.0, 0
     for examples in groups:
         counts = [ex['teacher'].shape[0] for ex in examples]
         with model.core.autocast():
@@ -276,6 +413,13 @@ def _score(model: Model, groups) -> dict:
                     'teacher': model.read(examples, [ex['teacher'] for ex in examples]),
                     'student_tf': model.read(examples, tf),
                     'student_free': model.read(examples, free)}
+            if model.reference is not None:
+                ref_read, _ = model.read(examples, [ex['teacher'] for ex in examples],
+                                         decoder=model.reference)
+                text_kl = _kl(model.text_logits(examples),
+                              model.text_logits(examples, decoder=model.reference))
+                replay += (_kl(arms['teacher'][0], ref_read) + text_kl).item()
+                replay_n += 1
         for name, (logits, targets) in arms.items():
             sums[name] = sums.get(name, 0.0) + F.cross_entropy(
                 logits, targets, reduction='sum').item()
@@ -285,12 +429,15 @@ def _score(model: Model, groups) -> dict:
             stop_hits += stop == k
             length_err += abs((k if stop is None else stop) - k) / max(k, 1)
     nll = {name: value / tokens for name, value in sums.items()}
+    extra = {}
+    if model.reference is not None:
+        extra = {'replay_kl': round(replay / max(replay_n, 1), 4)}
     gain = max(nll['noctx'] - nll['full'], 1e-9)
     return {'nll': {k: round(v, 4) for k, v in nll.items()},
             'captured': {k: round((nll['noctx'] - nll[k]) / gain, 4)
                          for k in ('teacher', 'student_tf', 'student_free')},
             'stop_exact': round(stop_hits / count, 4),
-            'length_rel_err': round(length_err / count, 4)}
+            'length_rel_err': round(length_err / count, 4), **extra}
 
 
 def evaluate(model: Model, cache: TeacherCache, items, classical, batch_size: int) -> dict:
@@ -304,6 +451,12 @@ def evaluate(model: Model, cache: TeacherCache, items, classical, batch_size: in
             _classical(model, classical[i:i + batch_size], [factor] * len(classical[i:i + batch_size]))
             for i in range(0, len(classical), batch_size)))
     return out
+
+
+def _gate(args, step: int) -> float:
+    if args.gate_open_start < 0 or step < args.gate_open_start:
+        return 0.0
+    return min(1.0, (step - args.gate_open_start + 1) / max(args.gate_open_steps, 1))
 
 
 def main() -> None:
@@ -330,6 +483,21 @@ def main() -> None:
     parser.add_argument('--log-every', type=int, default=25)
     parser.add_argument('--cuda-fraction', type=float, default=0.4)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--init-writer', type=Path, help='B3: start from this B2 writer.pt')
+    parser.add_argument('--adapter-rank', type=int, default=0)
+    parser.add_argument('--adapter-lr', type=float, default=2e-4)
+    parser.add_argument('--rollout-passes', type=int, default=0)
+    parser.add_argument('--sample-max', type=float, default=1.0)
+    parser.add_argument('--sample-ramp', type=int, default=2000,
+                        help='steps over which the self-fed fraction rises to --sample-max')
+    parser.add_argument('--gate-open-start', type=int, default=-1,
+                        help='step at which the write adapter starts opening outside spans')
+    parser.add_argument('--gate-open-steps', type=int, default=2000)
+    parser.add_argument('--merge-at', type=int, default=-1,
+                        help='step at which the open adapter and S2 LoRA are merged and the '
+                        'whole decoder trains (needs the gate fully open)')
+    parser.add_argument('--decoder-lr', type=float, default=1e-5)
+    parser.add_argument('--replay-tokens', type=int, default=1024)
     args = parser.parse_args()
     weights = {k: float(v) for k, v in (pair.split('=') for pair in args.weights.split(','))}
 
@@ -348,17 +516,30 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'writer.pt'
     step = 0
-    optimizer = torch.optim.AdamW(model.writer.parameters(), lr=args.lr, weight_decay=0.01)
+    state = None
     if state_path.exists():
         state = torch.load(state_path, map_location=model.device)
-        model.writer.load_state_dict(state['writer'])
-        optimizer.load_state_dict(state['optimizer'])
         step = state['step']
-    schedule = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda s: min(1.0, (s + step + 1) / args.warmup))
+        model.gate_value = _gate(args, step)
+        model.load_trained(state)
+    elif args.init_writer:
+        model.writer.load_state_dict(
+            torch.load(args.init_writer, map_location=model.device)['writer'])
+
+    def build_optimizer(start: int):
+        optimizer = torch.optim.AdamW(model.param_groups(args), weight_decay=0.01)
+        schedule = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda s: min(1.0, (s + start + 1) / args.warmup))
+        return optimizer, schedule
+
+    if 0 <= args.merge_at < args.gate_open_start + args.gate_open_steps - 1 and args.adapter_rank:
+        raise ValueError('--merge-at must come after the gate is fully open')
+    optimizer, schedule = build_optimizer(step - args.merge_at if model.merged else step)
+    if state is not None:
+        optimizer.load_state_dict(state['optimizer'])
     metrics = (args.output / 'metrics.jsonl').open('a', encoding='utf-8')
     config = dict(vars(args), train_items=len(train), heldout_items=len(heldout),
-                  target_norm=model.target_norm, memory_prompt=MEMORY_PROMPT,
+                  target_norm=model.target_norm, adapter_targets=ADAPTER_TARGETS, memory_prompt=MEMORY_PROMPT,
                   summarize_prompts=SUMMARIZE_PROMPTS)
     (args.output / 'config.json').write_text(json.dumps(config, indent=2, default=str) + '\n')
 
@@ -390,8 +571,16 @@ def main() -> None:
                         for item in next(batches)]
             stream = 'bank'
         optimizer.zero_grad(set_to_none=True)
-        result = train_step(model, examples, weights)
-        torch.nn.utils.clip_grad_norm_(model.writer.parameters(), 1.0)
+        model.gate_value = _gate(args, step)
+        if step == args.merge_at and not model.merged:
+            model.merge()
+            optimizer, schedule = build_optimizer(0)  # fresh warmup for the whole decoder
+            log({'step': step, 'event': 'merged; training the whole decoder'})
+        sample = args.sample_max * min(1.0, step / max(args.sample_ramp, 1))
+        result = train_step(model, examples, weights, args.rollout_passes, sample,
+                            args.replay_tokens)
+        torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
+                                       1.0)
         optimizer.step()
         schedule.step()
         step += 1
@@ -405,7 +594,7 @@ def main() -> None:
                  'lr': schedule.get_last_lr()[0], 'elapsed_s': round(time.time() - started)})
             window = {}
         if step % args.eval_every == 0 or step == args.steps:
-            torch.save({'writer': model.writer.state_dict(), 'optimizer': optimizer.state_dict(),
+            torch.save({**model.trained_state(), 'optimizer': optimizer.state_dict(),
                         'step': step}, state_path.with_suffix('.pending'))
             state_path.with_suffix('.pending').replace(state_path)
             log({'step': step, 'eval': evaluate(model, cache, heldout, classical_eval,

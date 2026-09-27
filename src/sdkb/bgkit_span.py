@@ -95,3 +95,86 @@ def span_targets(counts: list[int], device=None) -> torch.Tensor:
     for k in counts:
         labels.extend([0] * k + [1])
     return torch.tensor(labels, dtype=torch.long, device=device)
+
+
+class SpanGate:
+    """Shared position weights for the write adapter: (B, T, 1), 1 inside write spans.
+
+    ``None`` (the default, and outside ``active``) turns the adapter off entirely,
+    so every forward that is not a write - ordinary text, reading spans - is the
+    unmodified base decoder. Fractional weights elsewhere open the adapter
+    gradually into a global one (B3 gate ramp)."""
+
+    def __init__(self):
+        self.mask: torch.Tensor | None = None
+
+    def active(self, mask: torch.Tensor):
+        gate = self
+
+        class _Scope:
+            def __enter__(self):
+                gate.mask = mask
+                return gate
+
+            def __exit__(self, *exc):
+                gate.mask = None
+                return False
+
+        return _Scope()
+
+
+class SpanLoRA(nn.Module):
+    """Low-rank delta added to one linear module's output at gated positions only."""
+
+    def __init__(self, module: nn.Module, gate: SpanGate, rank: int, alpha: float):
+        super().__init__()
+        weight = module.base_layer.weight if hasattr(module, 'base_layer') else module.weight
+        out_features, in_features = weight.shape
+        self.gate, self.scale = gate, alpha / rank
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+        self.__dict__['target'] = module  # not a submodule: its weights are not adapter state
+        self.handle = module.register_forward_hook(self._hook)
+
+    def _hook(self, module, inputs, output):
+        mask = self.gate.mask
+        if mask is None:
+            return output
+        delta = self.up(self.down(inputs[0].to(self.down.weight.dtype))) * self.scale
+        return output + (delta * mask.to(delta.dtype)).to(output.dtype)
+
+    @torch.no_grad()
+    def merge(self) -> None:
+        """Fold the (fully open) delta into the target's weight and detach the hook."""
+        module = self.target
+        weight = module.base_layer.weight if hasattr(module, 'base_layer') else module.weight
+        delta = (self.up.weight.float() @ self.down.weight.float()) * self.scale
+        weight.copy_((weight.float() + delta).to(weight.dtype))
+        self.handle.remove()
+
+
+def attach_write_adapter(layers: nn.ModuleList, targets: tuple[str, ...], rank: int,
+                         alpha: float, layer_ids=None) -> tuple[SpanGate, nn.ModuleDict]:
+    """Attach span-gated LoRA to the named linear submodules of the given layers."""
+    gate, adapters = SpanGate(), nn.ModuleDict()
+    for index, layer in enumerate(layers):
+        if layer_ids is not None and index not in layer_ids:
+            continue
+        for name, module in layer.named_modules():
+            leaf = name.rsplit('.', 1)[-1]
+            if leaf in targets and (isinstance(module, nn.Linear) or hasattr(module, 'base_layer')):
+                key = f'{index}.{name}'.replace('.', '__')
+                adapters[key] = SpanLoRA(module, gate, rank, alpha)
+    if not adapters:
+        raise ValueError('write adapter: no target linear modules found')
+    return gate, adapters
+
+
+def span_mask(starts: list[int], lengths: list[int], width: int, device=None) -> torch.Tensor:
+    """(B, width, 1) mask of positions [start, start + length) per row."""
+    pos = torch.arange(width, device=device)[None, :]
+    start = torch.tensor(starts, device=device)[:, None]
+    end = start + torch.tensor(lengths, device=device)[:, None]
+    return ((pos >= start) & (pos < end)).unsqueeze(-1)
