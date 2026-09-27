@@ -220,22 +220,54 @@ class SpaceCodec(nn.Module):
             nn.init.zeros_(layer.weight)
         nn.init.zeros_(self.delta.bias)
 
+        # record position (combiner reads of several records); zero-init so a
+        # single-record combiner is exactly the codec it was initialized from
+        self.key_record = nn.Linear(feats, inner)
+        nn.init.zeros_(self.key_record.weight)
+        nn.init.zeros_(self.key_record.bias)
+
     def forward(self, source: torch.Tensor, count: int) -> torch.Tensor:
         """``source`` (n, width) -> (count, width) in the decoder's input space."""
-        n, device = source.shape[0], source.device
-        x = source.float()
+        return self.combine([source], count)
+
+    def combine(self, records: list[torch.Tensor], count: int,
+                gates: torch.Tensor | None = None) -> torch.Tensor:
+        """Gated read of several records -> ``count`` reps (the B7 combiner).
+
+        Every source rep's attention mass is multiplied by its record's gate
+        (score + log g), and each output is its gated numerator over its gated
+        mass: a gate of 0 removes that record's mass exactly (it still occupies a
+        place in the record-position features, i.e. the read's order), a single
+        record at gate 1 is the codec, and records are never averaged after
+        normalization."""
+        device = records[0].device
+        if gates is None:
+            gates = torch.ones(len(records), device=device)
+        x = torch.cat([r.float() for r in records])
+        src_pos = torch.cat([(torch.arange(r.shape[0], device=device) + 0.5) / r.shape[0]
+                             for r in records])
+        rec_pos = torch.cat([torch.full((r.shape[0],), (i + 0.5) / len(records), device=device)
+                             for i, r in enumerate(records)])
+        log_gate = torch.cat([torch.log(g.clamp_min(0)).expand(r.shape[0])
+                              for g, r in zip(gates, records)])
+        n = x.shape[0]
+        # compression feature from the gate-weighted source length (gated-out records
+        # do not count, gates above 1 count once)
+        lengths = torch.tensor([r.shape[0] for r in records], device=device, dtype=torch.float)
+        n_eff = float((lengths * gates.float().clamp(0, 1)).sum().clamp_min(1))
         out_pos = (torch.arange(count, device=device) + 0.5) / count
-        src_pos = (torch.arange(n, device=device) + 0.5) / n
-        ratio = torch.full((count,), math.log2(max(n, 1) / max(count, 1)) / 8, device=device)
+        ratio = torch.full((count,), math.log2(n_eff / max(count, 1)) / 8, device=device)
         query = self.query0(torch.cat([fourier(out_pos, self.frequencies),
                                        fourier(ratio, self.frequencies)], dim=-1))
-        keys = self.key_content(x) + self.key_position(fourier(src_pos, self.frequencies))
+        keys = (self.key_content(x) + self.key_position(fourier(src_pos, self.frequencies))
+                + self.key_record(fourier(rec_pos, self.frequencies)))
         values = x + self.value_up(self.value_down(x))
         head = self.inner // self.heads
         k = keys.view(n, self.heads, head).transpose(0, 1)
         for block in self.rounds:
             q = block['q'](query).view(count, self.heads, head).transpose(0, 1)
-            weights = torch.softmax(q @ k.transpose(1, 2) / math.sqrt(head), dim=-1)
+            scores = q @ k.transpose(1, 2) / math.sqrt(head) + log_gate
+            weights = torch.softmax(scores, dim=-1)
             mixed = (weights @ values.unsqueeze(0)).mean(0)          # (count, width)
             query = query + block['mlp'](query + self.read_back(mixed))
         return interface_rms(mixed + self.delta(query), self.target_norm)

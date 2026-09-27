@@ -101,3 +101,29 @@ def test_space_codec_starts_as_attention_pooling():
     same = torch.randn(1, 16).expand(6, -1)
     out = codec(same, 3)
     assert torch.allclose(out, interface_rms(same[:3], 1.0), atol=1e-5)
+
+
+def test_combiner_gate_zero_removes_a_record_exactly():
+    from sdkb.bgkit_span import SpaceCodec
+
+    codec = SpaceCodec(32, target_norm=1.0, inner=16, heads=2)
+    a, b = torch.randn(5, 32), torch.randn(4, 32)
+    assert torch.allclose(codec.combine([a], 3), codec(a, 3))
+    assert torch.allclose(codec.combine([a, b], 3, torch.tensor([1.0, 0.0])), codec(a, 3),
+                          atol=1e-5)
+    assert not torch.allclose(codec.combine([a, b], 3), codec(a, 3), atol=1e-4)
+    torch.nn.init.normal_(codec.key_record.weight)  # record order now matters
+    assert not torch.allclose(codec.combine([a, b], 3), codec.combine([b, a], 3), atol=1e-4)
+
+
+def test_combiner_gates_scale_mass():
+    from sdkb.bgkit_span import SpaceCodec
+
+    codec = SpaceCodec(8, target_norm=1.0, inner=8, heads=1, rounds=1)
+    for module in (codec.key_content[1], codec.key_position, codec.query0[2]):
+        torch.nn.init.zeros_(module.weight)
+        torch.nn.init.zeros_(module.bias)
+    a, b = torch.randn(1, 8), torch.randn(1, 8)
+    out = codec.combine([a, b], 1, torch.tensor([3.0, 1.0]))
+    from sdkb.bgkit_span import interface_rms
+    assert torch.allclose(out, interface_rms((3 * a + b) / 4, 1.0), atol=1e-5)
