@@ -168,9 +168,10 @@ def code_match(prediction: str, test: str, style: str, timeout: float = 20.0) ->
 
 def knights_knaves_match(prediction: str, names: list[str], solution: list[bool]) -> bool:
     """Every inhabitant is named with the right role (``True`` = knight)."""
+    text = re.sub(r'[*_`#>]', '', prediction)  # markdown emphasis and headings
     for name, knight in zip(names, solution, strict=True):
-        found = re.findall(rf'\b{re.escape(name)}\b\s+is\s+an?\s+(knight|knave)', prediction,
-                           re.IGNORECASE)
+        found = re.findall(rf'\b{re.escape(name)}\b\s*(?:is\s+(?:an?\s+)?|:\s*|-\s*|=\s*)'
+                           r'(knight|knave)', text, re.IGNORECASE)
         if not found or (found[-1].lower() == 'knight') != knight:
             return False
     return True

@@ -47,6 +47,7 @@ def test_knights_knaves_parses_each_role():
     assert knights_knaves_match('(1) Ann is a knight\n(2) Bo is a knave', names, solution)
     assert not knights_knaves_match('Ann is a knave and Bo is a knave', names, solution)
     assert not knights_knaves_match('Ann is a knight', names, solution)
+    assert knights_knaves_match('Final: **Ann**: Knight; Bo - knave', names, solution)
 
 
 def test_extract_block_prefers_the_language_fence():

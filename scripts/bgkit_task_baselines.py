@@ -107,7 +107,8 @@ def knights(n: int, rng: random.Random):
                  (WORLDS / f'knights-and-knaves/train/people{people}_num1000.jsonl').open()]
         for row in rng.sample(test, min(n, len(test))):
             names, solution = _lit(row['names']), _lit(row['solution'])
-            fmt = 'Answer with one line per person: "(1) Name is a knight/knave".'
+            fmt = ('Think step by step, then end with one line per person: '
+                   '"Name is a knight" or "Name is a knave".')
             check = partial(_knights, names=names, solution=solution)
             yield f'plain/{people}', f'{row["quiz"]}\n\n{fmt}', check
             ex = rng.choice(train)
@@ -118,7 +119,7 @@ def knights(n: int, rng: random.Random):
 
 
 TASKS = {'xlam': (xlam, 320), 'spider': (spider, 256), 'bird': (bird, 320), 'kodcode': (kodcode, 768),
-         'knights': (knights, 640)}
+         'knights': (knights, 1200)}
 
 
 def main() -> None:
