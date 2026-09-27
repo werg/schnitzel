@@ -22,7 +22,7 @@ class ModelConfig:
     tiny_width: int = 64
     tiny_layers: int = 2
     tiny_heads: int = 4
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
     freeze_backbone: bool = False
 
 
@@ -48,7 +48,7 @@ class MemoryConfig:
     reader_rounds: int = 3
     reader: str = "mlp"
     chunk_size: int = 32
-    checkpoint_chunks: bool = True
+    checkpoint_chunks: bool = False
     storage_dtype: str = "bfloat16"
     compaction: str = "none"
     compact_records: int = 2

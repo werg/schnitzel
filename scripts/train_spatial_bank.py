@@ -103,7 +103,7 @@ def train(config_path: Path, data_path: Path, bank_dir: Path, output: Path,
           archive_dir: Path | None = None,
           record_budget: dict | None = None,
           writer_batch_size: int = 16,
-          writer_checkpointing: bool = True,
+          writer_checkpointing: bool = False,
           curriculum_value_cosine: float = 0.99) -> dict:
     if (steps < 1 or batch_size < 1 or loops < 2 or checkpoint_every < 1
             or max_unused_cuda_gib < 0 or profile_steps < 0
@@ -994,7 +994,7 @@ if __name__ == "__main__":
     parser.add_argument("--record-flush-extra", type=int)
     parser.add_argument("--writer-batch-size", type=int, default=16)
     parser.add_argument("--writer-checkpointing", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=False,
                         help="recompute writer activations in the record-gradient backward")
     parser.add_argument("--archive-dir", type=Path,
                         help="copy completed checkpoints here in the background")
