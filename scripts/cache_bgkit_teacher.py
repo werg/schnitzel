@@ -8,13 +8,19 @@ kept in document order with the summary slots ``finish_reps`` appends.
 Output: ``<output>/shard-NNNNN.safetensors`` holding, per ratio tag, the
 concatenated reps (bf16, [total, 1024]) and per-source counts, plus
 ``shard-NNNNN.json`` with the source IDs, token counts and ratios. Shards are
-written atomically and skipped when present, so the job resumes. A training-time
+written atomically and skipped when present, so the job resumes.
+
+``--schedule length`` (default) gives each source per-space ratios that scale
+with its length N: c_0(N) = clamp(sqrt(N)/2, 4, 32) and c_s = min(128, c_0 * 2^s)
+for spaces s0..s3, so short passages are compressed less. ``--schedule fixed``
+uses ``--ratios`` for every source. A training-time
 teacher only: SDKB inference never runs this encoder.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -27,12 +33,19 @@ def _tag(ratio: float) -> str:
     return f'x{round(1 / ratio)}'
 
 
+def length_factors(tokens: int, spaces: int = 4) -> list[float]:
+    """Compression factor per space for a source of ``tokens`` tokens."""
+    base = min(32.0, max(4.0, math.sqrt(max(tokens, 1)) / 2))
+    return [min(128.0, base * 2 ** space) for space in range(spaces)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path, required=True)
     parser.add_argument('--experiment', default='bgkit2_s2_showcase')
     parser.add_argument('--sources', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--schedule', choices=('length', 'fixed'), default='length')
     parser.add_argument('--ratios', nargs='+', type=float,
                         default=[1 / 16, 1 / 32, 1 / 64, 1 / 128])
     parser.add_argument('--shard-size', type=int, default=8192)
@@ -56,7 +69,8 @@ def main() -> None:
     manifest = args.output / 'manifest.json'
     identity = {'checkpoint': str(args.checkpoint), 'experiment': args.experiment,
                 'sources': str(args.sources), 'source_count': len(rows),
-                'ratios': args.ratios, 'shard_size': args.shard_size,
+                'schedule': args.schedule,
+                'ratios': args.ratios if args.schedule == 'fixed' else 'length_factors', 'shard_size': args.shard_size,
                 'prompt': 'reconstruct', 'max_tokens': args.max_tokens}
     if manifest.exists() and json.loads(manifest.read_text())['identity'] != identity:
         raise ValueError('Existing cache was built with different settings')
@@ -82,21 +96,28 @@ def main() -> None:
             encoded.append((record_id, torch.tensor(ids[:args.max_tokens], dtype=torch.long)))
         order = sorted(range(len(encoded)), key=lambda i: len(encoded[i][1]))
         tensors, counts = {}, {}
-        for ratio in args.ratios:
+        if args.schedule == 'fixed':
+            plans = [(_tag(ratio), [ratio] * len(encoded)) for ratio in args.ratios]
+        else:
+            factors = [length_factors(int(ids.shape[0])) for _, ids in encoded]
+            plans = [(f's{space}', [1 / f[space] for f in factors]) for space in range(4)]
+        for tag, per_source in plans:
             reps, lengths = [None] * len(encoded), [0] * len(encoded)
             for start in range(0, len(order), args.batch_size):
                 picked = order[start:start + args.batch_size]
                 samples = [Sample(ctx_ids=encoded[i][1], target_ids=encoded[i][1], task='reconstruct',
                                   store=0, doc=i, prompt_ids=prompt) for i in picked]
                 batch = collate(samples).to(core.device)
+                ratio = torch.tensor([per_source[i] for i in picked], device=core.device)
                 with torch.no_grad(), core.autocast():
                     out = core.encode(batch, ratio)
                 for row, i in enumerate(picked):
                     kept = out.reps[row][out.rep_mask[row]].to(torch.bfloat16).cpu()
                     reps[i], lengths[i] = kept, kept.shape[0]
-            tensors[f'{_tag(ratio)}_reps'] = torch.cat(reps).contiguous()
-            tensors[f'{_tag(ratio)}_counts'] = torch.tensor(lengths, dtype=torch.int32)
-            counts[_tag(ratio)] = sum(lengths)
+            tensors[f'{tag}_reps'] = torch.cat(reps).contiguous()
+            tensors[f'{tag}_counts'] = torch.tensor(lengths, dtype=torch.int32)
+            tensors[f'{tag}_ratio'] = torch.tensor(per_source, dtype=torch.float32)
+            counts[tag] = sum(lengths)
         pending = path.with_suffix('.pending')
         save_file(tensors, str(pending))
         (args.output / f'shard-{shard:05d}.json').write_text(json.dumps({
