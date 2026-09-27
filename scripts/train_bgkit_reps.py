@@ -232,8 +232,9 @@ class Model:
         needs: per attention layer the keys and values, per convolution layer the
         last ``L_cache - 1`` convolution inputs (B * x) at each row's own end.
 
-        Valid only while nothing trainable acts on the prefix (write adapter closed
-        outside spans, decoder not merged): ``_rollout`` falls back otherwise."""
+        Computed with the current weights and the write adapter at its current
+        weight outside spans, so it is exact for no-gradient passes; a gradient pass
+        uses it only while nothing trainable acts on the prefix (``_rollout``)."""
         inner = self.decoder.base_lm.model
         ids = []
         for ex in examples:
@@ -258,8 +259,12 @@ class Model:
                 at = lengths[:, None] - keep + torch.arange(keep, device=self.device)[None]
                 conv[index] = bx[rows[:, None], at]
             hooks.append(layer.conv.in_proj.register_forward_hook(capture))
+        scope = contextlib.nullcontext()
+        if self.gate is not None and self.gate_value > 0:
+            scope = self.gate.active(torch.full(batch.shape + (1,), self.gate_value,
+                                                device=self.device))
         try:
-            with self.core.autocast():
+            with self.core.autocast(), scope:
                 out = inner(inputs_embeds=self.decoder.embed(batch), attention_mask=mask,
                             use_cache=True)
         finally:
@@ -353,7 +358,7 @@ class Model:
         reps = [torch.zeros(0, self.decoder.embed_tokens.weight.shape[1], device=self.device)
                 for _ in examples]
         stops = [None] * len(examples)
-        prefix = None if self.replaying else self.prefix(examples)
+        prefix = self.prefix(examples)
         for step in range(max(lengths)):
             hidden = self.write(examples, reps, prefix)
             for i, h in enumerate(hidden):
@@ -470,26 +475,41 @@ def _subset(total: int, limit: int, device) -> torch.Tensor:
     return torch.randperm(total, device=device)[:limit]
 
 
-def _rollout(model: Model, examples, passes: int, sample: float):
+def _rollout(model: Model, examples, passes: int, sample: float, sequential: int = 0):
     """Writer forward on the teacher-fed span with a fraction ``sample`` of inputs
-    replaced by the writer's own previous-pass reps (detached, ``passes`` passes);
-    gradients flow through the final pass. Returns teacher reps, predicted reps and
-    the cosine and stop losses."""
+    replaced by the writer's own reps; gradients flow through the final pass.
+
+    With ``sequential`` > 0 the first ``sequential`` reps of each span are generated
+    one at a time from the writer's own previous reps (no gradient), so those
+    positions are exactly free-running; ``passes`` parallel passes (each feeding the
+    previous pass's reps, detached) then cover longer spans. Returns teacher reps,
+    predicted reps and the cosine and stop losses."""
     writer = model.writer
     teacher_feed = [ex['teacher'].to(model.device).float() for ex in examples]
     feed = teacher_feed
-    # the prompt and source are computed once and only span positions per pass, while
-    # nothing trainable acts outside spans (their states then need no gradient)
-    prefix = None if model.replaying else model.prefix(examples)
+    # the prompt and source are computed once (with the current weights and gate) and
+    # every no-gradient pass runs only span positions
+    prefix = model.prefix(examples)
+    if sequential and sample > 0:
+        limits = [min(sequential, t.shape[0]) for t in teacher_feed]
+        own = [t[:0] for t in teacher_feed]
+        with torch.no_grad():
+            for step in range(max(limits)):
+                states = model.write(examples, own, prefix)
+                own = [o if step >= n else torch.cat([o, writer.rep(h[-1:])])
+                       for o, h, n in zip(own, states, limits)]
+        feed = [torch.cat([o, t[o.shape[0]:]]) for o, t in zip(own, teacher_feed)]
     if passes and sample > 0:
-        own = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
+        mask = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
+        start = feed
         for _ in range(passes):
             with torch.no_grad():
                 states = model.write(examples, feed, prefix)
                 preds = [writer.rep(h[:-1]) for h in states]
-            feed = [torch.where(m, p, t) for m, p, t in zip(own, preds, teacher_feed)]
-    # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop
-    full = model.write(examples, feed, prefix)
+            feed = [torch.where(m, p, f) for m, p, f in zip(mask, preds, start)]
+    # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop;
+    # the gradient pass reuses the prefix only while nothing trainable acts on it
+    full = model.write(examples, feed, None if model.replaying else prefix)
     counts = [t.shape[0] for t in teacher_feed]
     preds = [writer.rep(h[:-1]) for h in full]
     cos = 1 - F.cosine_similarity(torch.cat(preds), torch.cat(teacher_feed), dim=-1).mean()
@@ -530,13 +550,13 @@ class QAEpisodes:
 
 
 def qa_step(model: Model, episodes: QAEpisodes, rows, weights: dict, rng: random.Random,
-            related: int, passes: int, sample: float) -> dict:
+            related: int, passes: int, sample: float, sequential: int = 0) -> dict:
     """Writer writes the records (question-free); the reader answers from them."""
     tag = rng.choice(SPACES)
     built = [episodes.build(model, row, tag, rng, related) for row in rows]
     records = [record for recs, _ in built for record in recs]
     with model.core.autocast():
-        _, preds, cos, stop = _rollout(model, records, passes, sample)
+        _, preds, cos, stop = _rollout(model, records, passes, sample, sequential)
         spans, start = [], 0
         for recs, _ in built:
             spans.append(torch.cat(preds[start:start + len(recs)]))
@@ -601,12 +621,12 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
 
 
 def train_step(model: Model, examples, weights: dict, passes: int = 0,
-               sample: float = 0.0, replay_tokens: int = 1024) -> dict:
+               sample: float = 0.0, replay_tokens: int = 1024, sequential: int = 0) -> dict:
     """One step. ``passes`` > 0 with ``sample`` > 0 trains on the writer's own reps: a
     fixed random fraction ``sample`` of span inputs is replaced by the previous pass's
     predictions (detached); gradients flow through the final pass."""
     with model.core.autocast():
-        teacher_feed, preds, cos, stop = _rollout(model, examples, passes, sample)
+        teacher_feed, preds, cos, stop = _rollout(model, examples, passes, sample, sequential)
         pred = torch.cat(preds)
         logits, targets = model.read(examples, preds)
         nll = F.cross_entropy(logits, targets)
@@ -725,6 +745,9 @@ def main() -> None:
     parser.add_argument('--adapter-rank', type=int, default=0)
     parser.add_argument('--adapter-lr', type=float, default=2e-4)
     parser.add_argument('--rollout-passes', type=int, default=0)
+    parser.add_argument('--sequential-reps', type=int, default=0,
+                        help="generate the first N reps of each span one at a time from "
+                        "the writer's own reps before the parallel passes")
     parser.add_argument('--sample-max', type=float, default=1.0)
     parser.add_argument('--sample-ramp', type=int, default=2000,
                         help='steps over which the self-fed fraction rises to --sample-max')
@@ -838,10 +861,11 @@ def main() -> None:
         sample = args.sample_max * min(1.0, step / max(args.sample_ramp, 1))
         if stream == 'qa':
             result = qa_step(model, qa_train, rng.sample(qa_train.rows, args.qa_batch), weights,
-                             rng, rng.randint(0, args.qa_related), args.rollout_passes, sample)
+                             rng, rng.randint(0, args.qa_related), args.rollout_passes, sample,
+                             args.sequential_reps)
         else:
             result = train_step(model, examples, weights, args.rollout_passes, sample,
-                                args.replay_tokens)
+                                args.replay_tokens, args.sequential_reps)
         torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
                                        1.0)
         optimizer.step()
