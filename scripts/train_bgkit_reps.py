@@ -61,7 +61,8 @@ import torch
 import torch.nn.functional as F
 
 from schnitz.bgkit_span import (MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
-                             attach_write_adapter, span_mask, span_targets)
+                             attach_write_adapter, checkpoint_layers, span_mask,
+                             span_targets)
 
 SPACES = ('s0', 's1', 's2', 's3')
 ADAPTER_TARGETS = ('q_proj', 'k_proj', 'v_proj', 'out_proj', 'in_proj', 'w1', 'w2', 'w3')
@@ -117,6 +118,7 @@ class Model:
         from bgkit2.training.standalone import load_models
 
         core = load_models(args.experiment, str(args.checkpoint))
+        self.checkpoint_merged = args.merge_checkpoint
         self.core, self.decoder, self.tok = core, core.decoder, core.tok
         for param in list(self.decoder.parameters()) + list(core.encoder.parameters()):
             param.requires_grad_(False)
@@ -169,6 +171,8 @@ class Model:
         dec.base_lm.float()
         for param in dec.base_lm.parameters():
             param.requires_grad_(True)
+        if self.checkpoint_merged:
+            checkpoint_layers(dec.base_lm.model.layers)
         self.gate, self.adapter, self.merged = None, None, True
 
     def param_groups(self, args) -> list[dict]:
@@ -726,6 +730,8 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--steps', type=int, default=20000)
     parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--merge-checkpoint', action=argparse.BooleanOptionalAction, default=True,
+                        help='after the merge, recompute decoder-layer activations in backward')
     parser.add_argument('--batch-tokens', type=int, default=4096,
                         help='per batch: source tokens (bank) or context + target tokens (classical)')
     parser.add_argument('--lr', type=float, default=5e-4)

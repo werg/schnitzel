@@ -155,6 +155,26 @@ class SpanLoRA(nn.Module):
         self.handle.remove()
 
 
+def checkpoint_layers(layers: nn.ModuleList) -> None:
+    """Recompute each layer's activations in backward instead of storing them.
+
+    Only when gradients are enabled and no cache is requested, so generation and
+    prefix-cache passes run unchanged. Non-reentrant checkpointing restores the RNG
+    and autocast state, so the recomputed forward equals the original one."""
+    from torch.utils.checkpoint import checkpoint
+
+    for layer in layers:
+        forward = layer.forward
+
+        def wrapped(*args, _forward=forward, **kwargs):
+            if torch.is_grad_enabled() and not kwargs.get('use_cache') \
+                    and kwargs.get('past_key_values') is None:
+                return checkpoint(_forward, *args, use_reentrant=False, **kwargs)
+            return _forward(*args, **kwargs)
+
+        layer.forward = wrapped
+
+
 def attach_write_adapter(layers: nn.ModuleList, targets: tuple[str, ...], rank: int,
                          alpha: float, layer_ids=None) -> tuple[SpanGate, nn.ModuleDict]:
     """Attach span-gated LoRA to the named linear submodules of the given layers."""

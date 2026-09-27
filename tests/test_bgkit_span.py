@@ -127,3 +127,42 @@ def test_combiner_gates_scale_mass():
     out = codec.combine([a, b], 1, torch.tensor([3.0, 1.0]))
     from schnitz.bgkit_span import interface_rms
     assert torch.allclose(out, interface_rms((3 * a + b) / 4, 1.0), atol=1e-5)
+
+
+def test_checkpoint_layers_keeps_gradients_and_skips_cached_passes():
+    import copy
+
+    import torch
+    from torch import nn
+
+    from schnitz.bgkit_span import checkpoint_layers
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lin = nn.Linear(8, 8)
+            self.calls = 0
+
+        def forward(self, x, use_cache=False):
+            self.calls += 1
+            return torch.tanh(self.lin(x)) + x
+
+    torch.manual_seed(0)
+    plain = nn.ModuleList([Layer(), Layer()])
+    wrapped = copy.deepcopy(plain)
+    checkpoint_layers(wrapped)
+    x = torch.randn(3, 8)
+    grads = []
+    for layers in (plain, wrapped):
+        h = x
+        for layer in layers:
+            h = layer(h)
+        h.pow(2).sum().backward()
+        grads.append([p.grad.clone() for p in layers.parameters()])
+    for a, b in zip(*grads):
+        assert torch.allclose(a, b)
+    assert [layer.calls for layer in wrapped] == [2, 2]  # recomputed in backward
+    with torch.no_grad():
+        wrapped[0](x)
+    wrapped[1](x, use_cache=True)
+    assert [layer.calls for layer in wrapped] == [3, 3]
