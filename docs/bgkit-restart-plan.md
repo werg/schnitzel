@@ -368,7 +368,8 @@ so later episodes sharing rules or entities can use them.
 - *Single-pass S2 baselines (greedy, docs/schema in context; S2 vs base):*
   Spider 13% vs 21%, BIRD ≈0–5% both, KodCode easy 2% vs 7%, xLAM 41% vs 59%.
   Knights & Knaves S2 (plain / with worked examples): 3 people 17%/12%, 4 people
-  7%/7%, 5 people 3%/4%; base pending.
+  7%/7%, 5 people 3%/4%; base 16%/15%, 7%/10%, 4%/2%. Both are at chance
+  (1/8, 1/16, 1/32): the models do not solve these puzzles single-pass.
   S2's global LoRA costs 8–20 points.
 
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
