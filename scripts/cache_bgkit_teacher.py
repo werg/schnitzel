@@ -52,6 +52,9 @@ def main() -> None:
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--max-tokens', type=int, default=1024)
     parser.add_argument('--cuda-fraction', type=float, default=0.10)
+    parser.add_argument('--worker', type=int, default=0, help='this process handles shards '
+                        'with index %% workers == worker')
+    parser.add_argument('--workers', type=int, default=1)
     args = parser.parse_args()
 
     from bgkit_core.host_memory_guard import cap_cuda
@@ -74,7 +77,8 @@ def main() -> None:
                 'prompt': 'reconstruct', 'max_tokens': args.max_tokens}
     if manifest.exists() and json.loads(manifest.read_text())['identity'] != identity:
         raise ValueError('Existing cache was built with different settings')
-    manifest.write_text(json.dumps({'identity': identity, 'complete': False}, indent=2) + '\n')
+    if args.worker == 0:
+        manifest.write_text(json.dumps({'identity': identity, 'complete': False}, indent=2) + '\n')
 
     core = load_models(args.experiment, str(args.checkpoint))
     templates = Templates.from_tokenizer(core.tok, style=core.cfg2.data.prompt_style)
@@ -86,7 +90,7 @@ def main() -> None:
     truncated, started = 0, time.time()
     for shard in range(shards):
         path = args.output / f'shard-{shard:05d}.safetensors'
-        if path.exists():
+        if path.exists() or shard % args.workers != args.worker:
             continue
         chunk = rows[shard * args.shard_size:(shard + 1) * args.shard_size]
         encoded = []
@@ -127,8 +131,9 @@ def main() -> None:
         print(json.dumps({'shard': shard, 'of': shards, 'sources': len(chunk), 'reps': counts,
                           'truncated_so_far': truncated,
                           'elapsed_s': round(time.time() - started)}), flush=True)
-    manifest.write_text(json.dumps({'identity': identity, 'complete': True, 'shards': shards,
-                                    'truncated_sources': truncated}, indent=2) + '\n')
+    if all((args.output / f'shard-{i:05d}.safetensors').exists() for i in range(shards)):
+        manifest.write_text(json.dumps({'identity': identity, 'complete': True, 'shards': shards},
+                                       indent=2) + '\n')
 
 
 if __name__ == '__main__':
