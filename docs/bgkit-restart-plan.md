@@ -149,7 +149,9 @@ interface norm) and a two-way emit/stop head that stands in for the `<|rep|>` an
   "Compact the following passage with BGKit into a memory record, so that its
   content can later be recalled and reproduced verbatim."
 - Classical BGKit compression, 40% of steps: reconstruct and continue samples
-  from BGKit's own train stores (contexts 64–512 tokens), log-uniform ratio
+  from BGKit's own train stores (contexts 64–512 tokens while the decoder is
+  frozen; the cap is lifted to BGKit's full range from B3 on, owner decision
+  27 September), log-uniform ratio
   x1–x128, teacher reps from the frozen S2 encoder online with BGKit's own
   encoder prompt; the writer is prompted "Summarize this text with BGKit so that
   it can be reproduced verbatim / continued."
