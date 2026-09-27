@@ -305,6 +305,14 @@ so later episodes sharing rules or entities can use them.
   target, so hints are annealed: heavily hinted seed rounds (partial teacher
   trajectory or plan as round 0), and gold as a KB record at a forced low gate
   (exact, same mechanism as the feedback curriculum) annealed to 0 over training.
+- *On- and off-policy records together (owner, 27 September):* the KB stores
+  both the model's own trajectories and the gold teacher trajectories. A gold
+  record's gate is its learned gate times a continually receding weight w, the
+  product of a global schedule over training and a per-task factor that shrinks
+  each time the model's own record of that task is superseded; gates scale mass
+  exactly, so w is the gold record's share. At w = 0 the record is massless
+  (kept for comparison or dropped). This subsumes low-weight gold and hinted
+  seeds: a seed round is the model writing its first own record while w is high.
 - *Gradient path:* written records are reps, so later-round losses reach the
   writer of earlier rounds (truncated backprop over 2–3 rounds). Text
   trajectories (sampled, then written) first; with the soft output port, attempts
