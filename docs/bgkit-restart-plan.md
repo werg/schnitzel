@@ -81,8 +81,11 @@ BGKit encodings), appear as one span:
 
 ### 3.3 Dense, size-scaled compression (owner decision, 27 September)
 General compression capability is trained at all ratios x1–x128 (x1 and x4
-included). Knowledge-base encoding starts at x16: spaces at x16, x32, x64 and
-x128, and longer texts are compressed harder. After distillation, output sizes become
+included). Knowledge-base compression scales with record length, so short
+records are compressed less (x4 is fine for a short passage). During BGKit
+distillation the four spaces use c_0(N) = clamp(sqrt(N)/2, 4, 32) and
+c_s(N) = min(128, c_0(N)·2^s): a 55-token passage is stored at x4/x8/x16/x32
+(about 14/7/4/2 reps), a 1,000-token document at about x16/x32/x64/x128. After distillation, output sizes become
 logarithmic in the source length, k(N) = ceil(a·log2(N) + b), with a and b set
 from the distilled model's measured quality-per-rep curve.
 
@@ -124,9 +127,9 @@ x4 0.87, x8 0.69, x16 0.49, x32 0.34, x64 0.23; on invented passages 0.74, 0.51,
 0.33, 0.19, 0.10 (`scripts/bgkit_parity.py`).
 
 **B1 — Teacher cache.** Every bank source (466,820) encoded by the frozen S2
-encoder with the reconstruct prompt at x16/x32/x64/x128
-(`scripts/cache_bgkit_teacher.py`, resumable shards). Bank passages average
-about 55 tokens: about 3.5 reps at x16, the one-rep minimum at x64 and x128.
+encoder with the reconstruct prompt at its four length-scaled space ratios
+(`scripts/cache_bgkit_teacher.py --schedule length`, resumable shards; about 25
+reps per 55-token passage over the four spaces, about 23 GB).
 
 **B2 — Rep generation, rep head only.** Decoder frozen (including its LoRA);
 train the rep head and the stop decision, teacher-forced. Losses: cosine and norm
