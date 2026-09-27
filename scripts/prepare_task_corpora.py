@@ -28,6 +28,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from public_corpus_common import Writer, clean, record_id  # noqa: E402
 
+from sdkb.task_verifiers import run_sql  # noqa: E402
+
 RAW = Path('/archive/raw')
 RECORD_CHARS = 1500
 
@@ -35,6 +37,11 @@ RECORD_CHARS = 1500
 def _lit(value):
     """A list field that some releases store as its Python literal string."""
     return __import__('ast').literal_eval(value) if isinstance(value, str) else value
+
+
+def _lenient(raw: bytes) -> str:
+    """Text columns with stray non-UTF-8 bytes (some Spider rows) decode with replacement."""
+    return raw.decode('utf-8', 'replace')
 
 
 def record(domain: str, text: str, kind: str, **provenance) -> dict:
@@ -136,6 +143,7 @@ def database_records(domain: str, db_id: str, db_path: Path, *, full_rows: int,
     descriptions), value lists of low-cardinality text columns, and rows (all rows
     of tables up to ``full_rows`` rows, else a ``sample_rows`` sample)."""
     con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    con.text_factory = _lenient
     out: dict[str, list[dict]] = {}
     tables = [(n, s) for n, s in con.execute(
         "select name, sql from sqlite_master where type='table' and sql is not null")]
@@ -173,7 +181,10 @@ def database_records(domain: str, db_id: str, db_path: Path, *, full_rows: int,
 
 
 def _tables_in(sql: str, tables: set[str]) -> list[str]:
-    words = {w.strip('`"[]').lower() for w in re.findall(r'[`"\[]?[\w ]+[`"\]]?|\w+', sql)}
+    """Tables named in ``sql``: quoted identifiers (backticks, double quotes, brackets)
+    or bare words, matched case-insensitively."""
+    words = {next(g for g in m if g).lower()
+             for m in re.findall(r'`([^`]+)`|"([^"]+)"|\[([^\]]+)\]|(\w+)', sql)}
     return [t for t in tables if t in words]
 
 
@@ -243,6 +254,59 @@ def sql_corpus(output: Path, dataset: str, *, full_rows: int, sample_rows: int,
                          'value_limit': value_limit, 'database_records': sizes})
 
 
+# -- answers from stored database contents --------------------------------------
+def spider_memory(output: Path, *, max_chars: int, max_rows: int, max_cells: int,
+                  max_answer: int) -> dict:
+    """Small Spider databases stored whole in the KB (schema and all rows); questions
+    answered from memory with the values, no SQL. A test of how precisely stored
+    facts are recalled. Questions whose gold result is short (up to ``max_rows``
+    rows, ``max_cells`` cells, ``max_answer`` characters) and non-empty."""
+    domain = 'spider_memory'
+    base = RAW / 'agentic-20260927/spider/official/spider_data'
+    splits = {'train': [*json.load((base / 'train_spider.json').open()),
+                        *json.load((base / 'train_others.json').open())],
+              'validation': json.load((base / 'dev.json').open())}
+    writer = Writer(output, domain)
+    stored: dict[str, dict[str, list[dict]] | None] = {}
+    for split, rows in splits.items():
+        for index, row in enumerate(rows):
+            db_id = row['db_id']
+            path = base / 'database' / db_id / f'{db_id}.sqlite'
+            if db_id not in stored:
+                con = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+                con.text_factory = _lenient
+                size = sum(len(repr(tuple(r))) for (t,) in con.execute(
+                    "select name from sqlite_master where type='table'")
+                    for r in con.execute(f'select * from "{t}"'))
+                con.close()
+                stored[db_id] = (database_records(domain, db_id, path, full_rows=10 ** 9,
+                                                  sample_rows=0, value_limit=0)
+                                 if size <= max_chars else None)
+            db = stored[db_id]
+            if db is None:
+                writer.filters_for(split).reject('database_too_large')
+                continue
+            result = run_sql(path, row['query'])
+            cells = [v for r in (result or []) for v in r]
+            answer = '; '.join(', '.join(str(v) for v in r) for r in (result or []))
+            if (not result or len(result) > max_rows or len(cells) > max_cells
+                    or any(v is None for v in cells) or len(answer) > max_answer):
+                writer.filters_for(split).reject('answer_not_short')
+                continue
+            used = _tables_in(row['query'], set(db)) or list(db)
+            required = [r for t in used for r in db[t]]
+            everything = [r for rs in db.values() for r in rs]
+            query = (f'Use the stored contents of database {db_id}. Answer the question with '
+                     f'the values only.\nQuestion: {clean(row["question"])}')
+            item = task_episode(domain, split, f'{split}-{index}', query, answer, required, required,
+                                {'type': 'values', 'rows': [list(r) for r in result]},
+                                'stored_table_qa', db_id=db_id)
+            writer.add(split, item, everything)
+    kept = {k: v for k, v in stored.items() if v is not None}
+    return writer.close({'domain': domain, 'max_chars': max_chars, 'databases_stored': len(kept),
+                         'database_records': sum(len(r) for d in kept.values() for r in d.values())})
+
+
 # -- knights and knaves ---------------------------------------------------------
 RULES = ('Knights and knaves: every inhabitant is either a knight, who always tells the '
          'truth, or a knave, who always lies. To solve a puzzle, assume a role for one '
@@ -299,6 +363,11 @@ def main() -> None:
         s.add_argument('--full-rows', type=int, default=60)
         s.add_argument('--sample-rows', type=int, default=8)
         s.add_argument('--value-limit', type=int, default=40)
+    m = sub.add_parser('spider-memory')
+    m.add_argument('--max-chars', type=int, default=60000)
+    m.add_argument('--max-rows', type=int, default=5)
+    m.add_argument('--max-cells', type=int, default=6)
+    m.add_argument('--max-answer', type=int, default=160)
     k = sub.add_parser('knights')
     k.add_argument('--examples', type=int, default=20)
     k.add_argument('--seed', type=int, default=0)
@@ -307,6 +376,9 @@ def main() -> None:
     args = parser.parse_args()
     if args.dataset == 'xlam':
         manifest = xlam(args.output, args.validation)
+    elif args.dataset == 'spider-memory':
+        manifest = spider_memory(args.output, max_chars=args.max_chars, max_rows=args.max_rows,
+                                 max_cells=args.max_cells, max_answer=args.max_answer)
     elif args.dataset == 'knights':
         manifest = knights(args.output, args.examples, args.seed)
     else:

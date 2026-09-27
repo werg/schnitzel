@@ -212,6 +212,19 @@ R5d5's routing addresses (queries), cached offline. Gate: retrieval recall with
 distilled keys on R5d5's validation sites close to R5d5's (0.94 union at
 checkpoint 1000).
 
+*Several, diverse queries per read site (owner, 27 September).* R5 queried every
+space at two of its three loop boundaries (8 queries per read site) but nothing
+kept those queries apart, so later loops could repeat the first query. From B5 on:
+(1) one query per loop boundary and space plus 2 query heads per space, later
+loops conditioned on what was read (multi-hop bridges); (2) coverage over
+repetition - within a site, a record already retrieved by an earlier query gets a
+discounted gate in the combiner, and the query set is trained on union recall of a
+sufficient group; (3) a margin-hinged repulsion between one site's query vectors;
+(4) exploration while training (Gumbel-perturbed top-k, an entropy floor on each
+query's routing), annealed off; (5) tasks that need several reads (multi-hop QA,
+SQL schema + values + evidence, per-step agent reads, B9 rounds). Tracked:
+distinct records per site, union recall, pairwise query similarity.
+
 **B6 — Reads.** A read passes the retrieved records' rep sequences and their
 gates through the combiner (B7), whose variable-length output span is spliced
 into the read workspace at the loop boundary, instead of the MLP reader's fixed

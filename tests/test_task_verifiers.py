@@ -1,7 +1,7 @@
 import sqlite3
 
 from sdkb.task_verifiers import (call_match, code_match, extract_block, knights_knaves_match,
-                                 sql_match)
+                                 sql_match, value_match)
 
 
 def test_call_match_is_an_unordered_multiset():
@@ -52,3 +52,11 @@ def test_knights_knaves_parses_each_role():
 def test_extract_block_prefers_the_language_fence():
     assert extract_block('x\n```python\nprint(1)\n```\n```sql\nselect 1\n```', 'sql') == 'select 1'
     assert extract_block('select 2', 'sql') == 'select 2'
+
+
+def test_value_match_needs_every_value_in_a_short_answer():
+    rows = [['Paris', 3.0], ['Lyon', 1.25]]
+    assert value_match('Paris (3) and Lyon (1.25)', rows)
+    assert not value_match('Paris (3)', rows)
+    assert not value_match('Paris 3 Lyon 1.25 ' + 'x ' * 80, rows)
+    assert value_match('It is 42.', [[42]])

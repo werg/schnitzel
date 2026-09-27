@@ -11,7 +11,8 @@ parsing failures count as wrong, never as errors.
   limit; result rows compared as multisets (order-insensitive, as BIRD scores);
 - code: the candidate written to ``solution.py`` beside the task's pytest file,
   or run on stdin/stdout cases, in a subprocess with a time limit;
-- Knights and Knaves: every inhabitant's role parsed from the text.
+- Knights and Knaves: every inhabitant's role parsed from the text;
+- answers from memory: every expected value appears in a short answer.
 """
 from __future__ import annotations
 
@@ -111,6 +112,7 @@ def extract_block(text: str, language: str) -> str:
 def run_sql(db_path: Path, sql: str, timeout: float = 10.0):
     """Rows of ``sql`` on a read-only connection, or ``None`` on error or timeout."""
     con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    con.text_factory = lambda raw: raw.decode('utf-8', 'replace')
     deadline = time.monotonic() + timeout
     con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
     try:
@@ -172,3 +174,25 @@ def knights_knaves_match(prediction: str, names: list[str], solution: list[bool]
         if not found or (found[-1].lower() == 'knight') != knight:
             return False
     return True
+
+
+def _norm(value) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, float):
+        return f'{value:.4g}'
+    return re.sub(r'\s+', ' ', str(value)).strip().lower()
+
+
+def value_match(prediction: str, rows: list[list], slack: int = 40) -> bool:
+    """Every expected cell appears in the answer, which may be at most about three
+    times the length of the expected values (listing everything is not an answer).
+    Numbers match numerically (integers exactly, others to 4 significant digits)."""
+    cells = [_norm(v) for row in rows for v in row if v is not None]
+    if not cells:
+        return False
+    text = re.sub(r'\s+', ' ', prediction).strip().lower()
+    if len(text) > 3 * sum(len(c) for c in cells) + slack:
+        return False
+    numbers = {_norm(float(n)) for n in re.findall(r'-?\d+(?:\.\d+)?', text)}
+    return all(c in text or c in numbers for c in cells)
