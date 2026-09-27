@@ -35,7 +35,9 @@ Evaluation on validation episodes (gates at the current policy, no feedback
 record): answer and reconstruction NLL for no context, full gold text, teacher
 span, the gold records' teacher spans concatenated, the combiner over golds, over
 golds + related, and over related only (gold removed), as captured fractions of
-the full-text gain. Training-only; runs in ``sdkb-bgkit``.
+the full-text gain; and matched controls built from the next episode
+(``teacher_shuffled``, ``comb_shuffled``). A trained span can lower NLL by format
+alone, so ``content_nats`` (shuffled minus actual) is the measure of content. Training-only; runs in ``sdkb-bgkit``.
 """
 from __future__ import annotations
 
@@ -272,6 +274,9 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> d
                     'comb_gold_related': [comb.combine(ex, g) for ex, g in zip(full, g_full)],
                     'comb_related_only': [comb.combine(ex, g) if ex['records'] else
                                           ex['target_reps'][:0] for ex, g in zip(rel, g_rel)]}
+                # matched controls: the same kind of span built from the next episode
+                spans['teacher_shuffled'] = spans['teacher'][1:] + spans['teacher'][:1]
+                spans['comb_shuffled'] = spans['comb_gold'][1:] + spans['comb_gold'][:1]
                 for part in ('recon', 'qa'):
                     views = [ex[part] for ex in full]
                     arms = {'noctx': model.read(views, None), 'full': model.read(views, None, True)}
@@ -286,7 +291,12 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> d
             gain = max(nll['noctx'] - nll['full'], 1e-9)
             result[part] = {'nll': {k: round(v, 4) for k, v in nll.items()},
                             'captured': {k: round((nll['noctx'] - v) / gain, 4)
-                                         for k, v in nll.items() if k not in ('noctx', 'full')}}
+                                         for k, v in nll.items() if k not in ('noctx', 'full')},
+                            'content_nats': {
+                                'teacher': round(nll['teacher_shuffled'] - nll['teacher'], 4),
+                                'comb_gold': round(nll['comb_shuffled'] - nll['comb_gold'], 4),
+                                'comb_gold_related': round(nll['comb_shuffled']
+                                                           - nll['comb_gold_related'], 4)}}
         out[tag] = result
     return out
 

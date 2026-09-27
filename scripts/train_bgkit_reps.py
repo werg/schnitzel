@@ -553,7 +553,11 @@ def qa_step(model: Model, episodes: QAEpisodes, rows, weights: dict, rng: random
 def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
                 batch_size: int = 8) -> dict:
     """Answer NLL reading: nothing, the gold text, the gold records' teacher spans, the
-    writer's free-running spans of the golds, and of golds plus related records."""
+    writer's free-running spans of the golds, and of golds plus related records; and
+    the matched controls ``*_shuffled``, the same kind of spans of the *next* episode
+    in the batch. A trained span can lower the answer NLL by format alone (the
+    no-context arm has no slot at all), so content is the gain over its shuffled
+    control (``content_nats``)."""
     out = {}
     for tag in ('s0', 's2'):
         sums: dict[str, float] = {}
@@ -567,8 +571,9 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
             with model.core.autocast():
                 arms['noctx'] = model.read(views, None)
                 arms['full'] = model.read(views, None, True)
-                arms['teacher'] = model.read(
-                    views, [torch.cat([r['teacher'] for r in recs]) for recs, _ in gold])
+                teacher = [torch.cat([r['teacher'] for r in recs]) for recs, _ in gold]
+                arms['teacher'] = model.read(views, teacher)
+                arms['teacher_shuffled'] = model.read(views, teacher[1:] + teacher[:1])
                 for name, group in (('student_free', gold), ('student_free_related', mixed)):
                     records = [r for recs, _ in group for r in recs]
                     free, _ = model.free_run(records, [r['teacher'].shape[0] for r in records])
@@ -577,6 +582,8 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
                         spans.append(torch.cat(free[pos:pos + len(recs)]))
                         pos += len(recs)
                     arms[name] = model.read(views, spans)
+                    if name == 'student_free':
+                        arms['student_free_shuffled'] = model.read(views, spans[1:] + spans[:1])
             for name, (logits, targets) in arms.items():
                 sums[name] = sums.get(name, 0.0) + F.cross_entropy(
                     logits, targets, reduction='sum').item()
@@ -585,7 +592,11 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
         gain = max(nll['noctx'] - nll['full'], 1e-9)
         out[f'qa/{tag}'] = {'nll': {k: round(v, 4) for k, v in nll.items()},
                             'captured': {k: round((nll['noctx'] - v) / gain, 4)
-                                         for k, v in nll.items() if k not in ('noctx', 'full')}}
+                                         for k, v in nll.items() if k not in ('noctx', 'full')},
+                            'content_nats': {
+                                'teacher': round(nll['teacher_shuffled'] - nll['teacher'], 4),
+                                'student_free': round(nll['student_free_shuffled']
+                                                      - nll['student_free'], 4)}}
     return out
 
 
