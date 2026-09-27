@@ -20,6 +20,10 @@ trained codecs, s0 from the s1 codec). Per R6 episode and a random space s:
 Losses: cosine to the target reps; functional through the frozen S2 decoder
 reading the combiner span: reconstruction of the joined gold texts and the
 episode's answer to its question (NLL), each with KL to reading the teacher span.
+The teacher is weak at QA (question-free encodings), so once the feedback record
+is gone the distillation terms (cosine and both KLs) decay to ``--distill-floor``
+of their weight over ``--distill-decay`` steps and the task NLLs drive the
+combiner past its teacher.
 
 Evaluation on validation episodes (gates at the current policy, no feedback
 record): answer and reconstruction NLL for no context, full gold text, teacher
@@ -180,21 +184,31 @@ def _feedback(args, step: int) -> float:
     return max(0.0, 1.0 - (step - args.feedback_hold) / max(args.feedback_end - args.feedback_hold, 1))
 
 
-def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_gate: float) -> dict:
+def _distill(args, step: int) -> float:
+    """Weight factor of the distillation terms: 1 until the feedback record is gone,
+    then linearly down to ``--distill-floor`` over ``--distill-decay`` steps."""
+    if step < args.feedback_end:
+        return 1.0
+    done = min(1.0, (step - args.feedback_end) / max(args.distill_decay, 1))
+    return 1.0 - done * (1.0 - args.distill_floor)
+
+
+def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_gate: float,
+               distill: float = 1.0) -> dict:
     model = comb.model
     with model.core.autocast():
         gates, bce = comb.gates(examples, learned, related_gate)
         outs = [comb.combine(ex, g) for ex, g in zip(examples, gates)]
         teacher = [ex['target_reps'] for ex in examples]
         cos = 1 - F.cosine_similarity(torch.cat(outs), torch.cat(teacher), dim=-1).mean()
-        result, loss = {'cos': cos.item()}, weights['cos'] * cos
+        result, loss = {'cos': cos.item()}, distill * weights['cos'] * cos
         for part in ('recon', 'qa'):
             views = [ex[part] for ex in examples]
             logits, targets = model.read(views, outs)
             with torch.no_grad():
                 t_logits, _ = model.read(views, teacher)
             nll, kl = F.cross_entropy(logits, targets), _kl(logits, t_logits)
-            loss = loss + weights[f'{part}_nll'] * nll + weights[f'{part}_kl'] * kl
+            loss = loss + weights[f'{part}_nll'] * nll + distill * weights[f'{part}_kl'] * kl
             result[f'{part}_nll'], result[f'{part}_kl'] = nll.item(), kl.item()
         if bce is not None:
             loss = loss + weights['gate'] * bce
@@ -268,6 +282,8 @@ def main() -> None:
     parser.add_argument('--feedback-hold', type=int, default=500)
     parser.add_argument('--feedback-end', type=int, default=4000)
     parser.add_argument('--learned-gates-from', type=int, default=4000)
+    parser.add_argument('--distill-floor', type=float, default=0.1)
+    parser.add_argument('--distill-decay', type=int, default=2000)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--warmup', type=int, default=200)
     parser.add_argument('--weights', default='cos=1,recon_nll=1,recon_kl=1,qa_nll=1,qa_kl=1,gate=0.5')
@@ -324,7 +340,8 @@ def main() -> None:
                                feedback=feedback)
                     for row in rng.sample(train.rows, args.batch_size)]
         optimizer.zero_grad(set_to_none=True)
-        result = train_step(comb, examples, weights, learned, args.related_gate)
+        distill = _distill(args, step)
+        result = train_step(comb, examples, weights, learned, args.related_gate, distill)
         torch.nn.utils.clip_grad_norm_(comb.parameters(), 1.0)
         optimizer.step()
         schedule.step()
@@ -334,6 +351,7 @@ def main() -> None:
         if step % args.log_every == 0:
             log({'step': step, **{k: round(v / args.log_every, 4) for k, v in window.items()},
                  'feedback_gate': round(feedback, 3), 'learned_gates': learned,
+                 'distill': round(distill, 3),
                  'elapsed_s': round(time.time() - started)})
             window = {}
         if step % args.eval_every == 0 or step == args.steps:

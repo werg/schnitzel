@@ -33,6 +33,13 @@ weights and trains the whole decoder. Whenever the adapter acts outside spans or
 the decoder is unfrozen, a replay KL to a frozen S2 copy on plain corpus text and
 on reading teacher reps keeps S2's behaviour (``replay`` weight).
 
+QA over memory (``--qa-fraction``, owner decision 27 September): per R6 episode
+the writer writes each gold record (and ``--qa-related`` semantically related
+records) under the memory prompt without seeing the question, and the reader
+answers the question from those spans in order. The only loss on the answer is
+its NLL - no distillation target, since BGKit's question-free encodings are weak
+at QA - so gradients reach the writer, and the reader too once the gate opens.
+
 Evaluation on held-out bank sources at each space ratio and on BGKit's eval
 stores at x4/x16/x64: task NLL with no context, full text, teacher reps, student
 teacher-forced reps and student free-running reps (fed back, teacher length), the
@@ -203,6 +210,17 @@ class Model:
         with self.gate.active(weights):
             return dec._hidden(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
 
+    def question_instr(self, query: str) -> torch.Tensor:
+        """Decoder instruction after a context slot: the question, then the answer turn."""
+        from bgkit2.data.templates import decoder_sentinel
+        sent_str, sent_id = decoder_sentinel(self.tok)
+        ids = self.tok.apply_chat_template(
+            [{'role': 'user', 'content': f'Context:\n{sent_str}\n{query}'}],
+            add_generation_prompt=True, tokenize=True)
+        if hasattr(ids, 'input_ids'):
+            ids = ids['input_ids']
+        return torch.tensor(ids[ids.index(sent_id) + 1:])
+
     def text_ids(self, text: str, limit: int = 1024) -> torch.Tensor:
         return torch.tensor(self.tok(text, add_special_tokens=False)['input_ids'][:limit])
 
@@ -352,30 +370,130 @@ def _subset(total: int, limit: int, device) -> torch.Tensor:
     return torch.randperm(total, device=device)[:limit]
 
 
+def _rollout(model: Model, examples, passes: int, sample: float):
+    """Writer forward on the teacher-fed span with a fraction ``sample`` of inputs
+    replaced by the writer's own previous-pass reps (detached, ``passes`` passes);
+    gradients flow through the final pass. Returns teacher reps, predicted reps and
+    the cosine and stop losses."""
+    writer = model.writer
+    teacher_feed = [ex['teacher'].to(model.device).float() for ex in examples]
+    feed = teacher_feed
+    if passes and sample > 0:
+        own = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
+        for _ in range(passes):
+            with torch.no_grad():
+                states = model.write(examples, feed)
+                preds = [writer.rep(h[:-1]) for h in states]
+            feed = [torch.where(m, p, t) for m, p, t in zip(own, preds, teacher_feed)]
+    # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop
+    full = model.write(examples, feed)
+    counts = [t.shape[0] for t in teacher_feed]
+    preds = [writer.rep(h[:-1]) for h in full]
+    cos = 1 - F.cosine_similarity(torch.cat(preds), torch.cat(teacher_feed), dim=-1).mean()
+    stop = F.cross_entropy(writer.stop(torch.cat(full).float()),
+                           span_targets(counts, model.device))
+    return teacher_feed, preds, cos, stop
+
+
+class QAEpisodes:
+    """R6 episodes whose gold (and related) records the writer writes for QA reads."""
+
+    def __init__(self, path: Path, cache: TeacherCache, neighbors: Path | None):
+        self.cache = cache
+        self.items = {item[2]: item for item in cache.items}
+        self.rows = [row for row in (json.loads(line) for line in path.open(encoding='utf-8'))
+                     if all(r in self.items for r in row['required_ids'])]
+        self.neighbors, self.index, self.ids = None, None, None
+        if neighbors is not None:
+            data = torch.load(neighbors, weights_only=False)
+            self.neighbors, self.ids = data['neighbors'], data['record_ids']
+            self.index = {record_id: i for i, record_id in enumerate(self.ids)}
+
+    def build(self, model: Model, row: dict, tag: str, rng: random.Random, related: int):
+        golds = list(row['required_ids'])
+        entries = golds[:]
+        if related and self.neighbors is not None:
+            pool = [self.ids[j] for r in golds for j in self.neighbors[self.index[r]].tolist()]
+            pool = [r for r in dict.fromkeys(pool) if r not in golds]
+            for record_id in rng.sample(pool, min(related, len(pool))):
+                entries.insert(rng.randint(0, len(entries)), record_id)
+        records = [_example(self.cache, model, self.items[r], tag) for r in entries]
+        joined = model.text_ids('\n\n'.join(self.cache.texts[self.items[r][4]] for r in golds))
+        answer = torch.tensor(model.tok(' ' + row['answer'].strip(),
+                                        add_special_tokens=False)['input_ids'][:64])
+        view = {'ids': joined, 'target': answer, 'task': 'reconstruct',
+                'instr': model.question_instr(row['query'])}
+        return records, view
+
+
+def qa_step(model: Model, episodes: QAEpisodes, rows, weights: dict, rng: random.Random,
+            related: int, passes: int, sample: float) -> dict:
+    """Writer writes the records (question-free); the reader answers from them."""
+    tag = rng.choice(SPACES)
+    built = [episodes.build(model, row, tag, rng, related) for row in rows]
+    records = [record for recs, _ in built for record in recs]
+    with model.core.autocast():
+        _, preds, cos, stop = _rollout(model, records, passes, sample)
+        spans, start = [], 0
+        for recs, _ in built:
+            spans.append(torch.cat(preds[start:start + len(recs)]))
+            start += len(recs)
+        logits, targets = model.read([view for _, view in built], spans)
+        nll = F.cross_entropy(logits, targets)
+        loss = weights['qa'] * nll + weights['cos'] * cos + weights['stop'] * stop
+    loss.backward()
+    return {'loss': loss.item(), 'qa_nll': nll.item(), 'cos': cos.item(), 'stop': stop.item(),
+            'records': len(records)}
+
+
+@torch.no_grad()
+def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
+                batch_size: int = 8) -> dict:
+    """Answer NLL reading: nothing, the gold text, the gold records' teacher spans, the
+    writer's free-running spans of the golds, and of golds plus related records."""
+    out = {}
+    for tag in ('s0', 's2'):
+        sums: dict[str, float] = {}
+        tokens = 0
+        for start in range(0, len(rows), batch_size):
+            batch = rows[start:start + batch_size]
+            gold = [episodes.build(model, row, tag, random.Random(5), 0) for row in batch]
+            mixed = [episodes.build(model, row, tag, random.Random(5), related) for row in batch]
+            views = [view for _, view in gold]
+            arms = {}
+            with model.core.autocast():
+                arms['noctx'] = model.read(views, None)
+                arms['full'] = model.read(views, None, True)
+                arms['teacher'] = model.read(
+                    views, [torch.cat([r['teacher'] for r in recs]) for recs, _ in gold])
+                for name, group in (('student_free', gold), ('student_free_related', mixed)):
+                    records = [r for recs, _ in group for r in recs]
+                    free, _ = model.free_run(records, [r['teacher'].shape[0] for r in records])
+                    spans, pos = [], 0
+                    for recs, _ in group:
+                        spans.append(torch.cat(free[pos:pos + len(recs)]))
+                        pos += len(recs)
+                    arms[name] = model.read(views, spans)
+            for name, (logits, targets) in arms.items():
+                sums[name] = sums.get(name, 0.0) + F.cross_entropy(
+                    logits, targets, reduction='sum').item()
+            tokens += int(arms['noctx'][1].numel())
+        nll = {name: value / tokens for name, value in sums.items()}
+        gain = max(nll['noctx'] - nll['full'], 1e-9)
+        out[f'qa/{tag}'] = {'nll': {k: round(v, 4) for k, v in nll.items()},
+                            'captured': {k: round((nll['noctx'] - v) / gain, 4)
+                                         for k, v in nll.items() if k not in ('noctx', 'full')}}
+    return out
+
+
 def train_step(model: Model, examples, weights: dict, passes: int = 0,
                sample: float = 0.0, replay_tokens: int = 1024) -> dict:
     """One step. ``passes`` > 0 with ``sample`` > 0 trains on the writer's own reps: a
     fixed random fraction ``sample`` of span inputs is replaced by the previous pass's
     predictions (detached); gradients flow through the final pass."""
-    writer = model.writer
-    teacher_feed = [ex['teacher'].to(model.device).float() for ex in examples]
-    feed = teacher_feed
     with model.core.autocast():
-        if passes and sample > 0:
-            own = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
-            for _ in range(passes):
-                with torch.no_grad():
-                    states = model.write(examples, feed)
-                    preds = [writer.rep(h[:-1]) for h in states]
-                feed = [torch.where(m, p, t) for m, p, t in zip(own, preds, teacher_feed)]
-        # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop
-        full = model.write(examples, feed)
-        counts = [t.shape[0] for t in teacher_feed]
-        preds = [writer.rep(h[:-1]) for h in full]
+        teacher_feed, preds, cos, stop = _rollout(model, examples, passes, sample)
         pred = torch.cat(preds)
-        cos = 1 - F.cosine_similarity(pred, torch.cat(teacher_feed), dim=-1).mean()
-        stop_logits = writer.stop(torch.cat(full).float())
-        stop = F.cross_entropy(stop_logits, span_targets(counts, model.device))
         logits, targets = model.read(examples, preds)
         nll = F.cross_entropy(logits, targets)
         with torch.no_grad():
@@ -504,8 +622,16 @@ def main() -> None:
                         'whole decoder trains (needs the gate fully open)')
     parser.add_argument('--decoder-lr', type=float, default=1e-5)
     parser.add_argument('--replay-tokens', type=int, default=1024)
+    parser.add_argument('--qa-episodes', type=Path, help='R6 train episodes for QA over memory')
+    parser.add_argument('--qa-eval-episodes', type=Path)
+    parser.add_argument('--qa-fraction', type=float, default=0.0)
+    parser.add_argument('--qa-batch', type=int, default=12)
+    parser.add_argument('--qa-related', type=int, default=2)
+    parser.add_argument('--qa-eval-items', type=int, default=96)
+    parser.add_argument('--neighbors', type=Path)
     args = parser.parse_args()
     weights = {k: float(v) for k, v in (pair.split('=') for pair in args.weights.split(','))}
+    weights.setdefault('qa', 1.0)
 
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
@@ -519,6 +645,17 @@ def main() -> None:
                                          args.classical_ctx_max, args.seed)
     evald = _classical_dataset(model, data.eval_stores, None, 256, 10_007, args.classical_eval)
     classical_eval = [evald[i] for i in range(len(evald))]
+    qa_train = qa_eval = None
+    if args.qa_fraction > 0:
+        qa_train = QAEpisodes(args.qa_episodes, cache, args.neighbors)
+        qa_eval = QAEpisodes(args.qa_eval_episodes, cache, args.neighbors)
+        qa_eval_rows = sorted(qa_eval.rows, key=lambda row: row['episode_id'])[:args.qa_eval_items]
+
+    def run_eval():
+        result = evaluate(model, cache, heldout, classical_eval, args.classical_batch)
+        if qa_eval is not None:
+            result.update(evaluate_qa(model, qa_eval, qa_eval_rows, args.qa_related))
+        return result
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'writer.pt'
     step = 0
@@ -555,13 +692,15 @@ def main() -> None:
         print(json.dumps(record), flush=True)
 
     if step == 0:
-        log({'step': 0, 'eval': evaluate(model, cache, heldout, classical_eval,
-                                         args.classical_batch)})
+        log({'step': 0, 'eval': run_eval()})
     batches = _batches(train, rng, args.batch_size, args.batch_tokens)
     window: dict[str, float] = {}
     started = time.time()
     while step < args.steps:
-        if rng.random() < args.classical_fraction:
+        draw = rng.random()
+        if qa_train is not None and draw >= 1 - args.qa_fraction:
+            stream = 'qa'
+        elif draw < args.classical_fraction:
             samples, budget = [], args.batch_tokens
             while len(samples) < args.classical_batch:
                 sample = classical_train[rng.randrange(len(classical_train))]
@@ -583,8 +722,12 @@ def main() -> None:
             optimizer, schedule = build_optimizer(0)  # fresh warmup for the whole decoder
             log({'step': step, 'event': 'merged; training the whole decoder'})
         sample = args.sample_max * min(1.0, step / max(args.sample_ramp, 1))
-        result = train_step(model, examples, weights, args.rollout_passes, sample,
-                            args.replay_tokens)
+        if stream == 'qa':
+            result = qa_step(model, qa_train, rng.sample(qa_train.rows, args.qa_batch), weights,
+                             rng, rng.randint(0, args.qa_related), args.rollout_passes, sample)
+        else:
+            result = train_step(model, examples, weights, args.rollout_passes, sample,
+                                args.replay_tokens)
         torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
                                        1.0)
         optimizer.step()
@@ -603,8 +746,7 @@ def main() -> None:
             torch.save({**model.trained_state(), 'optimizer': optimizer.state_dict(),
                         'step': step}, state_path.with_suffix('.pending'))
             state_path.with_suffix('.pending').replace(state_path)
-            log({'step': step, 'eval': evaluate(model, cache, heldout, classical_eval,
-                                                args.classical_batch)})
+            log({'step': step, 'eval': run_eval()})
 
 
 if __name__ == '__main__':
