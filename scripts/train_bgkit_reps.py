@@ -49,6 +49,7 @@ captured fraction of the full-text gain, and the free-running stop-length error.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import json
@@ -225,10 +226,108 @@ class Model:
         return torch.tensor(self.tok(text, add_special_tokens=False)['input_ids'][:limit])
 
     # -- writer ---------------------------------------------------------
-    def write(self, examples, feed: list[torch.Tensor]):
+    @torch.no_grad()
+    def prefix(self, examples) -> dict:
+        """Run each write's prompt and source once and keep what a span continuation
+        needs: per attention layer the keys and values, per convolution layer the
+        last ``L_cache - 1`` convolution inputs (B * x) at each row's own end.
+
+        Valid only while nothing trainable acts on the prefix (write adapter closed
+        outside spans, decoder not merged): ``_rollout`` falls back otherwise."""
+        inner = self.decoder.base_lm.model
+        ids = []
+        for ex in examples:
+            pre, post = self.prompts[ex['prompt']]
+            ids.append(torch.cat([pre, ex['ids'], post]))
+        lengths = torch.tensor([x.shape[0] for x in ids], device=self.device)
+        batch = torch.full((len(ids), int(lengths.max())), self.tpl.pad_id, dtype=torch.long)
+        mask = torch.zeros(batch.shape, dtype=torch.long)
+        for i, x in enumerate(ids):
+            batch[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
+        batch, mask = batch.to(self.device), mask.to(self.device)
+        conv, hooks = {}, []
+        rows = torch.arange(len(ids), device=self.device)
+        for index, layer in enumerate(inner.layers):
+            if layer.is_attention_layer:
+                continue
+            keep = layer.conv.L_cache - 1
+
+            def capture(module, inputs, output, index=index, keep=keep):
+                b, _, x = output.chunk(3, dim=-1)
+                bx = b * x
+                at = lengths[:, None] - keep + torch.arange(keep, device=self.device)[None]
+                conv[index] = bx[rows[:, None], at]
+            hooks.append(layer.conv.in_proj.register_forward_hook(capture))
+        try:
+            with self.core.autocast():
+                out = inner(inputs_embeds=self.decoder.embed(batch), attention_mask=mask,
+                            use_cache=True)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        cache = out.past_key_values
+        kv = {index: (cache.layers[index].keys, cache.layers[index].values)
+              for index, layer in enumerate(inner.layers) if layer.is_attention_layer}
+        return {'lengths': lengths, 'mask': mask.bool(), 'kv': kv, 'conv': conv}
+
+    def span_hidden(self, prefix: dict, spans: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Final hidden states of span inputs continuing each row's cached prefix
+        (LFM2 layer maths replicated: RMS norms, attention with RoPE at each row's own
+        offset over prefix + causal span keys, short causal convolutions seeded with
+        the prefix's last inputs). The write adapter is active on every span position."""
+        from transformers.models.lfm2.modeling_lfm2 import apply_rotary_pos_emb
+        inner = self.decoder.base_lm.model
+        embed = self.decoder.embed_tokens.weight
+        size = [x.shape[0] for x in spans]
+        width = max(size)
+        x = torch.zeros(len(spans), width, embed.shape[1], device=self.device, dtype=embed.dtype)
+        for i, span in enumerate(spans):
+            x[i, :span.shape[0]] = span.to(x.dtype)
+        position = prefix['lengths'][:, None] + torch.arange(width, device=self.device)[None]
+        cos, sin = inner.rotary_emb(x, position_ids=position)
+        causal = torch.ones(width, width, dtype=torch.bool, device=self.device).tril()
+        allowed = torch.cat([prefix['mask'][:, None, None, :].expand(-1, 1, width, -1),
+                             causal[None, None].expand(len(spans), 1, -1, -1)], dim=-1)
+        scope = (self.gate.active(torch.ones(len(spans), width, 1, device=self.device))
+                 if self.gate is not None else contextlib.nullcontext())
+        with scope:
+            for index, layer in enumerate(inner.layers):
+                residual, h = x, layer.operator_norm(x)
+                if layer.is_attention_layer:
+                    att = layer.self_attn
+                    shape = (len(spans), width, -1, att.head_dim)
+                    q = att.q_layernorm(att.q_proj(h).view(shape)).transpose(1, 2)
+                    k = att.k_layernorm(att.k_proj(h).view(shape)).transpose(1, 2)
+                    v = att.v_proj(h).view(shape).transpose(1, 2)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                    pk, pv = prefix['kv'][index]
+                    k = torch.cat([pk.to(k.dtype), k], dim=2)
+                    v = torch.cat([pv.to(v.dtype), v], dim=2)
+                    o = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed,
+                                                       scale=att.scaling, enable_gqa=True)
+                    h = att.out_proj(o.transpose(1, 2).reshape(len(spans), width, -1))
+                else:
+                    conv = layer.conv
+                    b, c, xx = conv.in_proj(h).chunk(3, dim=-1)
+                    keep = conv.L_cache - 1
+                    z = torch.cat([prefix['conv'][index].to(b.dtype), b * xx], dim=1)
+                    out = conv.conv(z.transpose(1, 2))[..., keep:keep + width]
+                    h = conv.out_proj((c.transpose(1, 2) * out).transpose(1, 2))
+                x = h + residual
+                x = x + layer.feed_forward(layer.ffn_norm(x))
+            x = inner.embedding_norm(x)
+        return [x[i, :n] for i, n in enumerate(size)]
+
+    def write(self, examples, feed: list[torch.Tensor], prefix: dict | None = None):
         """Writer forward with ``feed`` reps as span inputs (teacher- or self-fed).
 
-        Returns per example the span-position hidden states (marker, feed_1..)."""
+        Returns per example the span-position hidden states (marker, feed_1..). With a
+        ``prefix`` (``Model.prefix``) only the span positions are computed."""
+        if prefix is not None:
+            spans = [torch.cat([self.writer.marker_embedding(
+                torch.tensor(ex['factor'], device=self.device)).unsqueeze(0),
+                fed.to(self.device).float()]) for ex, fed in zip(examples, feed)]
+            return self.span_hidden(prefix, spans)
         embed = self.decoder.embed_tokens
         seqs, starts = [], []
         for ex, fed in zip(examples, feed):
@@ -254,15 +353,16 @@ class Model:
         reps = [torch.zeros(0, self.decoder.embed_tokens.weight.shape[1], device=self.device)
                 for _ in examples]
         stops = [None] * len(examples)
+        prefix = None if self.replaying else self.prefix(examples)
         for step in range(max(lengths)):
-            hidden = self.write(examples, reps)
+            hidden = self.write(examples, reps, prefix)
             for i, h in enumerate(hidden):
                 last = h[-1:]
                 if stops[i] is None and self.writer.stop(last.float()).argmax(-1).item() == 1:
                     stops[i] = step
                 if step < lengths[i]:
                     reps[i] = torch.cat([reps[i], self.writer.rep(last)])
-        for i, h in enumerate(self.write(examples, reps)):
+        for i, h in enumerate(self.write(examples, reps, prefix)):
             if stops[i] is None and self.writer.stop(h[-1:].float()).argmax(-1).item() == 1:
                 stops[i] = reps[i].shape[0]
         return reps, stops
@@ -378,15 +478,18 @@ def _rollout(model: Model, examples, passes: int, sample: float):
     writer = model.writer
     teacher_feed = [ex['teacher'].to(model.device).float() for ex in examples]
     feed = teacher_feed
+    # the prompt and source are computed once and only span positions per pass, while
+    # nothing trainable acts outside spans (their states then need no gradient)
+    prefix = None if model.replaying else model.prefix(examples)
     if passes and sample > 0:
         own = [torch.rand(t.shape[0], 1, device=model.device) < sample for t in teacher_feed]
         for _ in range(passes):
             with torch.no_grad():
-                states = model.write(examples, feed)
+                states = model.write(examples, feed, prefix)
                 preds = [writer.rep(h[:-1]) for h in states]
             feed = [torch.where(m, p, t) for m, p, t in zip(own, preds, teacher_feed)]
     # k+1 states (marker, R_1..R_k): the first k predict R_1..R_k, all k+1 emit/stop
-    full = model.write(examples, feed)
+    full = model.write(examples, feed, prefix)
     counts = [t.shape[0] for t in teacher_feed]
     preds = [writer.rep(h[:-1]) for h in full]
     cos = 1 - F.cosine_similarity(torch.cat(preds), torch.cat(teacher_feed), dim=-1).mean()
