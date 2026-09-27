@@ -275,7 +275,11 @@ BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
   the frozen S2 encoder's, so it stays BGKit-compatible while the memory
   write-out space drifts under end-to-end training. The x1 teacher encoding is
   bidirectional, so each output rep must plan the rest of the response; rollout
-  passes as for the writer.
+  passes as for the writer. The aim is placement on the BGKit manifold, not exact
+  reconstruction (owner, 27 September): losses weight KL to S2 reading the
+  teacher's x1 encoding and a loose cosine over a light reconstruction NLL, and
+  the gate is "a reader recovers the gist"; exactness comes from end-to-end
+  training with input and output ports connected.
 - *Schedule:* (1) measure frozen S2 reading x1 soft-token questions (no training);
   (2) input port after the B3 merge (whole decoder trains): the soft-prompt share
   of QA, summarize and memory-write prompts ramps 0 → 50% over a few thousand

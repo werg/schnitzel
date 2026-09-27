@@ -25,6 +25,12 @@ is gone the distillation terms (cosine and both KLs) decay to ``--distill-floor`
 of their weight over ``--distill-decay`` steps and the task NLLs drive the
 combiner past its teacher.
 
+``--writer-state`` (a B3 ``writer.pt``, adapter included) replaces the cached
+teacher reps of every input record by the writer's own free-running spans
+(``--writer-passes`` rollout passes on its own reps); with ``--writer-train`` the
+writer trains too, so gradients run writer -> combiner -> reader in one graph,
+the writer keeping its cosine and stop losses as an anchor (``writer`` weight).
+
 Evaluation on validation episodes (gates at the current policy, no feedback
 record): answer and reconstruction NLL for no context, full gold text, teacher
 span, the gold records' teacher spans concatenated, the combiner over golds, over
@@ -45,7 +51,8 @@ import torch.nn.functional as F
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_bgkit_reps import SPACES, Model, TeacherCache, _kl  # noqa: E402
+from train_bgkit_reps import (SPACES, Model, TeacherCache, _example, _kl,  # noqa: E402
+                              _rollout)
 
 from sdkb.bgkit_span import SpaceCodec  # noqa: E402
 
@@ -145,14 +152,30 @@ class Combiner:
         for entry in extra:
             entries.insert(rng.randint(0, len(entries)), entry)
         records = [target if kind == 'feedback' else self.record(r, tag) for kind, r in entries]
+        record_ids = [r for _, r in entries]
         ids = self.model.text_ids(episodes.cache.texts[index])
         answer = torch.tensor(self.model.tok(' ' + row['answer'].strip(),
                                              add_special_tokens=False)['input_ids'][:64])
         return {'tag': tag, 'kinds': [kind for kind, _ in entries], 'records': records,
+                'record_ids': record_ids,
                 'target_reps': target, 'feedback': feedback, 'query': row['query'],
                 'recon': {'ids': ids, 'target': ids, 'task': 'reconstruct'},
                 'qa': {'ids': ids, 'target': answer, 'task': 'reconstruct',
                        'instr': self.question_instr(row['query'])}}
+
+    def own_spans(self, examples, train: bool):
+        """Replace every source record by the writer's own free-running span of it."""
+        slots = [(i, j) for i, ex in enumerate(examples)
+                 for j, record_id in enumerate(ex['record_ids']) if record_id is not None]
+        if not slots or not self.args.writer_state:
+            return None
+        writes = [_example(self.bank, self.model, self.bank_items[examples[i]['record_ids'][j]],
+                           examples[i]['tag']) for i, j in slots]
+        with torch.set_grad_enabled(train):
+            _, preds, cos, stop = _rollout(self.model, writes, self.args.writer_passes, 1.0)
+        for (i, j), pred in zip(slots, preds):
+            examples[i]['records'][j] = pred if train else pred.detach()
+        return cos + 0.2 * stop if train else None
 
     def gates(self, examples, learned: bool, related_gate: float):
         if learned:
@@ -197,6 +220,7 @@ def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_g
                distill: float = 1.0) -> dict:
     model = comb.model
     with model.core.autocast():
+        anchor = comb.own_spans(examples, comb.args.writer_train)
         gates, bce = comb.gates(examples, learned, related_gate)
         outs = [comb.combine(ex, g) for ex, g in zip(examples, gates)]
         teacher = [ex['target_reps'] for ex in examples]
@@ -213,6 +237,9 @@ def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_g
         if bce is not None:
             loss = loss + weights['gate'] * bce
             result['gate_bce'] = bce.item()
+        if anchor is not None:
+            loss = loss + weights.get('writer', 0.5) * anchor
+            result['writer_anchor'] = anchor.item()
     loss.backward()
     return {'loss': loss.item(), **result}
 
@@ -233,6 +260,8 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> d
             rel = [comb.build(episodes, row, tag, random.Random(7), related=args.related,
                               feedback=0.0, gold=False) for row in batch]
             with model.core.autocast():
+                for group in (full, only, rel):
+                    comb.own_spans(group, False)
                 g_full, _ = comb.gates(full, learned, args.related_gate)
                 g_rel, _ = comb.gates(rel, learned, args.related_gate)
                 spans = {
@@ -274,6 +303,12 @@ def main() -> None:
     parser.add_argument('--eval-episodes', type=Path, required=True)
     parser.add_argument('--eval-cache', type=Path, required=True)
     parser.add_argument('--init-codecs', type=Path)
+    parser.add_argument('--writer-state', type=Path,
+                        help='B3 writer.pt: read the writer\'s own spans instead of teacher reps')
+    parser.add_argument('--writer-adapter-rank', type=int, default=16)
+    parser.add_argument('--writer-passes', type=int, default=4)
+    parser.add_argument('--writer-train', action='store_true')
+    parser.add_argument('--writer-lr', type=float, default=1e-4)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--steps', type=int, default=12000)
     parser.add_argument('--batch-size', type=int, default=16)
@@ -303,17 +338,27 @@ def main() -> None:
     train = Episodes(args.train_episodes, args.train_cache, bank)
     evald = Episodes(args.eval_episodes, args.eval_cache, bank)
     eval_rows = sorted(evald.rows, key=lambda row: row['episode_id'])[:args.eval_items]
-    model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
-                                     checkpoint=args.checkpoint, adapter_rank=0,
-                                     gate_open_start=-1, merge_at=-1))
+    model = Model(argparse.Namespace(
+        cuda_fraction=args.cuda_fraction, experiment=args.experiment, checkpoint=args.checkpoint,
+        adapter_rank=args.writer_adapter_rank if args.writer_state else 0,
+        gate_open_start=-1, merge_at=-1))
+    if args.writer_state:
+        model.load_trained(torch.load(args.writer_state, map_location=model.device))
     comb = Combiner(args, model, bank)
-    optimizer = torch.optim.AdamW(comb.parameters(), lr=args.lr, weight_decay=0.01)
+    groups = [{'params': comb.parameters(), 'lr': args.lr}]
+    if args.writer_train:
+        writer_args = argparse.Namespace(lr=args.writer_lr, adapter_lr=args.writer_lr,
+                                         decoder_lr=args.writer_lr / 10)
+        groups += model.param_groups(writer_args)
+    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
     args.output.mkdir(parents=True, exist_ok=True)
     state_path, step = args.output / 'combiner.pt', 0
     if state_path.exists():
         state = torch.load(state_path, map_location=model.device)
         comb.combiners.load_state_dict(state['combiners'])
         comb.gate_head.load_state_dict(state['gate_head'])
+        if 'writer' in state:
+            model.load_trained(state['writer'])
         optimizer.load_state_dict(state['optimizer'])
         step = state['step']
     start = step
@@ -342,7 +387,8 @@ def main() -> None:
         optimizer.zero_grad(set_to_none=True)
         distill = _distill(args, step)
         result = train_step(comb, examples, weights, learned, args.related_gate, distill)
-        torch.nn.utils.clip_grad_norm_(comb.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
+                                       1.0)
         optimizer.step()
         schedule.step()
         step += 1
@@ -357,6 +403,7 @@ def main() -> None:
         if step % args.eval_every == 0 or step == args.steps:
             torch.save({'combiners': comb.combiners.state_dict(),
                         'gate_head': comb.gate_head.state_dict(),
+                        **({'writer': model.trained_state()} if args.writer_train else {}),
                         'optimizer': optimizer.state_dict(), 'step': step},
                        state_path.with_suffix('.pending'))
             state_path.with_suffix('.pending').replace(state_path)
