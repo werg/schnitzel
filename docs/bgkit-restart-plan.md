@@ -351,8 +351,25 @@ so later episodes sharing rules or entities can use them.
   as warm-up and control; world-based agent trajectories (ETO / AgentInstruct /
   AgentBank for ALFWorld, WebShop, ScienceWorld), Knights & Knaves and SynLogic
   for shared-rule reasoning. Raw data under
-  `/mnt/external/sdkb-archive/raw/{agentic,worlds}-20260927/`. Next: single-pass
-  baselines of S2 on each, with and without the docs/schemas in context.
+  `/mnt/external/sdkb-archive/raw/{agentic,worlds}-20260927/`.
+- *Built corpora (`/mnt/external/sdkb-archive/corpora/tasks-<name>[-20260927]`,
+  `prepare_task_corpora.py`, `prepare_agent_corpora.py`; train/validation
+  episodes):* xlam 58000/2000; spider 8659/1034; spider-memory (whole small DBs
+  in the KB, short-answer questions) 4442/560; bird 6601/1534; knights 6060/700;
+  kodcode 68560/1381 (40k easy / 20k medium / 10k hard, pytest or stdin tests;
+  27/30 sampled gold solutions pass their tests in the container); apigen-mt
+  4725/275 (policies and tool docs in the KB, multi-turn); reasoning-gym
+  5003/549 (only rows whose LLM answer equals the oracle); synlogic 20476/306
+  (English families; verification by the SynLogic verifiers, not yet wired);
+  alfworld, scienceworld, webshop, agentinstruct, agentbank. Every domain keeps
+  a worked-example pool in its KB, disjoint from its episodes. `-bg` variants
+  add BM25-selected background passages (`add_background.py`: Wikipedia dump,
+  ConceptNet, WorldTree, Python docs) as KB records and supports.
+- *Single-pass S2 baselines (greedy, docs/schema in context; S2 vs base):*
+  Spider 13% vs 21%, BIRD ≈0–5% both, KodCode easy 2% vs 7%, xLAM 41% vs 59%.
+  Knights & Knaves S2 (plain / with worked examples): 3 people 17%/12%, 4 people
+  7%/7%, 5 people 3%/4%; base pending.
+  S2's global LoRA costs 8–20 points.
 
 **B8 — Spatial training.** Resume the bank curriculum, key table and record
 gradients on the new format, with the R6 corpus (187,813 episodes, 13 new
