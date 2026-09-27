@@ -307,6 +307,179 @@ def spider_memory(output: Path, *, max_chars: int, max_rows: int, max_cells: int
                          'database_records': sum(len(r) for d in kept.values() for r in d.values())})
 
 
+# -- code -----------------------------------------------------------------------
+def _fraction(key: str) -> float:
+    import hashlib
+    return int(hashlib.sha256(key.encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+
+
+def kodcode(output: Path, caps: dict[str, int], pool: float, validation: float,
+            seed: int) -> dict:
+    """KodCode problems with unit tests; a held-out pool of solved problems as worked
+    examples in the KB (Python documentation is added by ``add_background.py``)."""
+    import pyarrow.parquet as pq
+    domain = 'kodcode'
+    columns = ['question_id', 'subset', 'style', 'question', 'solution', 'test', 'gpt_difficulty']
+    rows = []
+    for path in sorted((RAW / 'agentic-20260927/kodcode-v1/data').glob('train-*.parquet')):
+        rows += [r for r in pq.read_table(path, columns=columns).to_pylist()
+                 if r['style'] in ('instruct', 'online_judge', 'complete')]
+    rng = random.Random(seed)
+    by_level: dict[str, list] = {}
+    for row in rows:
+        by_level.setdefault(row['gpt_difficulty'], []).append(row)
+    writer = Writer(output, domain)
+    examples: dict[str, list[dict]] = {}
+    chosen = []
+    for level, cap in caps.items():
+        group = by_level.get(level, [])
+        rng.shuffle(group)
+        for row in group[:int(cap * (1 + pool))]:
+            if _fraction('pool:' + row['question_id']) < pool / (1 + pool):
+                text = (f'Worked example ({row["subset"]}):\n{row["question"][:700]}\n'
+                        f'Solution:\n{row["solution"][:700]}')
+                examples.setdefault(row['subset'], []).append(
+                    record(domain, text, 'worked_example', subset=row['subset']))
+            else:
+                chosen.append(row)
+    everything = [r for rs in examples.values() for r in rs]
+    for row in chosen:
+        split = 'validation' if _fraction('val:' + row['question_id']) < validation else 'train'
+        how = ('Write a Python program that reads from stdin and writes to stdout.'
+               if row['style'] == 'online_judge' else 'Write the Python code.')
+        query = (f'Use the stored examples and documentation.\n{row["question"]}\n\n{how} '
+                 'Put the code in one ```python block.')
+        picks = sorted(examples.get(row['subset'], []), key=lambda r: record_id(
+            row['question_id'], r['record_id']))[:3]
+        item = task_episode(domain, split, row['question_id'], query,
+                            f'```python\n{row["solution"].strip()}\n```', [], picks,
+                            {'type': 'code', 'test': row['test'], 'style': row['style']},
+                            'code', subset=row['subset'], difficulty=row['gpt_difficulty'])
+        writer.add(split, item, everything if not writer.sources else picks)
+    return writer.close({'domain': domain, 'caps': caps, 'worked_examples': len(everything)})
+
+
+# -- multi-turn tool use with a domain policy ------------------------------------
+def apigen_mt(output: Path, validation: float) -> dict:
+    """APIGen-MT (tau-bench airline/retail): the policy and tool documentation live in
+    the KB; the customer's first message is the query; the trajectory interleaves the
+    simulated customer, assistant replies, calls and results."""
+    domain = 'apigen_mt'
+    rows = json.load((RAW / 'agentic-20260927/apigen-mt-5k/apigen-mt_5k.json').open())
+    writer = Writer(output, domain)
+    policies: dict[str, list[dict]] = {}
+    tools: dict[str, dict] = {}
+    for index, row in enumerate(rows):
+        area = 'airline' if 'airline' in row['system'][:200].lower() else 'retail'
+        if row['system'] not in policies:
+            lines = [line for line in row['system'].split('\n') if line.strip()]
+            policies[row['system']] = [record(domain, part, 'policy', area=area)
+                                       for part in pack(f'{area} agent policy:\n', lines)]
+        specs = json.loads(row['tools']) if isinstance(row['tools'], str) else row['tools']
+        docs = {}
+        for tool in specs:
+            key = f'{area}:{tool["name"]}'
+            if key not in tools:
+                tools[key] = record(domain, f'{area} tool {tool["name"]}: {tool.get("description", "")}\n'
+                                    f'Parameters: {json.dumps(tool.get("parameters", {}))}'[:3000],
+                                    'tool_doc', area=area, tool=tool['name'])
+            docs[tool['name']] = tools[key]
+        conv = row['conversations']
+        if not conv or conv[0]['from'] != 'human':
+            writer.filters_for('train').reject('no_opening_message')
+            continue
+        role = {'human': ('environment', 'Customer: '), 'gpt': ('assistant', ''),
+                'function_call': ('assistant', 'Call: '), 'observation': ('environment', 'Result: ')}
+        turns = [{'role': role[c['from']][0], 'text': role[c['from']][1] + c['value']}
+                 for c in conv[1:] if c['from'] in role]
+        calls = [json.loads(c['value']) for c in conv if c['from'] == 'function_call']
+        used = [docs[c['name']] for c in calls if c.get('name') in docs]
+        split = 'validation' if _fraction(f'apigen:{index}') < validation else 'train'
+        required = policies[row['system']] + list({r['record_id']: r for r in used}.values())
+        query = ('Use the stored agent policy and tool documentation. You are the agent; '
+                 f'reply to the customer or call tools.\nCustomer: {conv[0]["value"]}')
+        item = task_episode(domain, split, str(index), query, '\n'.join(t['text'] for t in turns),
+                            required, required, {'type': 'tau_bench', 'area': area, 'calls': calls},
+                            'policy_tool_agent', area=area)
+        item['turns'] = turns
+        writer.add(split, item, required + list(tools.values()))
+    return writer.close({'domain': domain, 'policies': len(policies), 'tools': len(tools)})
+
+
+# -- reasoning gym and synlogic ----------------------------------------------------
+def reasoning_gym(output: Path, pool: float) -> dict:
+    """Reasoning Gym SFT rows whose LLM reasoning reached the oracle answer; per
+    generator a pool of worked examples in the KB (one rule set per generator)."""
+    import pyarrow.parquet as pq
+    domain = 'reasoning_gym'
+    base = RAW / 'worlds-20260927/multilingual-reasoning-gym-sft-en/en'
+    rows = [r for path in sorted(base.rglob('*.parquet')) for r in pq.read_table(path).to_pylist()]
+    writer = Writer(output, domain)
+    examples: dict[str, list[dict]] = {}
+    kept = []
+    for i, row in enumerate(rows):
+        if str(row.get('llm_boxed_answer')) != str(row.get('oracle_answer')):
+            writer.filters_for('train').reject('llm_answer_wrong')
+            continue
+        if _fraction(f'rg-pool:{i}') < pool:
+            examples.setdefault(row['task_name'], []).append(record(
+                domain, f'Worked example ({row["task_name"]}):\n{row["question"][:600]}\n'
+                f'Answer: {row["oracle_answer"]}', 'worked_example', task=row['task_name']))
+        else:
+            kept.append((i, row))
+    everything = [r for rs in examples.values() for r in rs]
+    for i, row in kept:
+        split = 'validation' if _fraction(f'rg-val:{i}') < 0.1 else 'train'
+        picks = examples.get(row['task_name'], [])[:3]
+        query = f'Use the stored worked examples.\n{row["question"]}'
+        item = task_episode(domain, split, str(i), query, row['answer'], [], picks,
+                            {'type': 'exact', 'answer': str(row['oracle_answer'])}, 'rule_reasoning',
+                            task=row['task_name'], level=row.get('curriculum_level'))
+        writer.add(split, item, everything if not writer.sources else picks)
+    return writer.close({'domain': domain, 'worked_examples': len(everything)})
+
+
+def synlogic(output: Path, pool: float, min_ascii: float) -> dict:
+    """SynLogic puzzles (English prompts): answers from the generator data, verification
+    by the SynLogic verifiers (``verify.task`` names the family); worked examples per
+    family in the KB."""
+    import pyarrow.parquet as pq
+    domain = 'synlogic'
+    writer = Writer(output, domain)
+    examples: dict[str, list[dict]] = {}
+    kept = []
+    for level in ('easy', 'hard'):
+        for split in ('train', 'validation'):
+            path = RAW / f'worlds-20260927/synlogic/synlogic_{level}/{split}.parquet'
+            for i, row in enumerate(pq.read_table(path).to_pylist()):
+                prompt = row['prompt'][0]['content']
+                if sum(ch.isascii() for ch in prompt) / max(len(prompt), 1) < min_ascii:
+                    writer.filters_for(split).reject('not_english')
+                    continue
+                data = json.loads(row['extra_info']['game_data_str'])
+                answer = str(data.get('answer', '')).strip()
+                if not answer:
+                    writer.filters_for(split).reject('no_answer')
+                    continue
+                family = row['data_source'].split('/')[-1]
+                ident = f'{level}-{split}-{i}'
+                if split == 'train' and _fraction('sl-pool:' + ident) < pool:
+                    examples.setdefault(family, []).append(record(
+                        domain, f'Worked example ({family}):\n{prompt[-900:]}\nAnswer: {answer[:400]}',
+                        'worked_example', family=family))
+                else:
+                    kept.append((split, ident, family, prompt, answer, row['extra_info']['game_data_str']))
+    everything = [r for rs in examples.values() for r in rs]
+    for split, ident, family, prompt, answer, game in kept:
+        picks = examples.get(family, [])[:3]
+        item = task_episode(domain, split, ident, f'Use the stored worked examples.\n{prompt}',
+                            f'<answer>{answer}</answer>', [], picks,
+                            {'type': 'synlogic', 'task': family, 'game_data': game},
+                            'logic_puzzle', puzzle=family)
+        writer.add(split, item, everything if not writer.sources else picks)
+    return writer.close({'domain': domain, 'worked_examples': len(everything)})
+
+
 # -- knights and knaves ---------------------------------------------------------
 RULES = ('Knights and knaves: every inhabitant is either a knight, who always tells the '
          'truth, or a knave, who always lies. To solve a puzzle, assume a role for one '
@@ -368,6 +541,20 @@ def main() -> None:
     m.add_argument('--max-rows', type=int, default=5)
     m.add_argument('--max-cells', type=int, default=6)
     m.add_argument('--max-answer', type=int, default=160)
+    kc = sub.add_parser('kodcode')
+    kc.add_argument('--easy', type=int, default=40000)
+    kc.add_argument('--medium', type=int, default=20000)
+    kc.add_argument('--hard', type=int, default=10000)
+    kc.add_argument('--pool', type=float, default=0.05)
+    kc.add_argument('--validation', type=float, default=0.02)
+    kc.add_argument('--seed', type=int, default=0)
+    am = sub.add_parser('apigen-mt')
+    am.add_argument('--validation', type=float, default=0.05)
+    rg = sub.add_parser('reasoning-gym')
+    rg.add_argument('--pool', type=float, default=0.1)
+    sl = sub.add_parser('synlogic')
+    sl.add_argument('--pool', type=float, default=0.1)
+    sl.add_argument('--min-ascii', type=float, default=0.9)
     k = sub.add_parser('knights')
     k.add_argument('--examples', type=int, default=20)
     k.add_argument('--seed', type=int, default=0)
@@ -379,6 +566,15 @@ def main() -> None:
     elif args.dataset == 'spider-memory':
         manifest = spider_memory(args.output, max_chars=args.max_chars, max_rows=args.max_rows,
                                  max_cells=args.max_cells, max_answer=args.max_answer)
+    elif args.dataset == 'kodcode':
+        manifest = kodcode(args.output, {'easy': args.easy, 'medium': args.medium, 'hard': args.hard},
+                           args.pool, args.validation, args.seed)
+    elif args.dataset == 'apigen-mt':
+        manifest = apigen_mt(args.output, args.validation)
+    elif args.dataset == 'reasoning-gym':
+        manifest = reasoning_gym(args.output, args.pool)
+    elif args.dataset == 'synlogic':
+        manifest = synlogic(args.output, args.pool, args.min_ascii)
     elif args.dataset == 'knights':
         manifest = knights(args.output, args.examples, args.seed)
     else:
