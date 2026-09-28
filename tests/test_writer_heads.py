@@ -327,3 +327,43 @@ def test_write_prefix_with_lfm2_template():
         assert prefix == full[:len(prefix)] and full[len(prefix)] == SPAN_TOKENS['bg'][1]
         assert tok.decode(prefix).endswith('[memory_write()]<|tool_call_end|>')
         assert 'secret' not in tok.decode(prefix)
+
+
+def test_write_prefix_slots_are_filled_from_span_caches(tmp_path):
+    from types import SimpleNamespace
+
+    from schnitz.kb.bank import SpanCache, kb_dir
+    from schnitz.kb.stages.writer import SlotSpans
+    from schnitz.memory_transcripts import site_slots, splice_slots
+    tok, row = FakeTokenizer(), transcript()
+    row['messages'][3]['content']['slot'].update(kb='d:x', record_ids=['r', 'gone', 's'])
+    ids = write_site_prefix(tok, row, 0)
+    pairs = splice_slots(ids, site_slots(row, 0))
+    assert [slot['record_ids'] for _, slot in pairs] == [['r', 'gone', 's']]
+    assert ids[pairs[0][0]] == SPAN_TOKENS['mem'][1]
+    assert splice_slots(ids[pairs[0][0] + 2:], site_slots(row, 0)) == []   # cut from the left
+
+    class Writer:  # spans: rep j of record t is (sum of its chars) + j
+        def text_ids(self, text):
+            return torch.tensor([ord(c) for c in text])
+
+        def free_run(self, examples, lengths):
+            return [torch.arange(n)[:, None].float() + float(ex['ids'].sum())
+                    + torch.zeros(n, 8) for ex, n in zip(examples, lengths)], None
+    SpanCache.build(tmp_path / kb_dir('d:x'), Writer(), {'r': 'a' * 40, 's': 'b' * 40}, 's0')
+    embed = torch.nn.Embedding(5000, 8)
+    model = SimpleNamespace(device='cpu', decoder=SimpleNamespace(embed_tokens=embed))
+    ex = {'prefix_ids': torch.tensor(ids), 'slots': pairs}
+    slots = SlotSpans(tmp_path, cap=1000)
+    filled = slots.fill(model, ex)['inputs']
+    r = SpanCache(tmp_path / kb_dir('d:x')).get('r').float()
+    s = SpanCache(tmp_path / kb_dir('d:x')).get('s').float()
+    at = pairs[0][0] + 1
+    assert filled.shape[0] == len(ids) + r.shape[0] + s.shape[0]
+    torch.testing.assert_close(filled[at:at + r.shape[0]], r)             # after <|mem|>
+    torch.testing.assert_close(filled[at + r.shape[0]:at + r.shape[0] + s.shape[0]], s)
+    torch.testing.assert_close(filled[:at], embed(torch.tensor(ids[:at])))
+    torch.testing.assert_close(filled[at + r.shape[0] + s.shape[0]:], embed(torch.tensor(ids[at:])))
+    assert slots.missing == 1                                             # 'gone' is not cached
+    capped = SlotSpans(tmp_path, cap=3).fill(model, ex)['inputs']
+    assert capped.shape[0] == len(ids) + 3

@@ -61,7 +61,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from schnitz.kb.bank import SpanCache, Transcripts, read_sources, record_sources, slots_of
+from schnitz.kb.bank import (SpanCache, Transcripts, build_caches, kb_dir, read_sources,
+                             record_sources, slots_of)
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, L1Reader,
                              ReadConfig, source_index, splice)
 from schnitz.kb.stack import KeyHeads
@@ -340,10 +341,6 @@ def load_stack(path: Path | None, target_norm: float, device, seed: int):
 
 
 # -- build --------------------------------------------------------------------------
-def _safe(name: str) -> str:
-    return re.sub(r'[^A-Za-z0-9_.-]', '__', name)
-
-
 def initial_heads(path: Path, hidden: int, key_hidden: int, seed: int) -> KeyHeads:
     """The initial query and item-key heads (seeded), shared by every KB of a build
     and the trainer's starting point."""
@@ -354,6 +351,13 @@ def initial_heads(path: Path, hidden: int, key_hidden: int, seed: int) -> KeyHea
     else:
         torch.save(heads.state_dict(), path)
     return heads
+
+
+def _writer_meta(reader_state: Path) -> dict:
+    """A span cache's writer identity, as ``train.py bank`` records it (so caches are
+    shared between the bank stage and the L1 build)."""
+    state = torch.load(reader_state, map_location='cpu', mmap=True)
+    return {'writer_state': str(reader_state), 'step': int(state.get('step', -1))}
 
 
 @torch.no_grad()
@@ -367,21 +371,20 @@ def build(args) -> None:
                              args.distractors)
     model = load_model(args)
     args.output.mkdir(parents=True, exist_ok=True)
-    teacher, cache = None, None
+    teacher, caches = None, {}
     if args.span_source == 'teacher':
         from schnitz.kb.decoder import TeacherCache
         teacher = TeacherCache(args.cache, None, texts=[])
         teacher.by_id = {item[2]: item for item in teacher.items}
     else:
-        cache = SpanCache.build(args.span_cache or args.output / 'spans', model,
-                                {r: rec['text'] for r, rec in records.items()}, args.level,
-                                batch_size=args.batch_size,
-                                meta={'reader_state': str(args.reader_state),
-                                      'checkpoint': str(args.checkpoint)})
+        span_root = args.span_cache or args.output / 'spans'   # one SpanCache per KB
+        built = build_caches(span_root, model, records, args.level, args.batch_size,
+                             meta=_writer_meta(args.reader_state))
+        caches = {kb: SpanCache(span_root / kb_dir(kb)) for kb in built}
 
     def span_of(record_id: str) -> torch.Tensor:
         if teacher is None:
-            return cache.get(record_id).to(model.device).float()
+            return caches[records[record_id]['kb']].get(record_id).to(model.device).float()
         if record_id not in teacher.by_id:
             raise ValueError(f'record {record_id} has no cached teacher span')
         shard, row = teacher.by_id[record_id][:2]
@@ -406,9 +409,9 @@ def build(args) -> None:
     report = {}
     started = time.time()
     for kb_name, recs in sorted(by_kb.items()):
-        root = args.output / _safe(kb_name)
+        root = args.output / kb_dir(kb_name)
         kb = KnowledgeBase(root, writable=True) if (root / 'manifest.json').exists() else \
-            KnowledgeBase.create(root, name=_safe(kb_name), dataset=kb_name,
+            KnowledgeBase.create(root, name=kb_dir(kb_name), dataset=kb_name,
                                  origin={'command': 'train.py l1 build',
                                          'span_source': args.span_source, 'level': args.level,
                                          'codecs': str(args.codecs), 'codec_step': codec_step,

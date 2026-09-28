@@ -653,3 +653,11 @@ log your decisions and changes of direction"), newest last.
   over 2000 steps. Write batches kept small (4 sites, prefixes up to 1536 tokens)
   because the launch is unattended and larger sizes were not tried at B4's memory
   cap.
+- 28 Sep (owner). Memory slots in B4 prefixes get latent content: each
+  `memory_search()` slot in a write-site prefix holds the writer's spans of the
+  slot's records (memory prompt, a coarse ratio level, capped per slot), from a
+  per-dataset span cache that the frozen writer builds after B3 and that is
+  refreshed at B4 checkpoints as the writer trains. This is bank creation's
+  write step (`schnitz.kb.bank`, shared with L1's KB build); B4 starts without it
+  and switches it on by resuming with the cache. Empty slots taught writes to
+  encode content the model never read and to ignore memory results.

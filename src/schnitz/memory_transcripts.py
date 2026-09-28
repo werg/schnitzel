@@ -81,3 +81,22 @@ def write_site_prefix(tok, row: dict, site: int) -> list[int]:
     if not opens:
         raise ValueError(f'{row.get("episode_id")}: write site {site} rendered no span')
     return ids[:opens[-1]]
+
+
+def site_slots(row: dict, site: int) -> list[dict]:
+    """The search slots a write site's prefix contains, in the order of their
+    ``<|mem|><|/mem|>`` pairs: one ``{'kb', 'record_ids', ...}`` per ``memory_search``
+    result before the site."""
+    return [m['content']['slot'] for m in site_messages(row, site)
+            if isinstance(m.get('content'), dict) and 'slot' in m['content']]
+
+
+def splice_slots(ids: list[int], slots: list[list]) -> list[tuple[int, list]]:
+    """Pair the ``<|mem|>`` positions of ``ids`` with ``slots`` (the prefix's slots in
+    order). A prefix cut from the left keeps its last slots: the i-th of k remaining
+    ``<|mem|>`` tokens takes slot ``len(slots) - k + i``. Returns (position of
+    ``<|mem|>``, slot) pairs."""
+    opens = [i for i, t in enumerate(ids) if t == SPAN_TOKENS['mem'][1]]
+    if len(opens) > len(slots):
+        raise ValueError(f'{len(opens)} memory slots in the prefix, {len(slots)} in the row')
+    return list(zip(opens, slots[len(slots) - len(opens):]))

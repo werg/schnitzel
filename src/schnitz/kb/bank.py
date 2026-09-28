@@ -21,6 +21,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 
 import torch
 from safetensors import safe_open
@@ -225,3 +226,22 @@ class SpanCache:
             _atomic_json(root / 'index.json', index)
             shard += 1
         return cls(root)
+
+
+def kb_dir(kb: str) -> str:
+    """Directory name of a dataset KB (``r6-mixed:musique`` -> ``r6-mixed__musique``):
+    the same for its span cache and its store."""
+    return re.sub(r'[^A-Za-z0-9_.-]', '__', kb)
+
+
+def build_caches(root: Path, model, records: Mapping[str, dict], level: str | int = 's1',
+                 batch_size: int = 32, meta: dict | None = None) -> dict[str, int]:
+    """One ``SpanCache`` per dataset KB under ``root`` for ``records`` (id -> {text,
+    kb, ...}, as ``record_sources`` returns). Returns the record count per KB."""
+    by_kb: dict[str, dict[str, str]] = {}
+    for record_id, rec in records.items():
+        by_kb.setdefault(rec['kb'], {})[record_id] = rec['text']
+    for kb, texts in sorted(by_kb.items()):
+        SpanCache.build(Path(root) / kb_dir(kb), model, texts, level, batch_size=batch_size,
+                        meta=meta)
+    return {kb: len(texts) for kb, texts in by_kb.items()}
