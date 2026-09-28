@@ -107,13 +107,14 @@ def read_sources(dirs: Iterable[str], wanted: set[str],
 
 
 def record_sources(transcript_dirs: Sequence[Path], splits: Mapping[str, int | None],
-                   distractors: int = 0) -> dict[str, dict]:
+                   distractors: int = 0, with_writes: bool = False) -> dict[str, dict]:
     """Every record the slots of the first ``splits[split]`` transcripts per directory
-    name (``None``: all), plus up to ``distractors`` other records per KB: record id ->
+    name (``None``: all; ``with_writes``: only transcripts with write sites), plus up to ``distractors`` other records per KB: record id ->
     {'text', 'kb', 'created_at'}. Raises if a slot record is not in its corpus or a
     slot names another KB than its episode."""
     rows = [row for split, limit in splits.items()
-            for row in Transcripts(transcript_dirs, split, limit)]
+            for row in Transcripts(transcript_dirs, split, limit)
+            if not with_writes or row.get('write_sites')]
     needed = needed_records(rows)
     wanted = {r for recs in needed.values() for r in recs}
     records = read_sources({d for recs in needed.values() for d in recs.values()}, wanted,
