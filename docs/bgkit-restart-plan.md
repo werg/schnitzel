@@ -388,6 +388,12 @@ so later episodes sharing rules or entities can use them.
   a worked-example pool in its KB, disjoint from its episodes. `-bg` variants
   add BM25-selected background passages (`add_background.py`: Wikipedia dump,
   ConceptNet, WorldTree, Python docs) as KB records and supports.
+- *Redundancy-controlled read tasks (28 September; `docs/datasets.md`, "Redundant
+  knowledge tasks"):* `recall-text-r8` / `-r2` (verbatim recall of 1,066
+  Wikipedia articles from overlapping 96-token windows, each token in 8 or 2
+  records; 3800/464 episodes) and `synth-people-r32` / `-r4` (a fictional world of
+  2000 people, every asked fact in exactly 32 or 4 records; 15100/1426 episodes).
+  Slots name every copy (`alternatives`), so the L1 bank build stores them all.
 - *Single-pass S2 baselines (greedy, docs/schema in context; S2 vs base):*
   Spider 13% vs 21%, BIRD ≈0–5% both, KodCode easy 2% vs 7%, xLAM 41% vs 59%.
   Knights & Knaves S2 (plain / with worked examples): 3 people 17%/12%, 4 people
@@ -903,3 +909,15 @@ log your decisions and changes of direction"), newest last.
   real corpora serve. A synthetic fictional-people world (32 vs 4 records per fact)
   is being built as a controlled redundancy knob; high redundancy is expected to be
   key to learning content use.
+- 28 September: two redundancy-controlled read tasks are built, because reads carried
+  no content on text-to-SQL. There, shuffled reads helped as much as the right ones:
+  the format is learnable and schema names are guessable. In both new tasks the
+  answer can only come from the KB, and a useful record is easy to find because the
+  KB is highly redundant. `recall-text` asks for Wikipedia text verbatim from
+  overlapping windows (r8 and r2). Its targets have high entropy for the model on its
+  own, and the format is trivial. `synth-people` is a fictional world with every
+  asked fact in exactly M records across bios, rosters, registers and alumni lists
+  (r32 and r4). Its purpose is a controlled redundancy knob, not unseen text
+  (contamination is not a concern at 350M), so it has no fresh-world validation set.
+  Every copy is named in the slot's `alternatives` and banked by `needed_records`.
+  SQL with schema aliasing follows.

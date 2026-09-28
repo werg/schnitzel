@@ -124,6 +124,49 @@ retained producer IDs and experimental/original ordering type. These metadata ar
 not writer inputs. Training validates unique episode IDs and consistent source IDs,
 hashes input files, then uses offsets rather than keeping every episode's text in RAM.
 
+## Redundant knowledge tasks (28 September)
+
+These two task corpora are for the L1 read phase. The answer can only come from the
+KB, and the KB is highly redundant, so finding a useful record is easy. Both are
+subcommands of `scripts/prepare_task_corpora.py` in the tasks-* format. Their
+generators are importable modules with tests that need no downloads. Records are
+`kind: passage` with `provenance.record_type`. An episode lists every record that
+states its answer as a support. It also carries `alternatives`: per hop (people) or
+per target segment (recall), every record that holds that part whole.
+`prepare_memory_transcripts.py` names these in the slot of the read
+(`slot.alternatives`, audited like `record_ids`). `schnitz.kb.bank.needed_records`
+banks them, so the L1 KB contains every copy, not just the one a transcript reads.
+The L1 retrieval loss still takes only `record_ids` as positives. A copy that is
+merely in `alternatives` can be scored as a negative among the candidates.
+
+- **`recall-text`** (`schnitz.recall_text`). The sources are Wikipedia articles from
+  `/archive/raw/background-20260927/wikipedia-{sql-domains,household,logic}`, with
+  chunks joined in page order. Articles of 200 to 1500 LFM2.5 tokens are kept (1066).
+  Records are `--window` token windows every `window / --redundancy` tokens, widened
+  to whole words. Shorter head and tail windows keep the document ends as redundant
+  as the middle. Each document also gets a title record (title and lead paragraph).
+  The episodes are `continuation` (1 to 2 sentences given, then the next 64 to 256
+  tokens), `title` (the first 128 tokens of a named article) and `middle` (one
+  sentence given, then the following 64 to 192 tokens). Targets end at a sentence
+  end when one leaves at least 64 tokens. Sufficient groups are the covers by one
+  residue class of windows, so there are `redundancy` covers. The split is by
+  document. Corpora: `tasks-recall-text-r8-20260928` (71,807 records, 3800/464
+  episodes; target tokens median 117, p90 188; about 18 supports per episode) and
+  `-r2-` (18,353 records), each with `memory-recall-text-r{8,2}-20260928v3`.
+- **`synth-people`** (`schnitz.synth_world`). This is a seeded fictional world with
+  unique natural names, built-in vocabularies of real cities, plausible
+  universities, majors, companies and job titles, and mentor and sibling relations.
+  Every asked fact is stated in exactly `--redundancy` distinct records, counted
+  across bios (templated and permuted, with pronouns in a share of sentences),
+  company rosters, city birth registers and alumni lists. Companies have their own
+  profile records for 2-hop questions (`--hops 2`). Episodes ask one attribute of one
+  person, with the short value as the answer. The split is by person: validation
+  people's records are in the KB, but no training question asks about them. The
+  purpose is a controlled redundancy knob; contamination is not a concern at 350M.
+  Corpora (seed 0, 2000 people, 1-hop): `tasks-synth-people-r32-20260928` (66,867
+  records, 15100/1426 episodes) and `-r4-` (8,627 records), each with
+  `memory-synth-people-r{32,4}-20260928v3`.
+
 ## Stored-only measurement
 
 Evaluation has a separate write phase, serializes payload precision, reopens the bank,
