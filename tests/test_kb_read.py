@@ -928,6 +928,32 @@ def test_train_step_logs_the_contrast(tmp_path):
     assert 'contrast' not in out            # no same-KB donor in the batch: no term
 
 
+def test_gold_reads_read_the_slots_items_and_anneal(tmp_path):
+    ctx, _ = context(tmp_path, read_combine='r')
+    a = episode(IDS, [3, 10], [6, 13], records=(['r1'], ['r2']))
+    sets = l1.parameter_sets(ctx.reader)
+    trainable = l1.set_phase(sets, l1.L1A_SET)
+    opt = torch.optim.AdamW(trainable, lr=1e-3)
+    seen = []
+    real = l1.run_episode
+
+    def spy(ctx_, ep, cache, mode='retrieve', **kw):
+        seen.append(mode)
+        return real(ctx_, ep, cache, mode, **kw)
+
+    l1.run_episode = spy
+    try:
+        out = l1.train_step(ctx, [a], opt, train_args(gold_reads=1.0), 0, trainable=trainable)
+        assert seen == ['gold'] and out['gold_episodes'] == 1
+        seen.clear()
+        l1.train_step(ctx, [a], opt, train_args(gold_reads=1.0, gold_anneal=10), 10,
+                      trainable=trainable)
+        assert seen == ['retrieve']
+    finally:
+        l1.run_episode = real
+    assert l1.gold_read_rate(train_args(gold_reads=0.8, gold_anneal=100), 50) == 0.4
+
+
 def test_null_prefix_sits_in_front_of_every_span_and_trains(tmp_path):
     ctx, _ = context(tmp_path, read_combine='r')
     prefix = l1.NullPrefix(['ds'], 3, ctx.reader.stack)

@@ -857,6 +857,18 @@ def retrieval_weight(args, step: int) -> float:
     return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
 
 
+def gold_read_rate(args, step: int) -> float:
+    """Share of training episodes read from their slots' own items (``--gold-reads``,
+    annealed linearly to 0 over ``--gold-anneal`` steps; 0 anneal: constant): R, the
+    null prefix, the decoder layers and the items learn to carry content while the
+    retrieval heads still find nothing (the read-side curriculum's warm start)."""
+    rate = getattr(args, 'gold_reads', 0.0)
+    anneal = getattr(args, 'gold_anneal', 0)
+    if not rate or not anneal:
+        return rate
+    return rate * max(0.0, 1.0 - step / anneal)
+
+
 def _balance(ctx: Context, reads, usage: dict, cache=None) -> torch.Tensor | None:
     """Spread-out use (stack doc 5.2): ``balance_loss`` per (KB, space) over every
     scored (read, candidate) pair of the episode's reads, averaged; updates the
@@ -1129,8 +1141,13 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         if loss is not None and loss.requires_grad:
             loss.backward()
 
+    gold_rate = 0.0 if args.retrieval_only else gold_read_rate(args, step)
+    gold_rng = random.Random(f'gold:{step}')
+    gold_count = 0
     for i, ep in enumerate(episodes):
-        nll, _, reads, spans = run_episode(ctx, ep, cache, 'retrieve',
+        mode = 'gold' if gold_rate and gold_rng.random() < gold_rate else 'retrieve'
+        gold_count += mode == 'gold'
+        nll, _, reads, spans = run_episode(ctx, ep, cache, mode,
                                            retrieval_only=args.retrieval_only,
                                            negatives=negatives.get(ep.kb), producer=producer)
         terms = [] if nll is None else [nll / tokens]
@@ -1161,6 +1178,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     if pending:
         raise AssertionError('an episode\'s contrast donor was never read')
     out: dict = {}
+    if gold_rate:
+        out['gold_episodes'] = gold_count
     if contrast:
         out.update({k: round(sum(v) / len(v), 6) for k, v in contrast.items()})
         out['contrast_episodes'] = len(contrast.get('contrast', ()))
@@ -2125,6 +2144,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--decoder-replay-kl', type=float,
                    help='--decoder-train-below: weight of KL(parent || reader decoder) on the '
                         'batch\'s no-read context (default 0.1 when the decoder trains)')
+    t.add_argument('--gold-reads', type=float, default=0.0,
+                   help='share of training episodes read from their slots\' own items '
+                        '(content warm start while retrieval finds nothing; 0: off)')
+    t.add_argument('--gold-anneal', type=int, default=0,
+                   help='steps over which --gold-reads decays linearly to 0 (0: constant)')
     t.add_argument('--contrast-weight', type=float, default=0.0,
                    help='content contrast: per episode weight x relu(margin + nll_retrieved - '
                         'nll_shuffled), the shuffled arm reading another same-KB episode\'s '
