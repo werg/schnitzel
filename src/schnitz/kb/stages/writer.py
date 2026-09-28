@@ -80,7 +80,8 @@ from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.decoder import (ADAPTER_TARGETS, LEVELS, Model, TeacherCache, _batches,
                                 _heldout, _kl, _subset, length_factors)
 from schnitz.kb.bank import SpanCache, kb_dir
-from schnitz.memory_transcripts import site_slots, splice_slots, write_site_prefix
+from schnitz.memory_transcripts import (sft_ids, site_slots, splice_slots, transcript_slots,
+                                        write_site_prefix)
 
 SPACES = LEVELS  # the writer's ratio levels (historical name in this stage)
 # B4b: the user turn asks for the answer through the soft output port, so the choice
@@ -380,17 +381,17 @@ def _port_out_arms(model: Model, episodes: QAEpisodes, batch, tag: str, spans,
 
 class WriteSites:
     """``memory_write()`` sites of memory transcripts v3 (``transcripts-<split>.jsonl``
-    in each directory): a byte-offset index of the rows that have write sites, rows
-    read on demand."""
+    in each directory): a byte-offset index of the rows that have write sites (all
+    rows with ``every_row``, for B4d), rows read on demand."""
 
-    def __init__(self, dirs: list[Path], split: str):
+    def __init__(self, dirs: list[Path], split: str, every_row: bool = False):
         self.files = [Path(d) / f'transcripts-{split}.jsonl' for d in dirs]
         self.index: list[tuple[int, int]] = []
         for number, path in enumerate(self.files):
             offset = 0
             with path.open('rb') as handle:
                 for line in handle:
-                    if b'"write_sites": [{' in line:
+                    if every_row or b'"write_sites": [{' in line:
                         self.index.append((number, offset))
                     offset += len(line)
         if not self.index:
@@ -454,19 +455,92 @@ class SlotSpans:
                 break
         return torch.cat(parts) if parts else None
 
-    def fill(self, model: Model, ex: dict) -> dict:
-        """``ex['inputs']``: the prefix embedding with each slot's spans after its
-        ``<|mem|>`` token (``Model.write_inputs`` prefers ``inputs``)."""
-        embeds = model.decoder.embed_tokens(ex['prefix_ids'].to(model.device)).float()
-        pieces, last = [], 0
-        for position, slot in ex['slots']:
+    def splice(self, model: Model, ids: torch.Tensor, pairs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embeddings of ``ids`` with each slot's spans after its ``<|mem|>`` token, and
+        the new position of every original token."""
+        embeds = model.decoder.embed_tokens(ids.to(model.device)).float()
+        pieces, last, shift = [], 0, torch.zeros(ids.shape[0], dtype=torch.long)
+        for position, slot in pairs:
             span = self.slot(slot)
             if span is None:
                 continue
             pieces += [embeds[last:position + 1], span.to(model.device).float()]
+            shift[position + 1:] += span.shape[0]
             last = position + 1
         pieces.append(embeds[last:])
-        return {**ex, 'inputs': torch.cat(pieces)}
+        return torch.cat(pieces), torch.arange(ids.shape[0]) + shift
+
+    def fill(self, model: Model, ex: dict) -> dict:
+        """``ex['inputs']``: the prefix embedding with each slot's spans after its
+        ``<|mem|>`` token (``Model.write_inputs`` prefers ``inputs``)."""
+        return {**ex, 'inputs': self.splice(model, ex['prefix_ids'], ex['slots'])[0]}
+
+
+def sft_example(model: Model, row: dict, max_tokens: int) -> dict:
+    """B4d: a whole memory transcript (calls, answers, write openings) for supervised
+    training of the protocol; ``slots`` pairs its ``<|mem|>`` tokens with their records."""
+    ids, mask = sft_ids(model.tok, row, max_tokens)
+    return {'ids': torch.tensor(ids), 'mask': torch.tensor(mask, dtype=torch.bool),
+            'slots': splice_slots(ids, transcript_slots(row))}
+
+
+def sft_logits(model: Model, examples, slot_spans: SlotSpans | None):
+    """Next-token logits and targets over the loss positions of B4d examples, the
+    memory slots filled when ``slot_spans`` is given; also which targets open a tool
+    call (``<|tool_call_start|>``)."""
+    embed = model.decoder.embed_tokens
+    seqs, where = [], []
+    for ex in examples:
+        if slot_spans is not None:
+            inputs, index = slot_spans.splice(model, ex['ids'], ex['slots'])
+        else:
+            inputs, index = embed(ex['ids'].to(model.device)).float(), torch.arange(ex['ids'].shape[0])
+        seqs.append(inputs)
+        where.append(index)
+    width = max(x.shape[0] for x in seqs)
+    batch = torch.zeros(len(seqs), width, seqs[0].shape[1], device=model.device)
+    attention = torch.zeros(len(seqs), width, dtype=torch.long, device=model.device)
+    for i, x in enumerate(seqs):
+        batch[i, :x.shape[0]], attention[i, :x.shape[0]] = x, 1
+    hidden = model.hidden(model.decoder, batch, attention)
+    rows, cols, targets = [], [], []
+    for i, (ex, index) in enumerate(zip(examples, where)):
+        positions = torch.nonzero(ex['mask'][1:]).flatten() + 1     # target token positions
+        rows.append(torch.full_like(positions, i))
+        cols.append(index[positions - 1])                            # the state that predicts
+        targets.append(ex['ids'][positions])
+    rows, cols = torch.cat(rows).to(model.device), torch.cat(cols).to(model.device)
+    logits = model.decoder.base_lm.lm_head(hidden[rows, cols]).float()
+    targets = torch.cat(targets).to(model.device)
+    call = targets == model.tok.convert_tokens_to_ids('<|tool_call_start|>')
+    return logits, targets, call
+
+
+def sft_step(model: Model, examples, weights: dict, slot_spans: SlotSpans | None) -> dict:
+    with model.core.autocast():
+        logits, targets, call = sft_logits(model, examples, slot_spans)
+        nll = F.cross_entropy(logits, targets)
+    (weights.get('sft', 1.0) * nll).backward()
+    right = logits.argmax(-1) == targets
+    return {'loss': nll.item(), 'sft_nll': nll.item(), 'tokens': int(targets.numel()),
+            'call_acc': float(right[call].float().mean()) if bool(call.any()) else 0.0}
+
+
+@torch.no_grad()
+def evaluate_sft(model: Model, examples, slot_spans: SlotSpans | None, batch_size: int = 4) -> dict:
+    """B4d held-out: NLL on the transcripts' assistant tokens, and how often the model
+    opens a tool call where the teacher does (memory calls included)."""
+    total, n, calls, hits = 0.0, 0, 0, 0
+    for start in range(0, len(examples), batch_size):
+        with model.core.autocast():
+            logits, targets, call = sft_logits(model, examples[start:start + batch_size],
+                                               slot_spans)
+        total += F.cross_entropy(logits, targets, reduction='sum').item()
+        n += int(targets.numel())
+        calls += int(call.sum())
+        hits += int((logits.argmax(-1)[call] == targets[call]).sum())
+    return {'nll': round(total / max(n, 1), 4), 'call_acc': round(hits / max(calls, 1), 4),
+            'calls': calls, 'filled': slot_spans is not None}
 
 
 @torch.no_grad()
@@ -747,6 +821,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         help='span caches (train.py bank) that fill the memory slots of '
                              'write-site prefixes; without it the slots stay empty')
     parser.add_argument('--slot-cap', type=int, default=64, help='reps per memory slot')
+    parser.add_argument('--sft-transcripts', type=Path, nargs='+', default=[],
+                        help='B4d: memory transcripts (v3) trained whole, so the decoder '
+                             'learns when to call memory_search()/memory_write()')
+    parser.add_argument('--sft-fraction', type=float, default=0.0)
+    parser.add_argument('--sft-batch', type=int, default=4)
+    parser.add_argument('--sft-max-tokens', type=int, default=2048)
+    parser.add_argument('--sft-eval-items', type=int, default=64)
 
 
 def run(args) -> None:
@@ -775,6 +856,13 @@ def run(args) -> None:
         qa_eval_rows = sorted(qa_eval.rows, key=lambda row: row['episode_id'])[:args.qa_eval_items]
     write_train = write_eval = None
     slot_spans = SlotSpans(args.slot_spans, args.slot_cap) if args.slot_spans else None
+    sft_train = sft_eval = None
+    if args.sft_fraction > 0:
+        sft_train = WriteSites(args.sft_transcripts, 'train', every_row=True)
+        held = WriteSites(args.sft_transcripts, 'validation', every_row=True)
+        stride = max(1, len(held.index) // max(args.sft_eval_items, 1))
+        sft_eval = [sft_example(model, held.row(i), args.sft_max_tokens)
+                    for i in range(0, len(held.index), stride)][:args.sft_eval_items]
     if args.write_fraction > 0:
         write_train = WriteSites(args.write_transcripts, 'train')
         held = WriteSites(args.write_transcripts, 'validation')
@@ -794,6 +882,10 @@ def run(args) -> None:
                 result['writes_filled'] = evaluate_writes(
                     model, [slot_spans.fill(model, ex) for ex in write_eval], args.write_batch)
                 result['writes_filled']['missing_records'] = slot_spans.missing
+        if sft_eval:
+            result['sft'] = evaluate_sft(model, sft_eval, None)
+            if slot_spans is not None:
+                result['sft_filled'] = evaluate_sft(model, sft_eval, slot_spans)
         return result
     out = Run(args.output)
     step = 0
@@ -838,7 +930,12 @@ def run(args) -> None:
         draw = rng.random()
         if qa_train is not None and draw >= 1 - args.qa_fraction:
             stream = 'qa'
-        elif write_train is not None and draw >= 1 - args.qa_fraction - args.write_fraction:
+        elif sft_train is not None and draw >= 1 - args.qa_fraction - args.sft_fraction:
+            examples = [sft_example(model, sft_train.row(rng.randrange(len(sft_train.index))),
+                                    args.sft_max_tokens) for _ in range(args.sft_batch)]
+            stream = 'sft'
+        elif write_train is not None and draw >= (1 - args.qa_fraction - args.sft_fraction
+                                                  - args.write_fraction):
             examples = [write_example(model, *write_train.sample(rng), args.write_max_tokens,
                                       args.write_space) for _ in range(args.write_batch)]
             if slot_spans is not None:
@@ -873,6 +970,8 @@ def run(args) -> None:
                              args.sequential_reps,
                              args.port_share * min(1.0, step / max(args.port_ramp, 1)),
                              _port_out_share(args, step))
+        elif stream == 'sft':
+            result = sft_step(model, examples, weights, slot_spans)
         elif stream == 'write':
             result = write_step(model, examples, weights, args.rollout_passes, sample,
                                 args.sequential_reps)

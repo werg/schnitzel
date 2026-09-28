@@ -367,3 +367,33 @@ def test_write_prefix_slots_are_filled_from_span_caches(tmp_path):
     assert slots.missing == 1                                             # 'gone' is not cached
     capped = SlotSpans(tmp_path, cap=3).fill(model, ex)['inputs']
     assert capped.shape[0] == len(ids) + 3
+
+
+def test_sft_transcript_keeps_calls_in_the_loss_and_masks_empty_span_closes(tmp_path):
+    from types import SimpleNamespace
+
+    from schnitz.kb.stages.writer import SlotSpans
+    from schnitz.memory_transcripts import sft_ids, transcript_slots, splice_slots
+    tok, row = FakeTokenizer(), transcript()
+    ids, mask = sft_ids(tok, row, 10_000)
+    bg, bg_end = SPAN_TOKENS['bg'][1], SPAN_TOKENS['bg_end'][1]
+    closes = [i for i in range(1, len(ids)) if ids[i] == bg_end and ids[i - 1] == bg]
+    assert len(closes) == 2 and not any(mask[i] for i in closes)
+    assert all(mask[i - 1] for i in closes)                  # opening a write stays trained
+    call = tok.convert_tokens_to_ids('<|tool_call_start|>')
+    assert all(mask[i] for i, t in enumerate(ids) if t == call)
+    mem = SPAN_TOKENS['mem'][1]
+    assert not any(m for t, m in zip(ids, mask) if t == mem)   # tool results are not trained
+    cut, cut_mask = sft_ids(tok, row, 20)
+    assert len(cut) == 20 and cut[0] == ids[0] and cut[1:] == ids[-19:]
+    pairs = splice_slots(ids, transcript_slots(row))
+    assert len(pairs) == 1 and ids[pairs[0][0]] == mem
+    # splicing moves every later token by the slot's span length
+    embed = torch.nn.Embedding(5000, 8)
+    model = SimpleNamespace(device='cpu', decoder=SimpleNamespace(embed_tokens=embed))
+    spans = SlotSpans(tmp_path, cap=8)
+    spans.slot = lambda slot: torch.ones(3, 8)
+    inputs, index = spans.splice(model, torch.tensor(ids), pairs)
+    assert inputs.shape[0] == len(ids) + 3
+    assert index[pairs[0][0]] == pairs[0][0] and index[pairs[0][0] + 1] == pairs[0][0] + 4
+    torch.testing.assert_close(inputs[index], embed(torch.tensor(ids)))
