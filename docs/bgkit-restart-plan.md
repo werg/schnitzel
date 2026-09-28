@@ -687,3 +687,32 @@ log your decisions and changes of direction"), newest last.
   gathers cost 22 of 30 s per step). Retrieval loss weight 0.5 (annealed),
   balance loss 0.01. Not yet built: L1b (hook), items written during episodes,
   in-batch negatives, starting L1a from K2's heads.
+- 28 Sep (L2 and B9 built, not trained). L2 (`train.py l2`, `schnitz.kb.producer`): targets
+  are an L1 run's live items at its reader checkpoint, exported from a scratch copy so the
+  run is untouched; the producer is the bank path with gradients (the writer's span of the
+  source, teacher-fed with the bank's cached span or free-running then one gradient pass;
+  the codecs; S_s for rewrite outputs over their produced inputs at gate share x mass, one
+  lineage level because exports keep only metadata of superseded rows). Losses: per-space
+  cosine and MSE relative to the target's mean square, key cosine through the L1 item-key
+  heads, and KL of the frozen decoder reading R(produced) against R(live) on the source's
+  reconstruction; the writer's rep head and ratio code train, codecs and S_s optionally.
+  B9 (`train.py b9`, `schnitz.kb.experience`): per round an attempt generated with reads
+  executed when the model emits `memory_search()`, the verifier's outcome, SFT on the
+  teacher transcript read against the KB at that round, then the single-pass write
+  (append, then supersede: one current record per task). Gold records carry
+  w = schedule x decay^supersedes as a gate factor inside S_s (exact mass share), hidden at
+  w = 0. A registry keeps each record's kind (model / hinted / gold) and the tasks whose
+  gold is in its lineage; held-out rounds read no record with gold for their task, write
+  records no training round or later evaluation sees, and run the removed and swapped
+  controls. Choices: generation uses the KV cache, but each query is recomputed from a
+  full pass over the exact prefix (identical to the SFT pass's query); episodes without a
+  single-answer verifier are skipped; `--backprop-rounds` accepts only 0 until L1b's
+  selective producer replay exists (the written spans are detached); `--open-with-search`
+  forces the first call while the decoder has not learned it (the B3 decoder never emits
+  it on its own). Smoke findings: after 8 L1a steps the L1 reader never put B9 records
+  among the items read (7-38% of the scored candidates), so rounds did not differ; L2
+  needs L1a runs whose items actually move (item lr 0.1: KL to the live reading 0.018 to
+  0.006 in 60 steps on training records). Proposed for `read.py` (owned elsewhere): an
+  item-weight hook and the stored item mass in the gates (the reader ignores item mass
+  today, which rewrite outputs with mass other than 1 need, invariant 5); B9 meanwhile
+  wraps S_s (`WeightedOperator`) and looks items up by their value tensor.
