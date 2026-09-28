@@ -304,8 +304,8 @@ applies to every stage.
    replays is written one span at a time (`l1 build --span-batch-size 1`): the GPU
    free run depends on its batch composition, and batch 1 costs about 3x the
    batched throughput (2.1 vs 5-7 records/s), so bank-scale builds stay batched.
-7. **L1 - End to end over the KBs** (decoder frozen, so knowledge has to land in
-   the KB). Reads are `memory_search()` calls (vector queries, sparse gates,
+7. **L1 - End to end over the KBs** (decoder frozen by default, so knowledge has
+   to land in the KB; optionally its lower layers train, see below). Reads are `memory_search()` calls (vector queries, sparse gates,
    S_s → R → a short span in the tool result); writes are `memory_write()`.
    Tasks: trajectory SFT over the task KBs, QA and reconstruction over the R6
    KBs, continuation of KB-domain text. Two gradient regimes, run as
@@ -345,6 +345,37 @@ applies to every stage.
      default, switched on only if item drift, read drift on a fixed probe set or
      cross-KB retention show see-saw (logged every eval). A per-space read combine
      stays as an ablation.
+     *Content-dependent training (28 September).* On plain text-to-SQL the frozen
+     decoder's reads helped as much with shuffled items as with the right ones
+     (captured 1.22 vs 1.19, content 0.01 nats): R learned a task-format soft
+     prompt and table/column names were guessable from the question. Three remedies,
+     all off by default: (a) the SQL task corpora are hardened by schema aliasing
+     (`prepare_task_corpora.py --alias-variants`, semantic renames per variant, see
+     the dataset guide), so the right schema has to be read from the KB; (b) a
+     *content contrast* (`--contrast-weight`, `--contrast-margin`): every step also
+     reads each episode with another same-KB episode's retrieved items at their gates
+     (a derangement within each KB of the batch: same counts, same gates, an
+     information-matched control) through the same R, conditioned on the episode's
+     own causal queries, and adds weight x relu(margin + NLL_retrieved -
+     NLL_shuffled) per episode (token-mean NLL on the loss mask; logged `contrast`,
+     `content_nats_train`). The shuffled arm's item payloads and gates are detached,
+     so rows are pushed only towards being useful for their own episodes, never
+     towards hurting others (which would satisfy the term by making rows harmful);
+     R, S_s, the query heads, the null prefix and trained decoder layers get
+     gradients from both arms. (c) A *null prefix* (`--null-prefix N`): N learned
+     reps per KB in front of every read span in every arm (including no memory),
+     trained at `--lr` in l1a and r, so task format has a content-free home.
+     *Decoder lower layers (owner, 28 September):* `--decoder-train-below N`
+     (default 0 = frozen; for LFM2.5-350M's 16 layers the documented start is 8)
+     trains the reader's own copies of layers < N at `--decoder-lr` (3e-5) in l1a
+     and r (parameter set `decoder`); embeddings, the upper layers, the final norm
+     and the LM head stay frozen and shared. The writer keeps running the parent
+     decoder with its own weights (writes and L1b replay are unchanged); the reader
+     checkpoint saves the copied layers (`decoder_layers`). A parent-preservation
+     term `--decoder-replay-kl` (0.1 when the decoder trains) adds KL(parent ||
+     reader decoder) on each episode's no-read context at its loss positions. With
+     the decoder training, query passes run with gradients (checkpointed), so the
+     retrieval loss reaches those layers too; the contrast term applies to them.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
@@ -522,6 +553,14 @@ inputs are. Training data is regenerated where the format changes (owner:
     the target items of the batch's other slots in the same KB (never another KB's),
     up to `--inbatch-negatives` (64) per space. A read item's gate is multiplied by its
     stored mass and by an optional per-item weight (`weights=`, B9's gold weight).
+    Optional (5.1 step 7): the content contrast (`--contrast-weight`,
+    `--contrast-margin`), the null prefix (`--null-prefix`) and the reader decoder's
+    lower layers (`--decoder-train-below`, `--decoder-lr`, `--decoder-replay-kl`); CPU
+    tests: the contrast is exactly zero for the identity permutation, the shuffled arm
+    reads the donor's items at the donor's gates and span length, its gradient reaches
+    R but not the donor's items; only the reader's layers below N get gradients (also
+    with layer checkpointing), N = 0 is the frozen reader, and the untrained copy gives
+    the parent's logits bit for bit.
   - *L1b* (`--phase l1b`, or alternating with `--phase-schedule a:2000,b:500`): the
     items a read keeps are recomputed from their stored sources (`Producers`): a bank
     item by the writer's free run of its record under the memory prompt, then the
