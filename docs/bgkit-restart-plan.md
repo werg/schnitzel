@@ -1,12 +1,23 @@
-# SDKB restart on the BGKit S2 decoder: plan
+# Restart on the BGKit S2 decoder: plan
 
-**Status: proposal, 27 September 2026. Nothing here is implemented.**
+**Status, 28 September 2026.** Built and trained: harness parity (B0), teacher
+cache (B1), the writer (B2, B3 in training). The knowledge-base stack that stores
+and combines what the writer writes is specified in
+[knowledge-base-stack.md](knowledge-base-stack.md) (owner direction, 28
+September); it replaces this plan's earlier combiner stage (B7) and its reading
+of "spaces" as BGKit compression ratios (section 3.3a). Everything from B4 on is
+not implemented. Section 7 logs decisions and changes of direction.
+
 Owner direction (27 September): start fresh from the jointly trained BGKit 350M
 decoder; the decoder emits BGKit-format representations as its memory output,
 with variable length; spatial operations work on variable-sized records; the
 model can also produce compressed output when prompted. Keys are distilled from
-the current R5d5 model; payloads from the BGKit S2 encoder; combiners from
-multi-level BGKit. Unfreeze step by step.
+the current R5d5 model; payloads from the BGKit S2 encoder. Unfreeze step by
+step.
+
+**Naming.** In B1-B3 (code, metrics, this plan) `s0`-`s3` are the four BGKit
+compression ratios at which the writer is trained. They are not the KB spaces
+A-D of the knowledge-base stack.
 
 ## 1. Why restart
 
@@ -83,31 +94,28 @@ BGKit encodings), appear as one span:
 General compression capability is trained at all ratios x1–x128 (x1 and x4
 included). Knowledge-base compression scales with record length, so short
 records are compressed less (x4 is fine for a short passage). During BGKit
-distillation the four spaces use c_0(N) = clamp(sqrt(N)/2, 4, 32) and
+distillation the writer's four ratio levels s0-s3 use c_0(N) = clamp(sqrt(N)/2, 4, 32) and
 c_s(N) = min(128, c_0(N)·2^s): a 55-token passage is stored at x4/x8/x16/x32
 (about 14/7/4/2 reps), a 1,000-token document at about x16/x32/x64/x128. After distillation, output sizes become
 logarithmic in the source length, k(N) = ceil(a·log2(N) + b), with a and b set
 from the distilled model's measured quality-per-rep curve.
 
-### 3.3a Spaces (owner decision, 27 September)
-The four-space architecture stays. The densest space is the span the decoder
-generates; the coarser spaces are small codec projections of it: a
-cross-attention with generated queries (position features i/k plus a space
-embedding), emitting k_s(N) reps for any length N. Codecs stay small (about
-1–5M parameters each, low-rank if needed); they are distilled against BGKit at
-that space's ratio and initialized from R5d5's codecs where shapes allow (both
-models are 1024 wide). Keys stay one per space, distilled from R5d5. The
-block-operator reader keeps its numerator-and-mass gating and rounds, with
-blocks indexed by normalized positions (source rep j of n, target i of m) so it
-accepts any number and size of records; per-space read limits become rep
-budgets (records × reps per record about constant).
+### 3.3a Spaces (superseded 28 September)
+The original design (owner, 27 September) kept four spaces fed by codecs from
+the writer's span. This plan then implemented them as BGKit's own encoding at
+four coarser ratios, all 1024 wide, with codecs distilled to reproduce that
+encoding: a localized design without superposition. The spaces are now defined
+by [knowledge-base-stack.md](knowledge-base-stack.md): different granularities
+and widths, fed by forward codecs, combined by a recombiner, all built from the
+MLP-matrix operator.
 
 ### 3.4 Storage
-Payloads become variable-length sequences of 1024-d bf16 vectors per record and
-space (about 2 KB per rep). A 700-character passage (~160 tokens) is about 40 reps
-at x4 and 20 at x8, 80 KB and 40 KB. The store and key index keep one key per
-record and space; the payload blob gains a rep count. Offline bank creation is
-generation by a frozen writer.
+Each stored item is a variable-length sequence of vectors of its space's width,
+with a key, a mass and provenance, per space (knowledge-base stack, section 3).
+The spaces together hold about as many values as the writer's span (1024 per
+rep, about 2 KB per rep in bf16; a 700-character passage is about 40 reps at x4,
+80 KB). Offline bank creation is generation by a frozen writer followed by the
+forward codecs.
 
 ## 4. Training stages
 
@@ -206,7 +214,7 @@ Evaluation adds the replay KL to S2 next to the captured fractions.
 with prompted compression ("compress at x16") and reading tasks over the model's
 own spans, so compressed output is a general skill, not only a memory write.
 
-**B5 — Key distillation.** Key heads read the state at `<|/bg|>` per space;
+**B5 — Key distillation** (now knowledge-base stack K2, per KB space). Key heads read the state at `<|/bg|>` per space;
 query heads read the query state. Targets: R5d5's key table rows (records) and
 R5d5's routing addresses (queries), cached offline. Gate: retrieval recall with
 distilled keys on R5d5's validation sites close to R5d5's (0.94 union at
@@ -218,63 +226,41 @@ kept those queries apart, so later loops could repeat the first query. From B5 o
 (1) one query per loop boundary and space plus 2 query heads per space, later
 loops conditioned on what was read (multi-hop bridges); (2) coverage over
 repetition - within a site, a record already retrieved by an earlier query gets a
-discounted gate in the combiner, and the query set is trained on union recall of a
+discounted gate in the compactor, and the query set is trained on union recall of a
 sufficient group; (3) a margin-hinged repulsion between one site's query vectors;
 (4) exploration while training (Gumbel-perturbed top-k, an entropy floor on each
 query's routing), annealed off; (5) tasks that need several reads (multi-hop QA,
 SQL schema + values + evidence, per-step agent reads, B9 rounds). Tracked:
 distinct records per site, union recall, pairwise query similarity.
 
-**B6 — Reads.** A read passes the retrieved records' rep sequences and their
-gates through the combiner (B7), whose variable-length output span is spliced
-into the read workspace at the loop boundary, instead of the MLP reader's fixed
-slots. Before B7 exists, the first reading runs splice gold reps directly. Build the bank by frozen-writer
-generation; train reading with retrieval (gold-forced at first, then annealed).
+**B6 — Reads.** A read retrieves a neighbourhood per KB space, combines each
+with that space's compactor and the spaces with the recombiner
+([knowledge-base stack](knowledge-base-stack.md)), and splices the resulting
+span into the read workspace at the loop boundary, instead of the MLP reader's
+fixed slots. Build the bank by frozen-writer generation and the forward codecs;
+train reading with retrieval.
 Gate: memory-vs-text probe fraction far above R5d5's 5%; invented-passage
 fraction above 50% at x4.
 
-**B7 — Combiners (block-operator MLPs on variable-size records).** The combiners
-keep SDKB's block-operator-matrix form, made size-agnostic: each block is an MLP
-applied to a contribution indexed by normalized positions (output i of m, input
-j of n) and content, so the operator is defined for any input and output length
-rather than for fixed slot counts. Inputs are the retrieved records' reps with
-their gate weights; contributions keep pre-normalization numerators and masses
-(invariants 5 and 7), so gating is part of the operator, not an afterthought.
+**B7 — superseded by the knowledge-base stack (28 September).** B7 trained a
+gated combiner that merged the gold records of one ratio level into one span,
+distilled towards the S2 encoding of the joined gold texts, after a codec stage
+that mapped s0 spans to BGKit's coarser ratios (`scripts/train_bgkit_codecs.py`,
+`scripts/train_bgkit_combiner.py`, `scripts/cache_bgkit_teacher.py --episodes`;
+these remain as records of the experiment). What it showed, used by the new
+design:
 
-Distillation target (owner direction): the combiner's output should look like
-BGKit's compressed encoding of *all the relevant parts* — the S2 encoder,
-reconstruct prompt, over the concatenated gold texts of the read, at the output
-size k(total length). Gates may be fudged during this phase (e.g. gold records
-fixed at full weight, others as scored), since the target only describes the
-relevant content. Combiner and space-projection weights start from R5d5's
-operator reader where shapes allow, so training begins near a working function
-and moves toward the BGKit manifold. Train only the combiners, everything else
-frozen; then leave distillation quickly for task loss with learned gates. Also
-distill BGKit multi-level node encodings (`encode_tree`, 1/4 re-encoding) for
-compaction of stored records.
-
-*Self-record curriculum (owner direction, 27 September).* Combiner training
-starts from the feedback case and phases it out. Each read contains the record
-being reconstructed (its own span, the "pure feedback source") together with
-semantically related records (exact nearest neighbours over the S2 teacher
-reps) and, for episodes, the other gold records. The self record's gate is forced
-down on a schedule from 1 to 0 (the numerator-and-mass form makes a forced gate
-exact), while the target moves from reconstructing that record to the episode's
-answer and the BGKit encoding of the *other* relevant records. The model thus
-moves from copying its own content to extracting knowledge from the actual
-sources; learned gates take over once the self record is gone.
-
-**Codec distillation (runs before B7; `scripts/train_bgkit_codecs.py`).** One
-`SpaceCodec` per coarser space (about 2M parameters each): source = teacher s0
-reps of a bank passage, target = teacher reps at that space's ratio, losses
-cosine + functional (frozen S2 reads the codec output: reconstruct NLL and KL to
-reading the teacher reps). Evaluation compares codec output with the teacher and
-with chunked mean pooling of s0. 40-step smoke: captured 0.20/0.19/0.18 on
-s1/s2/s3 (pooling 0.48/0.06/−0.08, teacher 0.63/0.47/0.33).
-
-**Combiner teacher cache.** `scripts/cache_bgkit_teacher.py --episodes`: per R6
-episode, the S2 encoding of its gold records' texts joined in order, at the
-four length-scaled space ratios.
+- The combiner was a cross-attention mixer (outputs are attention-weighted
+  averages of input reps), not the planned per-position MLP matrix. On 192
+  validation episodes (s1, content nats over shuffled controls) it ended level
+  with length-matched mean pooling: reconstruction 1.37 vs 1.64, QA 1.97 vs 1.83.
+- Its learned gates never learned (BCE at chance) while they fed the combine
+  step; related neighbour records carry almost no answer content (0.03 captured
+  at full weight); QA "captured" fractions are inflated by format, so content
+  is measured over shuffled controls.
+- The B3 decoder reads memory better than S2 (teacher-arm QA captured 0.35 vs 0.12).
+- A decoder-as-combiner mode (the writer merges retrieved spans under a merge
+  prompt) exists (`--combiner decoder`) as a baseline.
 
 **Soft I/O port (owner side quest, 27 September).** For end-to-end
 differentiable subagents: the decoder reads task prompts and questions given as
@@ -302,7 +288,8 @@ BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
   tasks through the port.
 
 **B9 — Recursive improvement through memory (owner direction, 27 September).**
-After the combiner stage (feedback curriculum, related sources) and the B3 merge.
+After the knowledge-base stack reaches end-to-end reconstruction (K4) and the B3
+merge.
 On a hard, verifiable task with teacher trajectories, the model runs R = 3–4
 rounds per episode. Round t reads the KB: ground sources, related records, its
 own trajectory records from earlier rounds, trajectories of other episodes
@@ -317,7 +304,7 @@ so later episodes sharing rules or entities can use them.
 - *Bridging the capability gap:* the student's own attempts may be far from the
   target, so hints are annealed: heavily hinted seed rounds (partial teacher
   trajectory or plan as round 0), and gold as a KB record at a forced low gate
-  (exact, same mechanism as the feedback curriculum) annealed to 0 over training.
+  (exact, since gates scale mass) annealed to 0 over training.
 - *On- and off-policy records together (owner, 27 September):* the KB stores
   both the model's own trajectories and the gold teacher trajectories. A gold
   record's gate is its learned gate times a continually receding weight w, the
@@ -381,17 +368,17 @@ datasets) and periodic memory-use evaluation.
 1. Dense compression, above x4, scaled with input size; logarithmic output sizes
    after distillation (3.3).
 2. Recurrent loops are kept: reads happen at loop boundaries as in R5.
-3. Reads are gated. Retrieved records pass through the gated block-operator
-   combiner (B7), which produces the spliced read span; raw rep sequences are not
-   spliced unweighted. Gates may be fudged only during distillation.
+3. Reads are gated. Retrieved items pass through the per-space compactors and
+   the recombiner of the knowledge-base stack, which produce the spliced read
+   span; raw rep sequences are not spliced unweighted. Gates only modulate mass.
 4. R5d5 is stopped (27 September, step ~1480) and serves as the frozen key
    teacher for B5.
 
 ## 6. Still open
 
 - Exact k(N) during distillation and the log-law constants afterwards.
-- Positional parametrization of the size-agnostic operator blocks.
-- How the read budget per space is set when every read passes through a combiner.
+- The knowledge-base stack's open questions (its section 8): space sizes,
+  neighbourhood sizes, compaction ratios, question-conditioned recombination.
 
 ## 7. Decision log
 
@@ -456,7 +443,20 @@ log your decisions and changes of direction"), newest last.
   steps), content nats over shuffled controls, reconstruction / QA: untrained
   mean pooling to the same length 1.65 / 2.22, the trained mixer (stage 2, step
   0, 192 episodes) 0.57 / 1.21, the decoder merge after 6 steps 0.74 / 1.80, the
-  S2 teacher 1.80 / 1.44. The trained mixer is below a training-free pooling
-  baseline; the decoder merge beats it on QA almost untrained. Next: a matched
-  run of both modes on the same episodes once B3 finishes (the decoder mode needs
-  a trainable decoder next to a frozen reader copy).
+  S2 teacher 1.80 / 1.44. (Corrected at step 2000 on the same 192 episodes: the
+  trained mixer is level with length-matched pooling, reconstruction 1.37 vs
+  1.64, QA 1.97 vs 1.83; the smoke's comparison mixed sample sizes and training
+  stages.)
+- **28 Sep, change of direction: the knowledge-base stack (owner).** The owner
+  identified that "spaces" had drifted into BGKit compression ratios of the same
+  record and the combiner into a merger of gold records: a localized design
+  without the intended superposition. New design in
+  [knowledge-base-stack.md](knowledge-base-stack.md): KB spaces of different
+  granularity and width that together are about the input size, forward codecs,
+  a per-space compactor that is also the read-time combiner, a recombiner across
+  spaces, all built from a dense MLP-matrix operator (an MLP per source and target
+  position pair, linearly combined per target in numerator-and-mass form, a
+  per-target feed-forward, several layers conditioned on the target's residual
+  state). Superposition is an explicit objective (compact then recover,
+  drop-one), plus tasks that reward spread-out use. B7 is superseded; combiner
+  stage 2 was stopped at step 2000. B3 continues (the writer feeds the stack).

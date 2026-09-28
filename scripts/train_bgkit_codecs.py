@@ -1,5 +1,8 @@
 """Codec distillation (restart plan 3.3a): dense span -> coarser spaces.
 
+Superseded (28 September 2026) by the knowledge-base stack
+(docs/knowledge-base-stack.md); kept as the record of restart-plan B7.
+
 The coarser spaces s1..s3 are small size-agnostic projections of the densest
 span s0 (``schnitz.bgkit_span.SpaceCodec``, one per space). Trained on the B1 cache:
 source = the teacher's s0 reps of a bank passage, target = the teacher's reps of

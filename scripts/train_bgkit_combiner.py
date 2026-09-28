@@ -1,5 +1,8 @@
 """B7 combiner training: gated reads of several records -> one BGKit span.
 
+Superseded (28 September 2026) by the knowledge-base stack
+(docs/knowledge-base-stack.md); kept as the record of restart-plan B7.
+
 One combiner per space (``SpaceCodec.combine``; s1..s3 initialized from the
 trained codecs, s0 from the s1 codec). Per R6 episode and a random space s:
 

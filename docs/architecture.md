@@ -1,5 +1,10 @@
 # Stigmergic Compactable Holographic Neural Indexed Trajectory Zettelkasten with Evolving Latents, Jointly Adapted by Gated Decoders (SCHNITZELJAGD)
 
+> **Current memory design, 28 September 2026:** the
+> [knowledge-base stack](knowledge-base-stack.md) specifies the superposed spaces,
+> forward codecs, per-space compactor-combiners and recombiner, built from a dense
+> MLP-matrix operator, on the BGKit restart ([restart plan](bgkit-restart-plan.md)).
+> The research objective below stands; where the two differ, the stack document is current.
 
 > **Implementation update, 19 September 2026:** the decoder now has a native
 > prelude/shared-core/coda conversion with in-loop reads and a conversion curriculum.
