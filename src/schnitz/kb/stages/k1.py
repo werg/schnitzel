@@ -45,19 +45,38 @@ def _example(cache: TeacherCache, model: Model, item) -> dict:
             'span': cache.reps(shard, row, 's0').to(model.device).float()}
 
 
-def _keep(rng: random.Random, p: float) -> dict[str, float]:
-    keep = {name: 0.0 if rng.random() < p else 1.0 for name in SPACES}
+def _dropout(spec: str) -> dict[str, float]:
+    """``0.25`` (every space) or ``A=0.5,B=0.25,...`` (per space; missing: 0.25)."""
+    if '=' not in spec:
+        return {name: float(spec) for name in SPACES}
+    given = {k: float(v) for k, v in (pair.split('=') for pair in spec.split(','))}
+    return {name: given.get(name, 0.25) for name in SPACES}
+
+
+def _keep(rng: random.Random, p: dict[str, float]) -> dict[str, float]:
+    keep = {name: 0.0 if rng.random() < p[name] else 1.0 for name in SPACES}
     if not any(keep.values()):
         keep[rng.choice(list(SPACES))] = 1.0
     return keep
 
 
 def train_step(model: Model, stack: Stack, examples, weights: dict, rng: random.Random,
-               dropout: float) -> dict:
+               dropout: dict[str, float]) -> dict:
+    """Reconstruction through all spaces with space dropout; with ``single`` weight
+    also through one random space alone (the same items), so every space carries
+    content of its own instead of leaving it to the widest."""
     with model.core.autocast():
-        outs = [stack.decode(stack.encode(ex['span']), _keep(rng, dropout), ex['span'].shape[0])
-                for ex in examples]
+        encoded = [stack.encode(ex['span']) for ex in examples]
+        outs = [stack.decode(e, _keep(rng, dropout), ex['span'].shape[0])
+                for e, ex in zip(encoded, examples)]
         loss, parts = reconstruction_losses(model, stack, examples, outs, weights)
+        if weights.get('single', 0) > 0:
+            alone = [rng.choice(list(SPACES)) for _ in examples]
+            singles = [stack.decode(e, {n: float(n == s) for n in SPACES}, ex['span'].shape[0])
+                       for e, ex, s in zip(encoded, examples, alone)]
+            single, sparts = reconstruction_losses(model, stack, examples, singles, weights)
+            loss = loss + weights['single'] * single
+            parts.update({f'single_{k}': v for k, v in sparts.items()})
     loss.backward()
     return {'loss': loss.item(), **parts}
 
@@ -108,7 +127,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--state', type=int, default=512)
     parser.add_argument('--hidden', type=int, default=256)
     parser.add_argument('--layers', type=int, default=3)
-    parser.add_argument('--space-dropout', type=float, default=0.25)
+    parser.add_argument('--space-dropout', default='0.25',
+                        help='drop probability, one value or per space (A=0.5,B=0.25,...)')
     parser.add_argument('--checkpointing', action='store_true',
                         help='recompute operator layers in backward')
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -157,7 +177,7 @@ def run(args) -> None:
     while step < args.steps:
         examples = [_example(cache, model, item) for item in next(batches)]
         optimizer.zero_grad(set_to_none=True)
-        result = train_step(model, stack, examples, weights, rng, args.space_dropout)
+        result = train_step(model, stack, examples, weights, rng, _dropout(args.space_dropout))
         torch.nn.utils.clip_grad_norm_(stack.parameters(), 1.0)
         optimizer.step()
         schedule.step()

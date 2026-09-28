@@ -1,7 +1,7 @@
 """Knowledge-base store (docs/knowledge-base-stack.md, sections 3 and 5; WP2).
 
 One KB per dataset; a KB is also an authorization domain. It holds spaces (by default
-A-D, 384/512/768/1024 wide). An item lives in one space: a variable-length sequence of
+A-D, 256/512/1024/2048 wide). An item lives in one space: a variable-length sequence of
 vectors of the space's width (bf16 on disk), one key (float32), a mass, provenance
 (source record ids, dataset, producer, step), an availability time, a version and
 lineage. Items are identified by opaque ids; a supersede keeps the id and bumps the
@@ -127,8 +127,10 @@ class SpaceSpec:
     ratio: float = 1.0      # positions per writer rep, m_s = ceil(ratio * n)
 
 
-DEFAULT_SPACES = {'A': SpaceSpec(384, 256, 1.0), 'B': SpaceSpec(512, 256, 0.5),
-                  'C': SpaceSpec(768, 256, 0.25), 'D': SpaceSpec(1024, 256, 0.125)}
+# equal information per space (owner, 28 Sep): width x ratio = 256 values per writer rep in
+# every space, 1024 in all (the input size)
+DEFAULT_SPACES = {'A': SpaceSpec(256, 256, 1.0), 'B': SpaceSpec(512, 256, 0.5),
+                  'C': SpaceSpec(1024, 256, 0.25), 'D': SpaceSpec(2048, 256, 0.125)}
 
 
 @dataclass(frozen=True)

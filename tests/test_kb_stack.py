@@ -10,7 +10,8 @@ from schnitz.mlp_matrix import MLPMatrix
 def test_spaces_come_from_the_store_definition():
     from schnitz.kb_store import DEFAULT_SPACES
     assert SPACES == {n: (s.ratio, s.width) for n, s in DEFAULT_SPACES.items()}
-    assert sum(r * w for r, w in SPACES.values()) == 960
+    assert {r * w for r, w in SPACES.values()} == {256}
+    assert sum(r * w for r, w in SPACES.values()) == 1024
 
 
 def test_read_count_rule():
