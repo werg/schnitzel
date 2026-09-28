@@ -53,6 +53,7 @@ import contextlib
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import time
@@ -60,6 +61,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from schnitz.span_protocol import ProtocolTokens, untie
 from schnitz.bgkit_span import (MEMORY_PROMPT, MERGE_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
                              attach_write_adapter, checkpoint_layers, span_mask,
                              span_targets)
@@ -130,6 +132,9 @@ class Model:
         self.prompts = {}
         named = [('memory', MEMORY_PROMPT), ('merge', MERGE_PROMPT)] + [(f'summarize-{task}', text)
                                                for task, text in SUMMARIZE_PROMPTS.items()]
+        # B4: prompts that state the compression factor (powers of two, x1 .. x128)
+        named += [(f'summarize-{task}@{2 ** e}', text.replace('with BGKit', f'with BGKit at about x{2 ** e}'))
+                  for task, text in SUMMARIZE_PROMPTS.items() for e in range(8)]
         for name, text in named:
             ids = self.tok.apply_chat_template([{'role': 'user', 'content': text + sent_str}],
                                                add_generation_prompt=True, tokenize=True)
@@ -148,6 +153,8 @@ class Model:
         opening = args.gate_open_start >= 0 or args.merge_at >= 0
         self.reference = copy.deepcopy(self.decoder) if opening else None
         self.gate, self.adapter, self.gate_value, self.merged = None, None, 0.0, False
+        self.protocol, self.protocol_losses, self.record_protocol = None, [], False
+        self.tail = torch.tensor(self.tok('<|im_end|>', add_special_tokens=False)['input_ids'])
         if args.adapter_rank:
             self.gate, self.adapter = attach_write_adapter(
                 self.decoder.base_lm.model.layers, ADAPTER_TARGETS, args.adapter_rank,
@@ -176,8 +183,49 @@ class Model:
             checkpoint_layers(dec.base_lm.model.layers)
         self.gate, self.adapter, self.merged = None, None, True
 
+    def install_protocol(self) -> None:
+        """B4: span protocol tokens with LM-head rows (``schnitz.span_protocol``) on the
+        merged decoder; the writer's marker and stop head become the ``<|bg|>`` input
+        embedding and the ``<|rep|>``/``<|/bg|>`` rows (initialized from them)."""
+        if not self.merged:
+            raise ValueError('the span protocol is installed on the merged decoder')
+        lm = self.decoder.base_lm
+        untie(lm)
+        embed = lm.get_input_embeddings()
+
+        def text(words: str) -> torch.Tensor:
+            ids = self.tok(words, add_special_tokens=False)['input_ids']
+            return embed.weight.detach()[ids].float().mean(0)
+
+        stop = self.writer.stop
+        init = {'inputs:bg': self.writer.marker.detach(), 'inputs:bg_end': text('\n'),
+                'inputs:mem': text('Memory:'), 'inputs:mem_end': text('\n'),
+                'inputs:port': text('Question:'), 'inputs:port_end': text('\n'),
+                'outputs:rep': stop.weight[0].detach(), 'outputs:bg_end': stop.weight[1].detach()}
+        protocol = ProtocolTokens(embed, lm.lm_head, self.writer.ratio, init).to(self.device)
+        protocol.span_bias.data.copy_(stop.bias.detach())
+        protocol.install(embed, lm.lm_head)
+
+        class SpanStop(torch.nn.Module):  # the writer's stop decision is now the LM rows
+            def forward(self, hidden):
+                return protocol.span_logits(hidden)
+
+        self.writer.stop = SpanStop()
+        self.writer.marker_embedding = protocol.marker
+        self.protocol = protocol
+
+    def port_reps(self, ids: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Soft input port: the frozen S2 encoder's x1 reps of each text."""
+        from bgkit2.data.autoencode import Sample
+        samples = [Sample(ctx_ids=x.long(), target_ids=x.long()[:1], task='reconstruct',
+                          store=0, doc=0) for x in ids]
+        return self.teacher(samples, [1.0] * len(samples))
+
     def param_groups(self, args) -> list[dict]:
         groups = [{'params': list(self.writer.parameters()), 'lr': args.lr}]
+        if self.protocol is not None:
+            groups.append({'params': list(self.protocol.parameters()),
+                           'lr': getattr(args, 'protocol_lr', args.lr)})
         if self.adapter is not None:
             groups.append({'params': list(self.adapter.parameters()), 'lr': args.adapter_lr})
         if self.merged:
@@ -192,17 +240,23 @@ class Model:
         if self.merged:
             state['merged'] = True
             state['decoder'] = self.decoder.base_lm.state_dict()
+        if self.protocol is not None:
+            state['protocol'] = self.protocol.state_dict()
         return state
 
     def load_trained(self, state: dict) -> None:
+        if state.get('merged') and not self.merged:  # a resumed merged state is loaded into place
+            self.gate_value = 1.0
+            self.merge()
+        if 'protocol' in state and self.protocol is None:
+            self.install_protocol()  # unties the LM head before the decoder state is loaded
         self.writer.load_state_dict(state['writer'])
         if state.get('merged'):
-            if not self.merged:  # a resumed merged state is loaded into place
-                self.gate_value = 1.0
-                self.merge()
             self.decoder.base_lm.load_state_dict(state['decoder'])
         elif 'adapter' in state and self.adapter is not None:
             self.adapter.load_state_dict(state['adapter'])
+        if 'protocol' in state:
+            self.protocol.load_state_dict(state['protocol'])
 
     def hidden(self, dec, inputs_embeds, attention_mask, spans=None) -> torch.Tensor:
         """Final hidden states; the write adapter weighs span positions 1 and all
@@ -352,11 +406,16 @@ class Model:
             return self.span_hidden(prefix, spans)
         embed = self.decoder.embed_tokens
         seqs, starts = [], []
+        protocol = self.protocol is not None and (torch.is_grad_enabled() or self.record_protocol)
         for ex, fed in zip(examples, feed):
             source = self.write_inputs(ex)
             marker = self.writer.marker_embedding(
                 torch.tensor(ex['factor'], device=self.device)).unsqueeze(0)
-            seqs.append(torch.cat([source, marker, fed.to(self.device).float()]))
+            parts = [source, marker, fed.to(self.device).float()]
+            if protocol:  # close the span and end the turn (B4): <|/bg|> then <|im_end|>
+                parts += [self.protocol.embedding('bg_end')[None].float(),
+                          embed(ex.get('tail', self.tail).to(self.device)).float()]
+            seqs.append(torch.cat(parts))
             starts.append(source.shape[0])
         width = max(s.shape[0] for s in seqs)
         dim = seqs[0].shape[1]
@@ -367,7 +426,46 @@ class Model:
             mask[i, :seq.shape[0]] = 1
         spans = span_mask(starts, [1 + fed.shape[0] for fed in feed], width, self.device)
         hidden = self.hidden(self.decoder, inputs, mask, spans)
+        if protocol:
+            self.protocol_losses.append(self._protocol_losses(hidden, examples, feed, starts))
         return [hidden[i, starts[i]:starts[i] + 1 + feed[i].shape[0]] for i in range(len(seqs))]
+
+    def _protocol_losses(self, hidden, examples, feed, starts) -> dict[str, torch.Tensor]:
+        """Opening ``<|bg|>`` from the last prompt position, the turn end after
+        ``<|/bg|>``, and (for prompts that state it) the ratio head."""
+        head = self.decoder.base_lm.lm_head
+        states, targets, ratio_pred, ratio_true = [], [], [], []
+        for i, (ex, fed) in enumerate(zip(examples, feed)):
+            tail = ex.get('tail', self.tail)
+            close = starts[i] + 1 + fed.shape[0]          # the <|/bg|> position
+            states.append(hidden[i, [starts[i] - 1] + list(range(close, close + tail.shape[0]))])
+            targets.append(torch.cat([torch.tensor([self.protocol.token('bg')]), tail]))
+            if ex.get('ratio_stated'):
+                ratio_pred.append(self.protocol.ratio_head(hidden[i, starts[i] - 1].float()))
+                ratio_true.append(torch.tensor([math.log2(ex['factor']) / 8], device=self.device))
+        logits = head(torch.cat(states)).float()
+        targets = torch.cat(targets).to(self.device)
+        out = {'open_close': F.cross_entropy(logits, targets),
+               'open_close_acc': (logits.argmax(-1) == targets).float().mean().detach()}
+        if ratio_pred:
+            out['ratio'] = F.mse_loss(torch.cat(ratio_pred), torch.cat(ratio_true))
+        return out
+
+    def take_protocol_losses(self, weights: dict) -> tuple[torch.Tensor | None, dict]:
+        """Weighted sum of the protocol losses recorded since the last call."""
+        records, self.protocol_losses = self.protocol_losses, []
+        if not records:
+            return None, {}
+        total, logged = 0.0, {}
+        for key, weight in (('open_close', weights.get('protocol', 1.0)),
+                            ('ratio', weights.get('ratio', 0.1))):
+            values = [r[key] for r in records if key in r]
+            if values:
+                value = torch.stack(values).mean()
+                total = total + weight * value
+                logged[key] = value.item()
+        logged['open_close_acc'] = torch.stack([r['open_close_acc'] for r in records]).mean().item()
+        return total, logged
 
     def write_inputs(self, ex: dict) -> torch.Tensor:
         """The writer's prompt and source as input embeddings. The source is text
@@ -421,6 +519,8 @@ class Model:
         prefix = [self.tpl.prefix.cpu()] * len(examples)
         if full:
             reps = [dec.embed(ex['ids'].to(self.device)) for ex in examples]
+        if self.protocol is not None and dec is self.decoder:
+            reps = self._delimit(examples, reps, wrap=not full)
         if reps is None:
             batch = dec.build_batch(prefix, None, None, suffix, suffix_label_start=start)
         else:
@@ -440,6 +540,24 @@ class Model:
         if index is not None:
             chosen, targets = chosen[index], targets[index]
         return dec.base_lm.lm_head(chosen).float(), targets
+
+    def _delimit(self, examples, reps, wrap: bool):
+        """B4 read layout: memory spans between ``<|mem|>`` and ``<|/mem|>``, then an
+        optional soft input port span (``ex['port']``) between ``<|port|>`` and
+        ``<|/port|>``, all in the context slot."""
+        p, width = self.protocol, self.writer.marker.shape[0]
+        blocks = []
+        for i, ex in enumerate(examples):
+            parts = []
+            if reps is not None:
+                rep = reps[i].to(self.device).float()
+                parts += ([p.embedding('mem')[None], rep, p.embedding('mem_end')[None]]
+                          if wrap else [rep])
+            if 'port' in ex:
+                parts += [p.embedding('port')[None], ex['port'].to(self.device).float(),
+                          p.embedding('port_end')[None]]
+            blocks.append(torch.cat(parts) if parts else torch.zeros(0, width, device=self.device))
+        return blocks if reps is not None or any('port' in ex for ex in examples) else None
 
     def text_logits(self, examples, decoder=None, index: torch.Tensor | None = None):
         """Plain-text next-token logits over each example's source (no span, no chat)."""
@@ -463,11 +581,18 @@ def _example(cache: TeacherCache, model: Model, item, tag: str) -> dict:
             'teacher': cache.reps(shard, row, tag), 'factor': cache.factor(shard, row, tag)}
 
 
-def _classical(model: Model, samples, factors: list[float]) -> list[dict]:
+def _classical(model: Model, samples, factors: list[float],
+               stated: list[bool] | None = None) -> list[dict]:
+    """``stated[i]``: the prompt names the factor (nearest power of two; B4)."""
     teacher = model.teacher(samples, factors)
-    return [{'ids': s.ctx_ids.long(), 'target': s.target_ids.long(), 'task': s.task,
-             'prompt': f'summarize-{s.task}', 'teacher': t, 'factor': f}
-            for s, t, f in zip(samples, teacher, factors)]
+    stated = stated or [False] * len(samples)
+    out = []
+    for s, t, f, named in zip(samples, teacher, factors, stated):
+        power = 2 ** min(7, max(0, round(math.log2(f))))
+        out.append({'ids': s.ctx_ids.long(), 'target': s.target_ids.long(), 'task': s.task,
+                    'prompt': f'summarize-{s.task}@{power}' if named else f'summarize-{s.task}',
+                    'teacher': t, 'factor': f, 'ratio_stated': named})
+    return out
 
 
 def _classical_dataset(model: Model, stores, weights, ctx_max: int, seed: int, size=None):
@@ -563,7 +688,8 @@ class QAEpisodes:
             self.neighbors, self.ids = data['neighbors'], data['record_ids']
             self.index = {record_id: i for i, record_id in enumerate(self.ids)}
 
-    def build(self, model: Model, row: dict, tag: str, rng: random.Random, related: int):
+    def build(self, model: Model, row: dict, tag: str, rng: random.Random, related: int,
+              port: bool = False):
         golds = list(row['required_ids'])
         entries = golds[:]
         if related and self.neighbors is not None:
@@ -577,14 +703,24 @@ class QAEpisodes:
                                         add_special_tokens=False)['input_ids'][:64])
         view = {'ids': joined, 'target': answer, 'task': 'reconstruct',
                 'instr': model.question_instr(row['query'])}
+        if port:  # the question arrives through the soft input port instead of as text
+            view['instr'] = model.question_instr('')
+            view['port_ids'] = model.text_ids(row['query'], limit=256)
         return records, view
 
 
 def qa_step(model: Model, episodes: QAEpisodes, rows, weights: dict, rng: random.Random,
-            related: int, passes: int, sample: float, sequential: int = 0) -> dict:
-    """Writer writes the records (question-free); the reader answers from them."""
+            related: int, passes: int, sample: float, sequential: int = 0,
+            port_share: float = 0.0) -> dict:
+    """Writer writes the records (question-free); the reader answers from them. With
+    ``port_share`` a fraction of questions arrives through the soft input port."""
     tag = rng.choice(SPACES)
-    built = [episodes.build(model, row, tag, rng, related) for row in rows]
+    built = [episodes.build(model, row, tag, rng, related, port=rng.random() < port_share)
+             for row in rows]
+    ported = [view for _, view in built if 'port_ids' in view]
+    if ported:
+        for view, reps in zip(ported, model.port_reps([v['port_ids'] for v in ported])):
+            view['port'] = reps
     records = [record for recs, _ in built for record in recs]
     with model.core.autocast():
         _, preds, cos, stop = _rollout(model, records, passes, sample, sequential)
@@ -595,9 +731,12 @@ def qa_step(model: Model, episodes: QAEpisodes, rows, weights: dict, rng: random
         logits, targets = model.read([view for _, view in built], spans)
         nll = F.cross_entropy(logits, targets)
         loss = weights['qa'] * nll + weights['cos'] * cos + weights['stop'] * stop
+        extra, logged = model.take_protocol_losses(weights)
+        if extra is not None:
+            loss = loss + extra
     loss.backward()
     return {'loss': loss.item(), 'qa_nll': nll.item(), 'cos': cos.item(), 'stop': stop.item(),
-            'records': len(records)}
+            'records': len(records), 'ported': len(ported), **logged}
 
 
 @torch.no_grad()
@@ -635,6 +774,15 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
                     arms[name] = model.read(views, spans)
                     if name == 'student_free':
                         arms['student_free_shuffled'] = model.read(views, spans[1:] + spans[:1])
+                        if model.protocol is not None:  # question through the soft input port
+                            ported = [episodes.build(model, row, tag, random.Random(5), 0, port=True)[1]
+                                      for row in batch]
+                            for view, reps in zip(ported, model.port_reps(
+                                    [v['port_ids'] for v in ported])):
+                                view['port'] = reps
+                            arms['student_free_port'] = model.read(ported, spans)
+                            arms['student_free_port_shuffled'] = model.read(
+                                ported, spans[1:] + spans[:1])
             for name, (logits, targets) in arms.items():
                 sums[name] = sums.get(name, 0.0) + F.cross_entropy(
                     logits, targets, reduction='sum').item()
@@ -647,7 +795,10 @@ def evaluate_qa(model: Model, episodes: QAEpisodes, rows, related: int,
                             'content_nats': {
                                 'teacher': round(nll['teacher_shuffled'] - nll['teacher'], 4),
                                 'student_free': round(nll['student_free_shuffled']
-                                                      - nll['student_free'], 4)}}
+                                                      - nll['student_free'], 4),
+                                **({'student_free_port': round(nll['student_free_port_shuffled']
+                                                               - nll['student_free_port'], 4)}
+                                   if 'student_free_port' in nll else {})}}
     return out
 
 
@@ -680,6 +831,10 @@ def train_step(model: Model, examples, weights: dict, passes: int = 0,
             replay = _kl(read_now, t_logits[pick]) + _kl(text_now, text_ref)
             loss = loss + weights.get('replay', 1.0) * replay
             result['replay'] = replay.item()
+        extra, logged = model.take_protocol_losses(weights)
+        if extra is not None:
+            loss = loss + extra
+            result.update(logged)
     loss.backward()
     return {'loss': loss.item(), **result, 'reps': len(pred)}
 
@@ -731,6 +886,7 @@ def _score(model: Model, groups) -> dict:
 
 def evaluate(model: Model, cache: TeacherCache, items, classical, batch_size: int) -> dict:
     out = {}
+    model.protocol_losses, model.record_protocol = [], model.protocol is not None
     for tag in SPACES:
         out[f'bank/{tag}'] = _score(model, (
             [_example(cache, model, item, tag) for item in items[i:i + batch_size]]
@@ -739,6 +895,9 @@ def evaluate(model: Model, cache: TeacherCache, items, classical, batch_size: in
         out[f'classical/x{int(factor)}'] = _score(model, (
             _classical(model, classical[i:i + batch_size], [factor] * len(classical[i:i + batch_size]))
             for i in range(0, len(classical), batch_size)))
+    if model.record_protocol:  # opening and closing a span on held-out teacher-fed writes
+        model.record_protocol = False
+        _, out['protocol'] = model.take_protocol_losses({})
     return out
 
 
@@ -801,6 +960,17 @@ def main() -> None:
     parser.add_argument('--qa-related', type=int, default=2)
     parser.add_argument('--qa-eval-items', type=int, default=96)
     parser.add_argument('--neighbors', type=Path)
+    parser.add_argument('--protocol', action='store_true',
+                        help='B4: span protocol tokens with LM-head rows, turn end after the span, '
+                             'memory/port delimiters in reads (restart plan 3.2)')
+    parser.add_argument('--init-state', type=Path,
+                        help='B4: start from this B3 writer.pt (writer and merged decoder)')
+    parser.add_argument('--protocol-lr', type=float, default=1e-3)
+    parser.add_argument('--ratio-stated', type=float, default=0.0,
+                        help='fraction of classical prompts that state the compression factor')
+    parser.add_argument('--port-share', type=float, default=0.0,
+                        help='final fraction of QA questions given through the soft input port')
+    parser.add_argument('--port-ramp', type=int, default=2000)
     args = parser.parse_args()
     weights = {k: float(v) for k, v in (pair.split('=') for pair in args.weights.split(','))}
     weights.setdefault('qa', 1.0)
@@ -837,9 +1007,15 @@ def main() -> None:
         step = state['step']
         model.gate_value = _gate(args, step)
         model.load_trained(state)
+    elif args.init_state:
+        init = torch.load(args.init_state, map_location=model.device)
+        model.load_trained({k: init[k] for k in ('writer', 'merged', 'decoder', 'protocol')
+                            if k in init})
     elif args.init_writer:
         model.writer.load_state_dict(
             torch.load(args.init_writer, map_location=model.device)['writer'])
+    if args.protocol and model.protocol is None:
+        model.install_protocol()
 
     def build_optimizer(start: int):
         optimizer = torch.optim.AdamW(model.param_groups(args), weight_decay=0.01)
@@ -881,7 +1057,8 @@ def main() -> None:
                     break
                 samples.append(sample)
             factors = [2 ** rng.uniform(0, 7) for _ in samples]  # x1 .. x128, log-uniform
-            examples = _classical(model, samples, factors)
+            examples = _classical(model, samples, factors,
+                                  [rng.random() < args.ratio_stated for _ in samples])
             stream = 'classical'
         else:
             examples = [_example(cache, model, item, rng.choice(SPACES))
@@ -897,7 +1074,8 @@ def main() -> None:
         if stream == 'qa':
             result = qa_step(model, qa_train, rng.sample(qa_train.rows, args.qa_batch), weights,
                              rng, rng.randint(0, args.qa_related), args.rollout_passes, sample,
-                             args.sequential_reps)
+                             args.sequential_reps,
+                             args.port_share * min(1.0, step / max(args.port_ramp, 1)))
         else:
             result = train_step(model, examples, weights, args.rollout_passes, sample,
                                 args.replay_tokens, args.sequential_reps)

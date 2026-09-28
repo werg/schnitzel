@@ -341,7 +341,7 @@ inputs are. Training data is regenerated where the format changes (owner:
 | Part | State |
 |---|---|
 | Writer (B2/B3) | training (restart plan B3) |
-| B4 general compression, soft I/O port | next after B3 (restart plan) |
+| B4 general compression, soft I/O port | built, not trained: `--protocol` in `scripts/train_bgkit_reps.py` (`src/schnitz/span_protocol.py`: protocol input/output rows via hooks on the untied embedding and LM head; the writer's stop head becomes the `<|rep|>`/`<|/bg|>` rows; losses for opening `<|bg|>` and ending the turn after `<|/bg|>`; ratio-stated prompts with a ratio head; memory spans between `<|mem|>`/`<|/mem|>` in reads; QA questions through the soft input port, ramped). GPU smoke test from B3 step ~14000 passed, including resume; the untrained port already nearly matches the text question (s0 answer NLL 1.21 vs 1.20). Launch after B3 |
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
 | K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
 | K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
