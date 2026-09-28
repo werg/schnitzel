@@ -207,12 +207,92 @@ def farthest_points(keys: Tensor, m: int) -> list[int]:
     return chosen
 
 
-def place_rows(leaf_keys: Tensor, m: int) -> Tensor:
+SCAN_ELEMENTS = 1 << 25    # similarities per block of an exact scan (256 MB in float64)
+
+
+def exact_topk(queries: Tensor, keys: Tensor, k: int, chunk: int | None = None
+               ) -> tuple[Tensor, Tensor]:
+    """Exact top-``k`` cosine neighbours among ``keys`` of every query (float64 on the CPU,
+    blocks of ``chunk`` queries, by default ``SCAN_ELEMENTS`` similarities per block; no
+    approximate index)."""
+    q = queries.detach().double().cpu()
+    kk = keys.detach().double().cpu()
+    k = min(k, kk.shape[0])
+    chunk = chunk or max(1, SCAN_ELEMENTS // max(kk.shape[0], 1))
+    values, indices = [], []
+    for start in range(0, q.shape[0], chunk):
+        top = (q[start:start + chunk] @ kk.T).topk(k, dim=1)
+        values.append(top.values)
+        indices.append(top.indices)
+    return torch.cat(values), torch.cat(indices)
+
+
+def exact_argmax(queries: Tensor, keys: Tensor, chunk: int | None = None) -> Tensor:
+    """For every query the index of its most similar key (exact, blocks of ``chunk``
+    keys, by default ``SCAN_ELEMENTS`` similarities per block; ties: the lower index)."""
+    q = queries.detach().double().cpu()
+    kk = keys.detach().double().cpu()
+    chunk = chunk or max(1, SCAN_ELEMENTS // max(q.shape[0], 1))
+    best = torch.full((q.shape[0],), -math.inf, dtype=torch.float64)
+    arg = torch.zeros(q.shape[0], dtype=torch.long)
+    for start in range(0, kk.shape[0], chunk):
+        sim = q @ kk[start:start + chunk].T
+        val, idx = sim.max(dim=1)
+        better = val > best
+        best = torch.where(better, val, best)
+        arg = torch.where(better, idx + start, arg)
+    return arg
+
+
+def kmeanspp(keys: Tensor, k: int, gen: torch.Generator) -> Tensor:
+    """k-means++ seeding (cosine distance 1 - cos, D^2 sampling) of ``k`` rows of unit
+    ``keys``; returns their indices. O(n k)."""
+    keys = keys.detach().double().cpu()
+    n = keys.shape[0]
+    k = min(k, n)
+    first = int(torch.randint(n, (1,), generator=gen))
+    chosen = [first]
+    dist = (1 - keys @ keys[first]).clamp_min(0)
+    for _ in range(k - 1):
+        w = dist ** 2
+        total = float(w.sum())
+        nxt = int(torch.multinomial(w / total, 1, generator=gen)) if total > 0 else \
+            int(torch.randint(n, (1,), generator=gen))
+        chosen.append(nxt)
+        dist = torch.minimum(dist, (1 - keys @ keys[nxt]).clamp_min(0))
+    return torch.tensor(chosen)
+
+
+def place_rows(leaf_keys: Tensor, m: int, bucket: int = 4096, seed: int = 0) -> Tensor:
     """Initial row positions: the keys of ``m`` leaves chosen by farthest-point sampling
-    (spread over the occupied key space, reproducible). The rows' own keys follow from
-    their values once initialized."""
+    (spread over the occupied key space, reproducible). Up to ``2 bucket`` leaves one
+    exact FPS (O(N m)); beyond, FPS within buckets: ``ceil(N / bucket)`` centres by
+    k-means++ seeding on a sample, every leaf assigned exactly to its nearest centre,
+    and each bucket's share of the ``m`` rows (proportional to its leaves) by FPS inside
+    it: O(N N/bucket + bucket m). The rows' own keys follow from their values once
+    initialized."""
     keys = nn.functional.normalize(leaf_keys.detach().float().cpu(), dim=-1)
-    return keys[sorted(farthest_points(keys, m))]
+    n = keys.shape[0]
+    m = min(m, n)
+    if n <= 2 * bucket:
+        return keys[sorted(farthest_points(keys, m))]
+    gen = torch.Generator().manual_seed(seed)
+    centres_n = math.ceil(n / bucket)
+    sample = torch.randperm(n, generator=gen)[:min(n, max(20 * centres_n, 20000))]
+    centres = keys[sample[kmeanspp(keys[sample], centres_n, gen)]]
+    owner = exact_argmax(keys, centres)
+    members = [torch.nonzero(owner == c).flatten() for c in range(centres.shape[0])]
+    sizes = np.array([len(x) for x in members], np.float64)
+    quota = sizes / sizes.sum() * m
+    take = np.floor(quota).astype(int)
+    for c in np.argsort(-(quota - take))[:m - int(take.sum())]:   # largest remainders
+        take[c] += 1
+    take = np.minimum(take, sizes.astype(int))
+    chosen = []
+    for idx, t in zip(members, take.tolist()):
+        if t > 0:
+            chosen += idx[farthest_points(keys[idx], t)].tolist()
+    return keys[sorted(chosen)]
 
 
 def memberships(keys: Tensor, rows: Tensor, overlap: int,
@@ -221,10 +301,9 @@ def memberships(keys: Tensor, rows: Tensor, overlap: int,
     ``softmax(tau cos)`` (sum one)."""
     if not len(keys) or not len(rows):
         return [[] for _ in range(len(keys))]
-    sim = keys.detach().double().cpu() @ rows.detach().double().cpu().T
-    top = sim.topk(min(overlap, rows.shape[0]), dim=1)
+    values, indices = exact_topk(keys, rows, overlap)
     return [_shares(list(zip(idx, val)), tau)
-            for idx, val in zip(top.indices.tolist(), top.values.tolist())]
+            for idx, val in zip(indices.tolist(), values.tolist())]
 
 
 def _shares(pairs: Sequence[tuple[int, float]], tau: float) -> list[tuple[int, float]]:
@@ -239,13 +318,14 @@ def fields_of(keys: Tensor, rows: Tensor, overlap: int, tau: float
     its nearest input (whose shares are renormalized over its c + 1 rows)."""
     member = memberships(keys, rows, overlap, tau)
     if len(keys) and len(rows):
-        sim = keys.detach().double().cpu() @ rows.detach().double().cpu().T
         filled = {o for pairs in member for o, _ in pairs}
-        for o in range(rows.shape[0]):
-            if o not in filled:
-                i = int(torch.argmax(sim[:, o]))
-                member[i] = _shares([(r, float(sim[i, r])) for r, _ in member[i]]
-                                    + [(o, float(sim[i, o]))], tau)
+        empty = [o for o in range(rows.shape[0]) if o not in filled]
+        if empty:
+            k64, r64 = keys.detach().double().cpu(), rows.detach().double().cpu()
+            nearest = exact_argmax(r64[empty], k64).tolist()
+            for o, i in zip(empty, nearest):
+                member[i] = _shares([(r, float(k64[i] @ r64[r])) for r, _ in member[i]]
+                                    + [(o, float(k64[i] @ r64[o]))], tau)
     fields: list[list[tuple[int, float]]] = [[] for _ in range(len(rows))]
     for i, pairs in enumerate(member):
         for o, share in pairs:
@@ -537,12 +617,12 @@ def build_rows(kb: KnowledgeBase, dest: Path, config: SuperposeConfig,
             continue
         items = kb.read(space, ids)
         keys = torch.stack([it.key.float() for it in items])
-        m = config.row_count(space, len(ids))
-        rows = [row_id(kb.dataset, space, n) for n in range(m)]
+        anchors = place_rows(keys, config.row_count(space, len(ids)), seed=config.seed)
+        rows = [row_id(kb.dataset, space, n) for n in range(anchors.shape[0])]
         one = dataclasses.replace(config, depth=1)
         graph = build_graph(kb.dataset, space, ids, keys, [it.mass for it in items],
                             [it.time for it in items], [it.values.shape[0] for it in items],
-                            rows, place_rows(keys, m), one)
+                            rows, anchors, one)
         values = mean_rows(graph, [it.values.float() for it in items])
         level = graph.levels[0]
         row_keys = [mean_key([graph.keys[i] for i in ins],
@@ -1325,7 +1405,8 @@ class SuperposedKB:
                                      float(level.mass[j]), int(level.time[j]),
                                      g.level_ids[n][j])
                              for j, (v, k, _) in enumerate(got)]
-                    out.rewrite(space, below, items, shares=level.matrix(len(below)).toarray())
+                    # sparse: each input has only its c candidate rows
+                    out.rewrite(space, below, items, shares=level.matrix(len(below)))
                     below = g.level_ids[n]
             out.close()
             scratch = KnowledgeBase(build, writable=True)

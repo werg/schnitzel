@@ -665,3 +665,27 @@ def test_fit_key_path_learns_row_keys_away_from_the_field_mean(tmp_path):
     after = key_cos()
     assert after > before + 0.2, (before, after)
     assert any(float(p.abs().sum()) > 0 for p in ops.key_heads.parameters())
+
+
+def test_exact_scans_and_bucketed_row_placement():
+    gen = torch.Generator().manual_seed(0)
+    centres = nn.functional.normalize(torch.randn(6, 16, generator=gen), dim=-1)
+    keys = nn.functional.normalize(centres[torch.arange(600) % 6]
+                                   + 0.2 * torch.randn(600, 16, generator=gen), dim=-1)
+    rows = nn.functional.normalize(torch.randn(50, 16, generator=gen), dim=-1)
+    full = (keys.double() @ rows.double().T).topk(3, dim=1)
+    values, indices = sp.exact_topk(keys, rows, 3, chunk=37)          # exact, in blocks
+    assert torch.equal(indices, full.indices) and torch.equal(values, full.values)
+    assert torch.equal(sp.exact_argmax(rows, keys, chunk=41),
+                       (rows.double() @ keys.double().T).argmax(dim=1))
+    # small sets: one exact FPS as before; large: FPS within k-means++ buckets
+    unit = nn.functional.normalize(keys, dim=-1)       # place_rows renormalizes
+    assert torch.equal(sp.place_rows(keys, 20, bucket=400),
+                       unit[sorted(sp.farthest_points(unit, 20))])
+    placed = sp.place_rows(keys, 60, bucket=64, seed=1)
+    assert placed.shape == (60, 16)
+    assert len({tuple(r.tolist()) for r in placed}) == 60                 # distinct leaves
+    nearest = (placed @ centres.T).argmax(dim=1)
+    counts = torch.bincount(nearest, minlength=6)
+    assert int(counts.min()) >= 5                  # every cluster gets its share of rows
+    assert torch.equal(placed, sp.place_rows(keys, 60, bucket=64, seed=1))   # reproducible
