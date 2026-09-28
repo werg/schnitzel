@@ -675,3 +675,15 @@ log your decisions and changes of direction"), newest last.
   in-context writes land. Validation items are the same live items the training
   episodes update (one KB per dataset), so evaluation measures reads of trained
   items for held-out questions, not held-out records.
+- 28 Sep (WP5 merged: L1 read path, K2 as retrieval-only L1). Query: the frozen
+  decoder's state after 8 of 16 layers at the call's closing token, from a pass
+  over the exact causal prefix with earlier reads spliced in (recomputed in
+  backward, so later queries reach earlier reads). Sparse reads: 8/16/32/64
+  candidates scored in spaces A-D, the top 2/2/3/4 read, the rest at gate exactly
+  0; gates sigmoid(scale (cos - b)) with a learned offset from 0.5 (from 0 they
+  saturated); read spans capped at 16 reps. Item keys come from the key heads on
+  current values; the stored keys are the search cache, re-keyed periodically.
+  Live item state on the CPU until the store batches its reads (per-item GPU
+  gathers cost 22 of 30 s per step). Retrieval loss weight 0.5 (annealed),
+  balance loss 0.01. Not yet built: L1b (hook), items written during episodes,
+  in-batch negatives, starting L1a from K2's heads.
