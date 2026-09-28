@@ -985,12 +985,17 @@ def load_producers(args, ctx: Context, writer: Writer, log: WriteLog, model) -> 
         print(json.dumps({'warning': 'bank writer state differs from --reader-state',
                           'bank': manifest.get('reader_state'),
                           'reader_state': str(args.reader_state)}), flush=True)
-    if manifest.get('span_batch_size') != 1 or args.l1b_batch != 1:
+    if args.l1b_replay == 'free' and (manifest.get('span_batch_size') != 1
+                                      or args.l1b_batch != 1):
         # the GPU free run depends on its batch composition (padding): exact replay needs
-        # the bank's spans written one at a time and replayed one at a time
-        print(json.dumps({'warning': 'L1b replay of bank items is not exact (bank span batch '
-                          f'{manifest.get("span_batch_size")}, --l1b-batch {args.l1b_batch}); '
-                          'see l1b_match_* in the logs'}), flush=True)
+        # the bank's spans written one at a time and replayed one at a time; a batched bank
+        # is off by up to ~30% for some records (invariant 3), so it is refused
+        message = ('L1b free replay is not exact for this bank (bank span batch '
+                   f'{manifest.get("span_batch_size")}, --l1b-batch {args.l1b_batch}); build '
+                   'with --span-batch-size 1, or pass --l1b-allow-inexact')
+        if not args.l1b_allow_inexact:
+            raise ValueError(message)
+        print(json.dumps({'warning': message}), flush=True)
     root = Path(manifest['span_cache'])
     caches = {}
     for name in ctx.kbs:
@@ -1274,6 +1279,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                    help='L1b producer replay (schnitz.kb.producer): the free run itself (the '
                         'stored forward), teacher-fed on the stored span (one pass), or one '
                         'pass fed with the writer\'s own free run')
+    t.add_argument('--l1b-allow-inexact', action='store_true',
+                   help='run L1b free replay on a bank whose spans were written in batches '
+                        '(not exact; refused otherwise)')
     t.add_argument('--l1b-batch', type=int, default=1,
                    help='bank sources per producer pass (1: the replay is exact when the bank\'s '
                         'spans were written one at a time, build --span-batch-size 1)')
