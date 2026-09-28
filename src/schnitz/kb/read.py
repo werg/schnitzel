@@ -241,6 +241,7 @@ class SpaceRead:
     scored_gates: Tensor | None = None   # differentiable gates of every scored candidate
     recomputed: int = 0           # L1b: items read with the producers' recomputed values
     scales: list[float] = field(default_factory=list)   # per item read: stored mass x weight
+    values: list[Tensor] = field(default_factory=list)  # the values read (with their graph)
 
 
 @dataclass
@@ -464,7 +465,7 @@ class L1Reader(nn.Module):
             elif wanted:
                 recall = recall_read = 0.0
             info[s] = SpaceRead(refs, g.cpu(), float(mass.detach()), count, recall, recall_read,
-                                scored, scored_gates, recomputed, list(scale))
+                                scored, scored_gates, recomputed, list(scale), list(values))
         aux_loss = torch.stack(aux).mean() if aux else None
         if c.read_combine == 'r':
             span, n = self._span_r(entries, queries, read_positions, read_spaces, read_gates,
@@ -564,6 +565,44 @@ class L1Reader(nn.Module):
             return self._span_r(entries, queries, read_positions, read_spaces, read_gates,
                                 state)[0]
         return self._span(reads, masses, read_positions, read_spaces, read_gates, state)[0]
+
+    def fixed_read(self, state: Tensor, donor: Read) -> Read:
+        """The read of ``donor``'s items at ``donor``'s gates, conditioned on the query of
+        ``state``: the information-matched content control of L1's contrast term
+        (``--contrast-weight``). Same items, same gates (stored mass x weight included),
+        so the same per-space counts and the same span length; the item payloads and the
+        gates enter detached, so only R (and S_s), the query heads through R's condition,
+        and whatever produced ``state`` receive gradients."""
+        reads, masses, read_positions, read_spaces, read_gates = {}, {}, [], [], []
+        entries, queries, info = [], {}, {}
+        for s in self.spaces:
+            q = self.keys.query_key(s, state)
+            queries[s] = q
+            got = donor.spaces.get(s)
+            if got is None or not got.refs:
+                continue
+            if len(got.values) != len(got.refs):
+                raise ValueError('the donor read keeps no item values')
+            items = [v.detach().to(q.device) for v in got.values]
+            gates = got.gates.detach().to(q.device, torch.float)
+            if self.config.read_combine == 'r':
+                entries += [(s, v, g) for v, g in zip(items, gates)]
+                mass, count = gates.sum(), sum(int(v.shape[0]) for v in items)
+            else:
+                out, mass, count, _ = self._combine(s, q, items, gates, [1.0] * len(items))
+                reads[s] = out
+            masses[s] = mass
+            read_positions += [int(v.shape[0]) for v in items]
+            read_spaces += [s] * len(items)
+            read_gates.append(gates)
+            info[s] = SpaceRead(list(got.refs), gates.cpu(), float(mass), count,
+                                scales=list(got.scales), values=items)
+        if self.config.read_combine == 'r':
+            span, n = self._span_r(entries, queries, read_positions, read_spaces, read_gates,
+                                   state)
+        else:
+            span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
+        return Read(span, info, None, n, {}, state.detach())
 
     def _retrieval_loss(self, space, q, refs, scores, wanted: Mapping[Ref, float], by_dataset,
                         cache, query_time, negatives: Sequence[Ref] = ()):

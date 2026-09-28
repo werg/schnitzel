@@ -830,3 +830,165 @@ def test_ste_round_is_exactly_the_serialized_value():
     assert torch.equal(y, x.detach().bfloat16().float())        # bitwise, not up to an ulp
     y.sum().backward()
     assert torch.equal(x.grad, torch.ones_like(x))
+
+
+
+# -- content contrast, null prefix, reader decoder layers ------------------------------
+@pytest.mark.parametrize('combine', ['s_s', 'r'])
+def test_contrast_is_zero_for_the_identity_permutation(tmp_path, combine):
+    """Reading an episode's own items at its own gates through the contrast arm gives the
+    retrieved NLL exactly, so the term (margin 0) and its gradient vanish."""
+    ctx, _ = context(tmp_path, read_combine=combine)
+    ep = episode(IDS, [3, 10], [6, 13])
+    cache = ItemCache(train=True)
+    nll, _, reads, _ = l1.run_episode(ctx, ep, cache)
+    term, stats = l1.contrast_term(ctx, ep, nll, reads, cache, train_args(contrast_margin=0.0))
+    assert float(term) == 0.0 and stats['content_nats_train'] == 0.0
+    term.backward()
+    assert all(p.grad is None or not p.grad.any() for p in ctx.reader.parameters())
+
+
+@pytest.mark.parametrize('combine', ['s_s', 'r'])
+def test_contrast_arm_matches_counts_and_gates_and_trains_r_not_donor_items(tmp_path, combine):
+    ctx, _ = context(tmp_path, read_combine=combine)
+    ep = episode(IDS, [3, 10], [6, 13], records=(['r1'], ['r2']))
+    other = episode([2, 8, 7, 11, 12, 13, MEM, MEM_END, 5, 4, 16, 17, 18, MEM, MEM_END, 3, 20,
+                     21, 22, 23], [3, 10], [6, 13], records=(['r3'], ['r1']))
+    donor_cache = ItemCache(train=True)
+    _, _, donor_reads, _ = l1.run_episode(ctx, other, donor_cache)
+    cache = ItemCache(train=True)
+    shuffled, _, reads, _ = l1.run_episode(ctx, ep, cache, 'donor', donors=donor_reads)
+    assert len(reads) == len(donor_reads)
+    for mine, theirs in zip(reads, donor_reads):     # same items, gates and span length
+        assert mine.n == theirs.n and mine.span.shape == theirs.span.shape
+        for s in SPACES:
+            assert mine.spaces[s].refs == theirs.spaces[s].refs
+            torch.testing.assert_close(mine.spaces[s].gates, theirs.spaces[s].gates,
+                                       rtol=0, atol=0)
+    shuffled.backward()
+    assert ctx.reader.recombiner.head[1].weight.grad.abs().sum() > 0      # R trains
+    # the donor's item payloads are detached in the contrast arm
+    assert all(v.grad is None for v in donor_cache.values.values())
+    assert all(v.grad is None for v in cache.values.values())
+    # the full term: gradients reach R through both arms (margin keeps it active)
+    ctx.reader.zero_grad(set_to_none=True)
+    cache = ItemCache(train=True)
+    nll, _, _, _ = l1.run_episode(ctx, ep, cache)
+    term, stats = l1.contrast_term(ctx, ep, nll, donor_reads, cache,
+                                   train_args(contrast_margin=10.0))
+    assert float(term) > 0 and stats['content_nats_train'] != 0.0
+    term.backward()
+    assert ctx.reader.recombiner.head[1].weight.grad.abs().sum() > 0
+    assert any(v.grad is not None and v.grad.abs().sum() > 0 for v in cache.values.values())
+
+
+def test_contrast_donors_are_a_derangement_within_each_kb():
+    eps = [episode(IDS, [3, 10], [6, 13], kb=kb) for kb in ('a', 'b', 'a', 'a', 'c')]
+    donors = l1.contrast_donors(eps)
+    assert donors == [3, None, 0, 2, None]
+    assert all(d is None or (d != i and eps[d].kb == eps[i].kb) for i, d in enumerate(donors))
+
+
+def test_train_step_logs_the_contrast(tmp_path):
+    ctx, _ = context(tmp_path, read_combine='r')
+    a = episode(IDS, [3, 10], [6, 13], records=(['r1'], ['r2']))
+    b = episode(IDS, [3, 10], [6, 13], records=(['r3'], ['r1']))
+    b.episode_id = 'f'
+    sets = l1.parameter_sets(ctx.reader)
+    trainable = l1.set_phase(sets, l1.L1A_SET)
+    opt = torch.optim.AdamW(trainable, lr=1e-3)
+    out = l1.train_step(ctx, [a, b], opt, train_args(contrast_weight=1.0, contrast_margin=0.5),
+                        0, trainable=trainable)
+    assert out['contrast_episodes'] == 2 and 'content_nats_train' in out and 'contrast' in out
+    out = l1.train_step(ctx, [a], opt, train_args(contrast_weight=1.0), 1, trainable=trainable)
+    assert 'contrast' not in out            # no same-KB donor in the batch: no term
+
+
+def test_null_prefix_sits_in_front_of_every_span_and_trains(tmp_path):
+    ctx, _ = context(tmp_path, read_combine='r')
+    prefix = l1.NullPrefix(['ds'], 3, ctx.reader.stack)
+    ctx = l1.Context(ctx.frozen, ctx.reader, ctx.kbs, prefix=prefix)
+    ep = episode(IDS, [3, 10], [6, 13])
+    empty = [torch.zeros(0, HIDDEN)] * 2
+    nll, _, _, spans = l1.run_episode(ctx, ep, ItemCache(train=False), 'fixed', empty)
+    assert all(s.shape[0] == 0 for s in spans)       # the returned spans are the reads'
+    nll.backward()                                     # the no-memory arm carries it too
+    assert prefix.z['ds'].grad.abs().sum() > 0
+    assert [s.shape[0] for s in ctx.spliced(ep, empty)] == [3, 3]
+    args = train_args(null_prefix=3, decoder_train_below=0)
+    assert 'prefix' in l1.phase_set('l1a', args) and 'prefix' in l1.phase_set('r', args)
+    assert 'prefix' not in l1.phase_set('l1b', args, ('keys',))
+    sets = l1.parameter_sets(ctx.reader, prefix=prefix)
+    assert sets['prefix'] == [prefix.z['ds']]
+
+
+def test_decoder_train_below_zero_is_the_frozen_reader(tmp_path):
+    ctx, _ = context(tmp_path)
+    assert ctx.frozen.parent is None and len(ctx.frozen.own) == 0 and not ctx.frozen.trains
+    sets = l1.parameter_sets(ctx.reader, decoder=ctx.frozen)
+    assert sets['decoder'] == []
+    args = train_args(decoder_train_below=0, lr=1e-3, l1b_codec_lr=1e-4, l1b_writer_lr=1e-5)
+    assert 'decoder' not in l1.phase_set('l1a', args)
+    assert l1.decoder_replay_kl(args) == 0.0
+    sets.update(codecs=[], writer=[])
+    assert len(l1.optimizer_groups(sets, args)) == 3
+
+
+def _reader_decoder_context(tmp_path, below=2, checkpointing=False):
+    lm, _ = tiny_lm()
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    frozen = l1.Frozen(lm, 3, train_below=below, checkpointing=checkpointing)
+    for p in frozen.own.parameters():
+        p.requires_grad_(True)
+    return l1.Context(frozen, reader(), {'ds': kb}), lm
+
+
+def test_reader_decoder_starts_as_its_parent(tmp_path):
+    ctx, lm = _reader_decoder_context(tmp_path)
+    x = ctx.frozen.embed(torch.tensor(IDS))[None]
+    with torch.no_grad():
+        mine = ctx.frozen.logits(ctx.frozen.final(x))
+        parent = ctx.frozen.parent.logits(ctx.frozen.parent.final(x))
+        mid, parent_mid = ctx.frozen.mid(x), ctx.frozen.parent.mid(x)
+    torch.testing.assert_close(mine, parent, rtol=0, atol=0)
+    torch.testing.assert_close(mid, parent_mid, rtol=0, atol=0)
+    assert ctx.frozen.lm.model.layers is not lm.model.layers
+    assert ctx.frozen.lm.model.layers[2] is lm.model.layers[2]           # shared, frozen
+    assert ctx.frozen.lm.model.layers[0] is not lm.model.layers[0]       # own copy
+    assert ctx.frozen.lm.lm_head is lm.lm_head
+    kl = l1.parent_kl(ctx, episode(IDS, [3, 10], [6, 13]))
+    assert abs(float(kl)) < 1e-6
+    args = train_args(decoder_train_below=2)
+    assert l1.decoder_replay_kl(args) == 0.1
+    assert 'decoder' in l1.phase_set('l1a', args) and 'decoder' in l1.phase_set('r', args)
+
+
+@pytest.mark.parametrize('checkpointing', [False, True])
+def test_only_reader_layers_below_n_get_gradients(tmp_path, checkpointing):
+    ctx, lm = _reader_decoder_context(tmp_path, checkpointing=checkpointing)
+    ep = episode(IDS, [3, 10], [6, 13])
+    nll, n, _, _ = l1.run_episode(ctx, ep, ItemCache(train=True))
+    (nll / n).backward()
+    own = list(ctx.frozen.own.parameters())
+    assert own and all(p.grad is not None for p in own)
+    assert any(p.grad.abs().sum() > 0 for p in ctx.frozen.own[0].parameters())
+    assert all(p.grad is None for p in lm.parameters())       # parent: embeddings, layers
+    assert all(p.grad is None for layer in ctx.frozen.lm.model.layers[2:]
+               for p in layer.parameters())                   # the frozen top, LM head
+    grads = [p.grad.clone() for p in own]
+    if checkpointing:     # recomputation gives the same gradients as stored activations
+        plain, _ = _reader_decoder_context(tmp_path / 'plain')
+        nll2, n2, _, _ = l1.run_episode(plain, ep, ItemCache(train=True))
+        (nll2 / n2).backward()
+        for a, b in zip(grads, [p.grad for p in plain.frozen.own.parameters()]):
+            torch.testing.assert_close(a, b)
+    # the parent-preservation KL reaches the own layers only
+    ctx.frozen.own.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        for p in ctx.frozen.own.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    kl = l1.parent_kl(ctx, ep)
+    assert float(kl) > 0
+    kl.backward()
+    assert all(p.grad is not None for p in ctx.frozen.own.parameters())
+    assert all(p.grad is None for p in lm.parameters())

@@ -883,6 +883,45 @@ log your decisions and changes of direction"), newest last.
   rows are close to free rows (captured 0.716 vs 0.775 after 20 joint steps) at five
   times the step cost (30-37 s against 6-7 s), because the aggregators run one small
   call per row and level; batching them per level is next.
+- 28 September: a long read phase on its own run (`kb-read-long`), because 30 smoke
+  steps moved the rows only about 1%. It uses 300 transcripts per corpus, 2000 read
+  steps and item lr 3e-2 (10x the smoke's), with row and key drift evaluated every 250
+  steps. The write fit then runs on the drifted rows.
+- 28 September: the long read phase on plain text-to-SQL was stopped at step ~300.
+  Rows drifted 10-13% by step 250, but shuffled reads helped as much as the right
+  ones (captured 1.19 vs 1.22, content 0.01 nats). The decoder is frozen in L1a, so
+  R and the read operators learned a content-free format prompt, and schema names are
+  mostly guessable. The long read phase moves to spider-memory (answers are stored
+  values, dev databases held out) as `kb-read-values`. The SQL tasks get schema
+  aliasing, and L1 gets a content-contrast term against shuffled reads and an
+  optional null prefix (in progress).
+- 28 September: the long read phase moves again, to the r6-mixed QA passages
+  (`kb-read-qa`, 1000 transcripts). Spider-memory had little headroom (0.35 nats
+  between no context and full context), while r6 QA reads were strongly
+  content-dependent in B3 (teacher captured 0.53 right vs -0.45 shuffled).
+  Contamination is not a concern at 350M, which knows little long-tail knowledge, so
+  real corpora serve. A synthetic fictional-people world (32 vs 4 records per fact)
+  is being built as a controlled redundancy knob; high redundancy is expected to be
+  key to learning content use.
+- 28 September: redundancy should come with diversity, not verbatim repeats.
+  Overlapping windows of one text are one version stored many times, so they are
+  kept only as a read-path sanity check (`recall-text`). The first diverse probe is
+  parallel-version recall: verse-aligned public-domain Bible translations, with the
+  target version never stored (agent building it). Queued next: scientific background
+  and methods text. Many papers describe the same method, and citation contexts
+  (PMC open-access citances, S2ORC inline citations) group many independent
+  descriptions per cited paper. Its target is the cited paper's abstract or a held-out
+  paper's background paragraph, with the other descriptions in the KB. It waits for
+  the first probes' results.
+- 28 September (owner): the training plan stays flexible and follows evidence. The
+  L1 read phase is reoriented to high-redundancy, high-target-entropy probes:
+  parallel-version recall, citance recall, r6 QA, and the synthetic redundancy knob.
+  How to continue (SQL with aliasing, agent tasks, B9) is decided from their
+  retrieved-vs-shuffled results. B3 -> B4 and K1 continue unchanged.
+- 28 September (owner): SQL hardening is deprioritized. The aliasing option is
+  committed as code with tests, but no aliased corpora are generated. The synthetic
+  people world stays as a small, optional redundancy probe (r32 only). Focus goes to
+  the diverse-redundancy probes: parallel-version recall, citance recall, r6 QA.
 - 28 Sep, superposed KB second pass (coordinator's list). (1) Batched aggregators as
   packed pairs with segment sums rather than padding (no waste on fields of 1 to 48
   inputs; a group's result equals the per-row call up to summation order; the
@@ -899,5 +938,6 @@ log your decisions and changes of direction"), newest last.
   Sparse shares in `kb_store.rewrite` as a separate branch, so dense rewrites are bit for
   bit unchanged; row placement keeps the exact FPS for small KBs (unchanged results) and
   uses FPS inside k-means++ buckets beyond; scans stay exact (invariant 8). (5) Read-phase
-  item rate on rows 1e-2 (3e-2 overfits the smoke set after 100 steps; 3e-3 barely moves
-  the rows).
+  item rate on rows 1e-2 by default (3e-2 overfits the 100-transcript smoke set after
+  100 steps; 3e-3 barely moves the rows); runs that set `--item-lr`, such as the long
+  read phases above at 3e-2, are unaffected.

@@ -31,11 +31,19 @@ spans of all earlier reads spliced in (a pass per site, truncated at the query
 layer, recomputed in backward), so gradients reach earlier reads through later
 queries too; then one full pass gives the task loss. Jointly trained: item values
 and keys in place (``kb_store`` live mode, sparse Adam per item and key), key
-heads, S_s and R; the decoder is frozen. An auxiliary retrieval loss (listwise, over
+heads, S_s and R; the decoder is frozen (``--decoder-train-below N`` trains the
+reader's own copies of its layers below N, the writer keeping the parent's weights,
+with a KL to the parent on the no-read context). An auxiliary retrieval loss (listwise, over
 the scored candidates, the targets the search missed and in-batch negatives: the
 target items of the batch's other slots in the same KB, never another KB's) supervises
 routing; recall@k per space is logged. ``--init-reader`` starts from a K2 run's key
 heads and gate offsets (K2 -> L1a; the search keys are refreshed from them).
+
+Content dependence (all off by default): ``--contrast-weight`` adds per episode
+weight x relu(``--contrast-margin`` + NLL_retrieved - NLL_shuffled), the shuffled arm
+reading another same-KB episode's items at their gates (detached) through the same R
+(``contrast_term``); ``--null-prefix N`` puts N learned reps per KB in front of every
+read span in every arm, a content-free home for task format.
 
 Phases (``--phase``, or alternating with ``--phase-schedule a:2000,b:500``):
 
@@ -240,16 +248,63 @@ class _Stop(Exception):
     pass
 
 
-class Frozen:
-    """The frozen reader: embeddings (protocol hooks included), the hidden state after
-    ``query_layer`` layers (a truncated pass), final hidden states and LM-head logits."""
+def _shallow(module: torch.nn.Module) -> torch.nn.Module:
+    """A new module object sharing ``module``'s parameters and submodules, with its own
+    registries (submodules, parameters, buffers, hooks), so replacing a submodule of the
+    copy leaves ``module`` unchanged."""
+    import copy
+    out = copy.copy(module)
+    out.__dict__ = {k: copy.copy(v) if isinstance(v, dict) else v
+                    for k, v in module.__dict__.items()}
+    return out
 
-    def __init__(self, lm, query_layer: int, autocast=None):
+
+def reader_decoder(lm, below: int, checkpointing: bool = False):
+    """``--decoder-train-below N``: the reader's decoder, a copy of ``lm`` whose layers
+    ``< below`` are its own copies (trainable; everything else - embeddings, the layers
+    from ``below`` up, the final norm and the LM head - is shared with ``lm`` and stays
+    frozen). ``lm`` itself is not changed, so the writer (which runs ``lm``) keeps its
+    weights. Returns (reader lm, the copied layers)."""
+    from schnitz.bgkit_span import checkpoint_layers, release_checkpointing
+    layers = lm.model.layers
+    if not 0 < below <= len(layers):
+        raise ValueError(f'--decoder-train-below {below} outside 1..{len(layers)}')
+    import copy
+    own = torch.nn.ModuleList(copy.deepcopy(layers[i]) for i in range(below))
+    release_checkpointing(own)    # a copied wrapper would still call the parent's layer
+    if checkpointing:
+        checkpoint_layers(own)
+    inner = _shallow(lm.model)
+    inner.layers = torch.nn.ModuleList(list(own) + list(layers[below:]))
+    out = _shallow(lm)
+    out.model = inner
+    return out, own
+
+
+class Frozen:
+    """The reader's decoder: embeddings (protocol hooks included), the hidden state after
+    ``query_layer`` layers (a truncated pass), final hidden states and LM-head logits.
+    Frozen unless ``train_below`` > 0 (``--decoder-train-below``): then its layers below
+    that index are the reader's own trainable copies (``own``; ``reader_decoder``) and
+    ``parent`` is the untouched decoder (the parent-preservation KL)."""
+
+    def __init__(self, lm, query_layer: int, autocast=None, train_below: int = 0,
+                 checkpointing: bool = False):
+        self.parent = None
+        self.own = torch.nn.ModuleList()
+        if train_below > 0:
+            self.parent = Frozen(lm, query_layer, autocast)
+            lm, self.own = reader_decoder(lm, train_below, checkpointing)
         self.lm, self.inner = lm, lm.model
         self.query_layer = query_layer
         self.autocast = autocast or (lambda: torch.autocast('cpu', enabled=False))
         if not 1 <= query_layer <= len(self.inner.layers):
             raise ValueError('query layer out of range')
+
+    @property
+    def trains(self) -> bool:
+        """Whether any of the reader's own decoder layers currently takes gradients."""
+        return any(p.requires_grad for p in self.own.parameters())
 
     @property
     def device(self):
@@ -306,12 +361,35 @@ def write_item_id(episode_id: str, site: int, space: str) -> str:
     return 'w' + hashlib.sha1(f'{episode_id}#{site}#{space}'.encode()).hexdigest()[:31]
 
 
+class NullPrefix(torch.nn.Module):
+    """``--null-prefix N``: a learned soft prefix of N reps per KB (task), placed in front
+    of every read span between ``<|mem|>`` and ``<|/mem|>`` in every arm (retrieved,
+    shuffled, gold, no memory), so task-format learning has a content-free home and R is
+    not needed for it. Parameterized in the read spans' standardized coordinates (the
+    stack's ``mean + std * z``, z starting small), trained at ``--lr``."""
+
+    def __init__(self, kbs, reps: int, stack, init: float = 0.1, seed: int = 0):
+        super().__init__()
+        gen = torch.Generator().manual_seed(seed)
+        width = int(stack.mean.numel())
+        self.z = torch.nn.ParameterDict({
+            name: torch.nn.Parameter(init * torch.randn(reps, width, generator=gen))
+            for name in sorted(kbs)})
+        self.stack = [stack]         # not a submodule: its statistics are the stack's
+
+    def forward(self, kb: str) -> torch.Tensor:
+        st = self.stack[0]
+        return st.mean.reshape(-1) + st.std.reshape(-1) * self.z[kb]
+
+
 class Context:
     """What a pass needs: the frozen decoder, the reader, the KBs and their item index."""
 
     def __init__(self, frozen: Frozen, reader: L1Reader, kbs: dict[str, KnowledgeBase],
-                 autocast=None, views: dict | None = None):
+                 autocast=None, views: dict | None = None,
+                 prefix: NullPrefix | None = None):
         self.frozen, self.reader, self.kbs = frozen, reader, kbs
+        self.prefix = prefix           # --null-prefix (None: off)
         self.autocast = autocast or frozen.autocast
         # --rows-from-stack: per dataset a ``superpose.SuperposedKB`` whose rows (combiner
         # outputs over this KB's items, the leaves) are what reads see
@@ -369,6 +447,13 @@ class Context:
         return index is not None and all(
             all(r in index[s] for s in index) for slot in ep.slots for r in slot['record_ids'])
 
+    def spliced(self, ep: Episode, spans: list[torch.Tensor]) -> list[torch.Tensor]:
+        """The spans as spliced: with ``--null-prefix`` each behind the KB's prefix."""
+        if self.prefix is None:
+            return spans
+        head = self.prefix(ep.kb)
+        return [torch.cat([head, s.to(head.device, head.dtype)]) for s in spans]
+
     def targets(self, ep: Episode, j: int) -> dict[str, list[tuple[str, str]]]:
         slot = ep.slots[j]
         if slot.get('kb', ep.kb) != ep.kb:
@@ -381,11 +466,17 @@ class Context:
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
                 spans: list[torch.Tensor] | None = None, retrieval_only: bool = False,
                 negatives: dict | None = None, producer=None,
-                weights: dict[str, float] | None = None):
+                weights: dict[str, float] | None = None, donors: list | None = None):
     """Task NLL (summed over target tokens) of one transcript and its reads.
 
     ``mode`` 'retrieve' or 'gold' computes each read at its call from the exact causal
-    prefix; 'fixed' splices the given ``spans`` (controls). ``retrieval_only`` (K2):
+    prefix; 'fixed' splices the given ``spans`` (controls); 'donor' (the contrast arm,
+    ``--contrast-weight``) makes the read at call j from the query of this episode's own
+    causal prefix (with this arm's earlier spans) over the items and gates of
+    ``donors[j % len(donors)]`` (another episode's reads; ``L1Reader.fixed_read``), and
+    no read without donors. With ``--null-prefix`` every spliced span is behind the
+    KB's prefix (``Context.spliced``; the returned spans are the reads' own).
+    ``retrieval_only`` (K2):
     the reads' spans enter later prefixes detached and no task pass runs (NLL None),
     so only the retrieval loss trains, through the queries and the item keys.
     ``negatives`` (per space, the episode's own KB only): in-batch negatives of the
@@ -407,14 +498,25 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                 group.append(group[-1] + 1)
             b = before[k]
             end = ep.calls[group[-1]] + 1
-            x, index = splice(embeds[:end], ep.mems[:b], spans[:b])
-            if torch.is_grad_enabled() and any(s.requires_grad for s in spans[:b]):
+            x, index = splice(embeds[:end], ep.mems[:b], ctx.spliced(ep, spans[:b]))
+            if torch.is_grad_enabled() and (x.requires_grad or ctx.frozen.trains):
                 # recomputed in backward; retrieval stays outside the recomputed function
                 h = checkpoint(ctx.frozen.mid, x[None], use_reentrant=False)[0]
             else:
                 with torch.no_grad():
                     h = ctx.frozen.mid(x[None])[0]
             for j in group:
+                if mode == 'donor':
+                    if not donors:
+                        spans.append(torch.zeros(0, ctx.reader.config.span_width,
+                                                 device=h.device))
+                        continue
+                    with ctx.autocast():
+                        read = ctx.reader.fixed_read(h[index[ep.calls[j]]],
+                                                     donors[j % len(donors)])
+                    reads.append(read)
+                    spans.append(read.span.float())
+                    continue
                 with ctx.autocast():
                     read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
@@ -429,7 +531,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
             k = group[-1] + 1
     if retrieval_only:
         return None, int(ep.targets.numel()), reads, spans
-    x, index = splice(embeds, ep.mems, spans)
+    x, index = splice(embeds, ep.mems, ctx.spliced(ep, spans))
     hidden = ctx.frozen.final(x[None])[0]
     positions = index[ep.targets] - 1
     logits = ctx.frozen.logits(hidden[positions])
@@ -794,23 +896,32 @@ def batch_negatives(ctx: Context, episodes: list[Episode], limit: int,
 
 
 # which parameter sets train in each phase (``--l1b-train`` chooses L1b's). ``write``: the
-# aggregators of ``--rows-from-stack`` (empty otherwise)
-PHASE_SETS = ('keys', 'operators', 'recombiner', 'codecs', 'writer', 'write')
+# aggregators of ``--rows-from-stack`` (empty otherwise); ``prefix``: ``--null-prefix``;
+# ``decoder``: the reader decoder's own lower layers (``--decoder-train-below``); the last
+# two train in the read-side phases (l1a, r) when enabled
+PHASE_SETS = ('keys', 'operators', 'recombiner', 'codecs', 'writer', 'write', 'prefix',
+              'decoder')
 L1A_SET = ('keys', 'operators', 'recombiner')
 READ_SET = ('keys', 'operators', 'recombiner')
 WRITE_SET = ('write',)
 PHASES = {'a': 'l1a', 'b': 'l1b', 'r': 'r', 'w': 'w'}
 
 
-def parameter_sets(reader: L1Reader, writer_model=None, write_ops=None) -> dict[str, list]:
+def parameter_sets(reader: L1Reader, writer_model=None, write_ops=None, prefix=None,
+                   decoder=None) -> dict[str, list]:
     """The trainable parameter sets: key heads and gate offsets, S_s (read-time combine,
     ``--read-combine s_s``), R (the read's), the codecs, the writer's span heads (marker,
-    ratio code, rep head) and the aggregators (``--rows-from-stack``)."""
+    ratio code, rep head), the aggregators (``--rows-from-stack``), the null prefix
+    (``--null-prefix``) and the reader decoder's own lower layers (``decoder``: a
+    ``Frozen`` with ``train_below`` > 0; never the writer's decoder, embeddings, final
+    norm or LM head)."""
     return {'keys': list(reader.keys.parameters()) + list(reader.gate_offset.parameters()),
             'operators': list(reader.operators.parameters()),
             'recombiner': list(reader.recombiner.parameters()),
             **producer_params(writer_model, reader.stack),
-            'write': [] if write_ops is None else list(write_ops.parameters())}
+            'write': [] if write_ops is None else list(write_ops.parameters()),
+            'prefix': [] if prefix is None else list(prefix.parameters()),
+            'decoder': [] if decoder is None else list(decoder.own.parameters())}
 
 
 def phase_set(phase: str, args, l1b_set=()) -> tuple[str, ...]:
@@ -820,26 +931,33 @@ def phase_set(phase: str, args, l1b_set=()) -> tuple[str, ...]:
     ``--l1b-train``."""
     if phase == 'l1b':
         return tuple(l1b_set)
-    if phase == 'r':
-        return READ_SET
     if phase == 'w':
         return WRITE_SET
+    extra = (('prefix',) if getattr(args, 'null_prefix', 0) else ()) + \
+        (('decoder',) if getattr(args, 'decoder_train_below', 0) else ())
+    if phase == 'r':
+        return READ_SET + extra
     joint = getattr(args, 'rows_from_stack', None) and not getattr(args, 'consolidate_every', 0)
-    return L1A_SET + (WRITE_SET if joint else ())
+    return L1A_SET + extra + (WRITE_SET if joint else ())
 
 
 def optimizer_groups(sets: dict[str, list], args) -> list[dict]:
-    """AdamW groups: the reader (keys, S_s, R) at ``--lr``; the producers at their own
-    L1b rates (``--l1b-codec-lr``, ``--l1b-writer-lr``), since one step at the reader's
-    rate moved the recomputed items by 25-45%; the aggregators (``--rows-from-stack``)
-    at ``--write-lr``."""
-    groups = [{'params': [p for name in ('keys', 'operators', 'recombiner') for p in sets[name]],
+    """AdamW groups: the reader (keys, S_s, R, the null prefix) at ``--lr``; the producers
+    at their own L1b rates (``--l1b-codec-lr``, ``--l1b-writer-lr``), since one step at the
+    reader's rate moved the recomputed items by 25-45%; the aggregators
+    (``--rows-from-stack``) at ``--write-lr``; the reader decoder's own layers
+    (``--decoder-train-below``) at ``--decoder-lr``, no weight decay."""
+    groups = [{'params': [p for name in ('keys', 'operators', 'recombiner', 'prefix')
+                          for p in sets.get(name, ())],
                'lr': args.lr, 'weight_decay': 0.01},
               {'params': sets['codecs'], 'lr': args.l1b_codec_lr, 'weight_decay': 0.01},
               {'params': sets['writer'], 'lr': args.l1b_writer_lr, 'weight_decay': 0.0}]
     if sets.get('write'):
         groups.append({'params': sets['write'], 'lr': getattr(args, 'write_lr', None) or args.lr,
                        'weight_decay': 0.01})
+    if sets.get('decoder'):     # its own group only when it trains (older checkpoints load)
+        groups.append({'params': sets['decoder'], 'lr': getattr(args, 'decoder_lr', 3e-5),
+                       'weight_decay': 0.0})
     return groups
 
 
@@ -883,6 +1001,65 @@ def phase_at(schedule: list[tuple[str, int]], step: int, read_warmup: int = 0) -
     raise AssertionError
 
 
+def contrast_donors(episodes: list[Episode]) -> list[int | None]:
+    """The contrast arm's donor episode per episode: a derangement within each KB of the
+    batch (a cyclic shift by one over the KB's episodes in batch order, so every episode's
+    donor is a different episode of its own KB and at most one episode per KB waits for
+    its donor); None for an episode alone in its KB in the batch. Donors never cross KBs:
+    a KB is an authorization domain (invariant 6), and a same-KB donor is the harder,
+    better matched control."""
+    groups: dict[str, list[int]] = {}
+    for i, ep in enumerate(episodes):
+        groups.setdefault(ep.kb, []).append(i)
+    out: list[int | None] = [None] * len(episodes)
+    for members in groups.values():
+        if len(members) > 1:
+            for k, i in enumerate(members):
+                out[i] = members[k - 1]
+    return out
+
+
+def contrast_term(ctx: Context, ep: Episode, nll: torch.Tensor, donor_reads: list,
+                  cache, args) -> tuple[torch.Tensor, dict]:
+    """``relu(margin + nll_retrieved - nll_shuffled)`` per episode, token-mean NLL on the
+    loss mask. The shuffled arm (``run_episode`` mode 'donor') reads another episode's
+    retrieved items at their gates (same counts, same gates: an information-matched
+    control) through the same R, conditioned on this episode's own causal queries; its
+    item payloads and gates are detached, so the rows are only pushed towards being useful
+    for their own episodes, never towards hurting others. Gradients reach R/S_s, the query
+    heads (R's condition and the queries' prefixes), the null prefix and the reader's
+    decoder layers through both arms, and the items and keys through the retrieved arm."""
+    shuffled, n, _, _ = run_episode(ctx, ep, cache, 'donor', donors=donor_reads)
+    n = max(n, 1)
+    ret, shuf = nll / n, shuffled / n
+    term = torch.relu(getattr(args, 'contrast_margin', 0.0) + ret - shuf)
+    return term, {'contrast': term.item(), 'content_nats_train': (shuf - ret).item()}
+
+
+def decoder_replay_kl(args) -> float:
+    """``--decoder-replay-kl``: 0.1 by default when the decoder trains, else 0."""
+    if not getattr(args, 'decoder_train_below', 0):
+        return 0.0
+    value = getattr(args, 'decoder_replay_kl', None)
+    return 0.1 if value is None else value
+
+
+def parent_kl(ctx: Context, ep: Episode) -> torch.Tensor | None:
+    """Parent preservation (``--decoder-train-below``): KL(parent || reader decoder) of the
+    next-token distributions on the episode's no-read context (empty memory spans, no
+    prefix) at its loss positions, mean over positions."""
+    parent = ctx.frozen.parent
+    if parent is None or not ctx.frozen.trains or ep.targets.numel() == 0:
+        return None
+    from schnitz.kb.losses import kl
+    x = ctx.frozen.embed(ep.ids)[None]
+    positions = ep.targets - 1
+    with torch.no_grad():
+        target = parent.logits(parent.final(x)[0][positions])
+    logits = ctx.frozen.logits(ctx.frozen.final(x)[0][positions])
+    return kl(logits, target)
+
+
 def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0,
                usage: dict | None = None, *, phase: str | None = None,
                trainable: list | None = None, writer: Writer | None = None,
@@ -922,11 +1099,35 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     if producer is not None:
         producer.begin()
     requests: list[WriteRequest] = []
-    for ep in episodes:
+    contrast_weight = 0.0 if args.retrieval_only else getattr(args, 'contrast_weight', 0.0)
+    donor_of = contrast_donors(episodes) if contrast_weight > 0 else [None] * len(episodes)
+    kl_weight = 0.0 if args.retrieval_only else decoder_replay_kl(args)
+    done: dict[int, list] = {}       # episode index -> its reads (donor material)
+    pending: dict[int, tuple] = {}   # episodes waiting for their donor's reads
+    contrast: dict[str, list] = {}
+
+    def finish(i: int, terms: list, nll) -> None:
+        """Add the episode's contrast term (its donor has been read) and backpropagate."""
+        ep = episodes[i]
+        if donor_of[i] is not None and nll is not None:
+            term, stats = contrast_term(ctx, ep, nll, done[donor_of[i]], cache, args)
+            terms.append(contrast_weight * term / len(episodes))
+            for k, v in stats.items():
+                contrast.setdefault(k, []).append(v)
+        loss = sum(terms) if terms else None
+        if loss is not None and loss.requires_grad:
+            loss.backward()
+
+    for i, ep in enumerate(episodes):
         nll, _, reads, spans = run_episode(ctx, ep, cache, 'retrieve',
                                            retrieval_only=args.retrieval_only,
                                            negatives=negatives.get(ep.kb), producer=producer)
         terms = [] if nll is None else [nll / tokens]
+        if kl_weight > 0:
+            kl_value = parent_kl(ctx, ep)
+            if kl_value is not None:
+                terms.append(kl_weight * kl_value / len(episodes))
+                contrast.setdefault('decoder_kl', []).append(kl_value.item())
         aux = [r.aux for r in reads if r.aux is not None]
         if aux and weight:
             aux_mean = torch.stack(aux).mean()
@@ -937,15 +1138,21 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             if balance is not None:
                 terms.append(args.balance_weight * balance / len(episodes))
                 balance_total += balance.item() / len(episodes)
-        loss = sum(terms) if terms else None
-        if loss is not None and loss.requires_grad:
-            loss.backward()
+        done[i] = reads
+        pending[i] = (terms, nll)
+        for k in [k for k in pending if donor_of[k] is None or donor_of[k] in done]:
+            finish(k, *pending.pop(k))
         if nll is not None:
             nll_total += nll.item()
         _read_stats(reads, stats, ctx.written, cache)
         if writer is not None and ep.writes:
             requests += write_requests(ep, spans, text_ids, args.write_level_index)
+    if pending:
+        raise AssertionError('an episode\'s contrast donor was never read')
     out: dict = {}
+    if contrast:
+        out.update({k: round(sum(v) / len(v), 6) for k, v in contrast.items()})
+        out['contrast_episodes'] = len(contrast.get('contrast', ()))
     if anchor is not None and getattr(args, 'read_anchor', 0) > 0 and anchor.probes:
         a_loss, a_stats = anchor.loss(rng or random.Random(step))
         (args.read_anchor * a_loss).backward()
@@ -1382,7 +1589,11 @@ def train(args) -> None:
     if args.decoder_checkpoint:
         from schnitz.bgkit_span import checkpoint_layers
         checkpoint_layers(lm.model.layers)
-    frozen = Frozen(lm, args.query_layer, model.core.autocast)
+    # --decoder-train-below: the reader decoder's lower layers are its own trainable
+    # copies; the writer keeps running (and keeps the weights of) the parent decoder
+    frozen = Frozen(lm, args.query_layer, model.core.autocast,
+                    train_below=args.decoder_train_below,
+                    checkpointing=args.decoder_checkpoint)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
     schedule = parse_schedule(args.phase_schedule, args.phase)
@@ -1427,10 +1638,15 @@ def train(args) -> None:
         write_ops, superpose, stack_run, fit_state = load_write_stack(args.rows_from_stack,
                                                                       dims, args)
         write_ops.to(model.device)
-    sets = parameter_sets(reader, model, write_ops)
+    prefix = NullPrefix(json.loads((leaf_banks / 'banks.json').read_text())['kbs'],
+                        args.null_prefix, stack, seed=args.seed) \
+        if args.null_prefix else None
+    if prefix is not None:
+        prefix.to(model.device)
+    sets = parameter_sets(reader, model, write_ops, prefix, frozen)
     groups = optimizer_groups(sets, args)
-    for p in sets['writer'] + sets['codecs'] + sets['write']:   # AdamW takes them
-        p.requires_grad_(True)
+    for p in sets['writer'] + sets['codecs'] + sets['write'] + sets['decoder']:
+        p.requires_grad_(True)                                   # AdamW takes them
     optimizer = torch.optim.AdamW(groups, lr=args.lr)
     set_phase(sets, L1A_SET)
     usage: dict = {}
@@ -1459,6 +1675,10 @@ def train(args) -> None:
             model.writer.load_state_dict(state['writer'])
         if write_ops is not None:
             write_ops.load_state_dict(state['write_ops'])
+        if prefix is not None:
+            prefix.load_state_dict(state['null_prefix'])
+        if len(frozen.own):
+            frozen.own.load_state_dict(state['decoder_layers'])
         if key_optimizer is not None:
             key_optimizer.load_state_dict(state.get('key_optimizer', {}))
         step = state['step']
@@ -1513,7 +1733,7 @@ def train(args) -> None:
                                        leaf_key=head_leaf_key(reader.keys),
                                        device=model.device, autocast=model.core.autocast)
             anchor_kb.close()
-    ctx = Context(frozen, reader, kbs, views=views)
+    ctx = Context(frozen, reader, kbs, views=views, prefix=prefix)
     ctx.key_optimizer = key_optimizer
     tok = model.tok
     writer = Writer(model, stack, frozen.embed, batch=args.write_batch) \
@@ -1605,6 +1825,12 @@ def train(args) -> None:
                     'config': dataclasses.asdict(config),
                     **({'key_optimizer': key_optimizer.state_dict()}
                        if key_optimizer is not None else {}),
+                    **({'null_prefix': prefix.state_dict()} if prefix is not None else {}),
+                    # the reader decoder's own layers (the writer's weights are not saved
+                    # here: they are the parent decoder's, unchanged)
+                    **({'decoder_layers': frozen.own.state_dict(),
+                        'decoder_train_below': args.decoder_train_below}
+                       if len(frozen.own) else {}),
                     **({'write_ops': write_ops.state_dict(),
                         'superpose': dataclasses.asdict(superpose)} if write_ops is not None
                        else {})}, pending)
@@ -1878,6 +2104,26 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--decoder-checkpoint', action='store_true',
                    help='recompute frozen decoder layers in backward')
+    t.add_argument('--decoder-train-below', type=int, default=0,
+                   help='train the reader decoder\'s layers below N (their own copies; '
+                        'embeddings, the layers from N up, final norm and LM head stay frozen, '
+                        'and the writer keeps the parent decoder\'s weights) in l1a and r; '
+                        '0: frozen. Starting point for LFM2.5-350M (16 layers): 8')
+    t.add_argument('--decoder-lr', type=float, default=3e-5,
+                   help='--decoder-train-below: the decoder layers\' learning rate')
+    t.add_argument('--decoder-replay-kl', type=float,
+                   help='--decoder-train-below: weight of KL(parent || reader decoder) on the '
+                        'batch\'s no-read context (default 0.1 when the decoder trains)')
+    t.add_argument('--contrast-weight', type=float, default=0.0,
+                   help='content contrast: per episode weight x relu(margin + nll_retrieved - '
+                        'nll_shuffled), the shuffled arm reading another same-KB episode\'s '
+                        'items at their gates (detached) through the same R (0: off)')
+    t.add_argument('--contrast-margin', type=float, default=0.0,
+                   help='content contrast margin in nats (token-mean NLL)')
+    t.add_argument('--null-prefix', type=int, default=0,
+                   help='reps of a learned per-KB soft prefix in front of every read span in '
+                        'every arm (a content-free home for task format; trained at --lr in '
+                        'l1a and r; 0: off)')
     t.add_argument('--no-operator-checkpoint', action='store_true')
 
 
