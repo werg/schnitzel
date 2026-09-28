@@ -843,3 +843,8 @@ log your decisions and changes of direction"), newest last.
   each row's learned value, never by reproducing particular source records. K3 is
   a short L1a with free rows followed by fitting the write stack to them (L2's
   stack code); the target-key K3 stage is removed.
+- 28 Sep (owner). The write-side schedule is a long read-side phase with free
+  rows, then the write fit against the rows' key/value pairs without the decoder
+  (sequential on exported rows by default; optionally a separate job following
+  row snapshots). No interleaving inside one trainer; the joint read/write default
+  of the entry above applies only if reads are later switched to stack outputs.

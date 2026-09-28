@@ -263,11 +263,17 @@ applies to every stage.
    each slot's records, with in-batch and KB negatives. It is the L1 stage with
    only the retrieval loss (`--retrieval-only`); no separate key-table
    distillation.
-5. **K3 - Write-stack warm-up on learned rows.** A short L1a in which the rows
-   are free learnable parameters trained by reads alone (row count = the
-   storage budget); then the write stack (S_s levels over fields of the
-   codecs' items) is fitted to map its inputs to those learned rows (the L2
-   stack objective, the same code). Joint training in L1 starts from there.
+5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
+   short warm-up: first a long read-side phase in which the rows are free
+   learnable parameters trained by reads alone, until they have drifted far from
+   their codec-derived start (the more drift the write side has to absorb, the
+   more superposition it must learn; drift is logged). Then the read side is cut
+   off at the rows' key/value pairs and the write stack (S_s levels over fields of
+   the source-level items, rows as anchors) is fitted to them, without the
+   decoder in the loop: sequentially on the exported rows by default, or as a
+   separate job following row snapshots that the read phase exports as it goes.
+   The fit is the L2 stack objective and code. Reads seeing the stack's outputs
+   instead of free rows is a later switch.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
