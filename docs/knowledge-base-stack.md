@@ -103,13 +103,14 @@ through its own learned function of both positions.
 
 Sources j = 1..n carry content x_j, a normalized position p_j = (j + 0.5)/n within
 their item, a kind (which space or input they come from, each kind with its own
-input projection, since widths differ) and a gate g_j >= 0. Targets i = 1..m
+input projection, since widths differ) and the gate of their item. Targets i = 1..m
 carry a residual state h_i, a normalized position t_i and an optional condition c
 (the target key). One layer:
 
 ```text
 z_ij = W_src[kind_j] x_j + P φ(p_j) + T LN(h_i) + Q φ(t_i) + D φ(p_j − t_i) + C c
-a_i  = Σ_j g_j σ(z_ij) / Σ_j g_j            (numerator and mass; mass_i = Σ_j g_j)
+a_i  = Σ_j w_j σ(z_ij) / Σ_j w_j            (numerator and mass)
+       w_j = gate of j's item / its length    (each item's total mass is its gate)
 h_i ← h_i + O a_i
 h_i ← h_i + FFN(LN(h_i))
 ```
@@ -121,11 +122,15 @@ h_i ← h_i + FFN(LN(h_i))
 - φ are Fourier features. The relative term φ(p_j − t_i) lets a codec align
   source and target positions; a compactor's neighbourhood has no meaningful
   cross-item order, so its sources carry only their within-item position.
-- **Gates only modulate mass.** g_j scales source j's contribution to the
-  numerator and the mass; it is not an input feature. A gate of 0 removes a
-  source exactly; masses are kept so compacted items can be weighed against
-  others (invariant 5), and a source's contributions sum to its mass over targets
-  with normalized responsibilities (invariant 7).
+- **Gates only modulate mass.** An item's gate scales its positions'
+  contributions to the numerator and the mass; it is not an input feature. A gate
+  of 0 removes an item exactly, and scaling all gates together changes only the
+  returned total mass. Each item's mass is its gate spread evenly over its
+  positions, so a long item (e.g. fine space A) does not outweigh a short one by
+  length alone; the per-pair MLPs can still learn to weight contributions. Each
+  target's weights over the sources sum to one, and the operator returns the
+  total input mass, so compacted items can be weighed against others
+  (invariant 5).
 - Several layers; each later layer's contributions depend on the target's current
   state h_i, so targets can specialize what they draw from each source.
 - Target initial state: an MLP of φ(t_i), the log size ratio and the condition c.
