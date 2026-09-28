@@ -55,11 +55,25 @@ Queries see only items whose time is at or before their query time (invariant 2)
 
 Live mode (stage L1) keeps fp32 master values, live keys and per-item Adam state beside
 the stored rows and updates only the items named in a step. It is mutable training
-state, visible only in the writer process: each update is written as a redo journal
-first, so it is applied completely or not at all, and ``live_updates`` counts applied
-steps (the live generation). Stored rows, keys and payloads are never changed by live
+state, visible only in the writer process, and ``live_updates`` counts applied steps
+(the live generation). Stored rows, keys and payloads are never changed by live
 updates, so cursor-pinned reads (and other processes) see the stored state only; live
-reads and searches (``live=True``) see the current live state. ``pin_live()`` returns a
+reads and searches (``live=True``) see the current live state.
+
+Two ways to hold live state. By default every update is written to disk as a redo
+journal before ``live_step`` returns (durable per step; 0.2-0.9 s per 3000-item step at
+200k items). ``load_live(device, sync_every)`` instead keeps the live state of every
+live space resident (fp32 tensors in RAM or on ``device``), so a step touches only
+memory; disk is written only by a sync: every ``sync_every`` updates, ``sync_live()``,
+``enable_live``, ``export_live``, ``compact``, ``unload_live`` and a clean ``close``
+(``checkpoint_live`` writes its checkpoint straight from memory). A sync journals every
+item changed since the last sync in bounded parts, with one atomic commit point, then
+applies it; when most items changed it instead writes the live files anew from memory
+and swaps them in behind one commit point (``live.swap``). After a crash the writer
+reopens at the last sync, which is generally not the step of the last model
+checkpoint: exact resume is ``restore_live`` of the ``checkpoint_live`` taken together
+with that model checkpoint. Both ways run the same vectorized Adam, so on CPU they give
+bit-identical state (on CUDA it agrees to float32 rounding). ``pin_live()`` returns a
 ``LiveSnapshot`` of the current cursor and generation: while any snapshot is pinned, an
 update first saves the pre-image of each item it changes (copy on write, in memory,
 only for items changed since the newest pin), so the snapshot keeps reading the values
@@ -93,9 +107,15 @@ PRODUCERS = ('codec', 'rewrite', 'live-update')
 OFFSET, LENGTH, BORN, DEAD, TIME, VERSION, META_OFF, META_LEN = range(8)
 STORED_FILES = ('keys.f32', 'rows.i64', 'mass.f32', 'payload.bf16', 'ids.txt', 'meta.jsonl')
 LIVE_FILES = ('live_values.f32', 'live_m.f32', 'live_v.f32', 'live_step.i64', 'live_keys.f32')
+# resident live field -> file; values, m and v are per position, step and keys per row
+LIVE_FIELDS = dict(zip(('values', 'm', 'v', 'step', 'keys'), LIVE_FILES))
+POSITION_FIELDS = ('values', 'm', 'v')
 CHECKPOINTS = 'live_checkpoints'
+JOURNAL_PART = 'live.journal.part'
 _TAG = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 _CHUNK = 1 << 24
+_PART_BYTES = 1 << 28       # bound on one journal part (and on the memory a sync holds)
+_SWAP_FRACTION = 0.5        # a sync rewriting more than this share of positions swaps files
 
 
 @dataclass(frozen=True)
@@ -246,6 +266,57 @@ def _copy_hashed(algorithm: str, src: Path, dst: Path, size: int) -> str:
     return h.hexdigest()
 
 
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _scatter_write(fd: int, index: np.ndarray, data: np.ndarray) -> None:
+    """Write ``data[j]`` (one row of a file) at row ``index[j]`` of a file, as one
+    ``pwrite`` per run of consecutive rows (no memory map, so no pages stay resident)."""
+    if not len(index):
+        return
+    data = np.ascontiguousarray(data)
+    row_bytes = data[0].nbytes
+    breaks = np.flatnonzero(np.diff(index) != 1) + 1
+    starts = [0] + breaks.tolist()
+    ends = breaks.tolist() + [len(index)]
+    for a, b in zip(starts, ends):
+        view, at = memoryview(data[a:b]).cast('B'), int(index[a]) * row_bytes
+        while len(view):
+            done = os.pwrite(fd, view, at)
+            view, at = view[done:], at + done
+
+
+def _flat_bytes(tensor: Tensor) -> Tensor:
+    """A contiguous tensor's storage as a flat uint8 tensor (a view)."""
+    return tensor.reshape(-1).view(torch.uint8)
+
+
+class _Grow:
+    """A tensor with spare capacity along dim 0, so appends in live mode do not copy the
+    whole resident state each time."""
+
+    def __init__(self, data: Tensor):
+        self.data, self.n = data, len(data)
+
+    def view(self) -> Tensor:
+        return self.data[:self.n]
+
+    def extend(self, more: Tensor) -> None:
+        need = self.n + len(more)
+        if need > len(self.data):
+            grown = torch.empty((max(need, len(self.data) * 5 // 4 + 1024),) + self.data.shape[1:],
+                                dtype=self.data.dtype, device=self.data.device)
+            grown[:self.n] = self.data[:self.n]
+            self.data = grown
+        self.data[self.n:need] = more.to(self.data.device, self.data.dtype)
+        self.n = need
+
+
 def _ref(item_id: str, version: int) -> str:
     return f'{item_id}@{version}'
 
@@ -294,6 +365,11 @@ class KnowledgeBase:
     def __init__(self, root: str | Path, *, writable: bool = False, verify: bool = False):
         self.root = Path(root)
         self.writable = writable
+        self._live: dict[str, dict[str, _Grow]] | None = None   # resident live state
+        self._device = torch.device('cpu')
+        self._sync_every, self._generation = 0, 0
+        self._workspaces: dict[str, list[Tensor]] = {}
+        self._bias: dict[tuple[float, float], tuple[Tensor, Tensor]] = {}
         self._lock = threading.RLock()
         self._lockfile = None
         self._maps: dict[tuple[str, str], np.ndarray] = {}
@@ -352,11 +428,18 @@ class KnowledgeBase:
         return cls(root, writable=True)
 
     def close(self) -> None:
-        self._maps.clear()
-        if self._lockfile is not None:
-            fcntl.flock(self._lockfile, fcntl.LOCK_UN)
-            self._lockfile.close()
-            self._lockfile = None
+        """Release the KB; a writer with resident live state syncs it first."""
+        try:
+            if self._live is not None:
+                self.sync_live()
+        finally:
+            self._live = None
+            self._workspaces.clear()
+            self._maps.clear()
+            if self._lockfile is not None:
+                fcntl.flock(self._lockfile, fcntl.LOCK_UN)
+                self._lockfile.close()
+                self._lockfile = None
 
     def __enter__(self):
         return self
@@ -378,7 +461,18 @@ class KnowledgeBase:
 
     @property
     def live_updates(self) -> int:
+        """Live generation: updates applied (including resident updates not yet synced)."""
+        return self._generation if self._live is not None else self._manifest['live_updates']
+
+    @property
+    def synced_live_updates(self) -> int:
+        """Live generation on disk: where a writer reopens after a crash."""
         return self._manifest['live_updates']
+
+    @property
+    def live_device(self) -> torch.device | None:
+        """Device of the resident live state (``load_live``), None when not resident."""
+        return self._device if self._live is not None else None
 
     @property
     def frozen(self) -> bool:
@@ -441,6 +535,11 @@ class KnowledgeBase:
                 shutil.rmtree(pending)
             elif pending.exists():
                 pending.unlink()
+        swap = self.root / 'live.swap'
+        if swap.exists():                                   # a committed sync by swap
+            self._apply_swap(swap)
+        for stale in self.root.glob('*/live_*.next'):       # an uncommitted one
+            stale.unlink()
         marker = self.root / 'live.restore'
         if marker.exists():
             self._finish_restore(json.loads(marker.read_text())['tag'])
@@ -449,6 +548,8 @@ class KnowledgeBase:
         journal = self.root / 'live.journal'
         if journal.exists():
             self._apply_journal(journal)
+        for part in self.root.glob(JOURNAL_PART + '*'):    # parts of an uncommitted sync
+            part.unlink()
 
     def _truncate(self) -> None:
         """Cut every file to its committed size and clear dead marks past the cursor."""
@@ -472,6 +573,7 @@ class KnowledgeBase:
         self._row_ids: dict[str, list[str]] = {}
         self._rows: dict[str, dict[str, list[int]]] = {}
         self._space_of: dict[str, str] = {}
+        self._current: dict[str, dict[str, int]] = {}   # space -> id -> current row (lazy)
         for space in self.spaces:
             size = self._manifest['spaces'][space]['ids_bytes']
             with (self.root / space / 'ids.txt').open('rb') as handle:
@@ -526,10 +628,32 @@ class KnowledgeBase:
             for replaced_at, values, key in self._pre.get(space, {}).get(row, ()):
                 if replaced_at > generation:
                     return values, key
-        r = self._map(space, 'rows.i64')[row]
-        start, length = int(r[OFFSET]), int(r[LENGTH])
-        return (np.array(self._map(space, 'live_values.f32')[start:start + length]),
-                np.array(self._map(space, 'live_keys.f32')[row]))
+        return self._live_states(space, [row])[0]
+
+    def _live_states(self, space: str, rows: Sequence[int]) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Current live (values, key) of rows, as CPU copies (one gather when resident)."""
+        if not rows:
+            return []
+        if self._live is not None:
+            state = self._live[space]
+            index = torch.as_tensor(rows, dtype=torch.long)
+            length = state['length'].view()[index]
+            _, positions = self._index(state['offset'].view()[index], length)
+            values = state['values'].view()[positions.to(self._device)].cpu().numpy()
+            keys = state['keys'].view()[index.to(self._device)].cpu().numpy()
+            split = np.split(values, length.cumsum(0)[:-1].numpy())
+            return list(zip(split, keys))
+        table = self._map(space, 'rows.i64')
+        values, keys = self._map(space, 'live_values.f32'), self._map(space, 'live_keys.f32')
+        return [(np.array(values[table[r, OFFSET]:table[r, OFFSET] + table[r, LENGTH]]),
+                 np.array(keys[r])) for r in rows]
+
+    def _live_gather(self, space: str, field: str, index: np.ndarray) -> np.ndarray:
+        """Live ``field`` at positions (values, m, v) or rows (step, keys), as a CPU array."""
+        if self._live is not None:
+            data = self._live[space][field].view()
+            return data[torch.from_numpy(index).to(data.device)].cpu().numpy()
+        return np.ascontiguousarray(self._map(space, LIVE_FIELDS[field])[index])
 
     def _item(self, space: str, row: int, cursor: int, live: bool,
               generation: int | None = None) -> Item:
@@ -665,10 +789,27 @@ class KnowledgeBase:
         _atomic_json(self.root / 'manifest.json', manifest)
         self._manifest = manifest
         self._maps = {k: v for k, v in self._maps.items() if k[0] != space}
+        current = self._current.get(space)
+        if current is not None:
+            for row in kill:
+                current.pop(self._row_ids[space][row], None)
         for j, item_id in enumerate(ids):
             self._row_ids[space].append(item_id)
             self._rows[space].setdefault(item_id, []).append(n + j)
             self._space_of[item_id] = space
+            if current is not None:
+                current[item_id] = n + j
+        if self._live is not None and space in self._live:
+            # the new rows' live state, as just written to the live files
+            state, fp32 = self._live[space], values.float()
+            for name, data in (('values', fp32), ('m', torch.zeros_like(fp32)),
+                               ('v', torch.zeros_like(fp32)),
+                               ('step', torch.zeros(len(items), dtype=torch.long)),
+                               ('keys', torch.from_numpy(keys.astype(np.float32))),
+                               ('offset', torch.from_numpy(rows[:, OFFSET].copy())),
+                               ('length', torch.from_numpy(rows[:, LENGTH].copy())),
+                               ('dirty', torch.zeros(len(items), dtype=torch.bool))):
+                state[name].extend(data)
 
     def append(self, space: str, items: Sequence[NewItem]) -> list[str]:
         """Add new items (version 1, no lineage); returns their ids. Items given an id
@@ -901,19 +1042,28 @@ class KnowledgeBase:
             else torch.as_tensor(query_time, dtype=torch.long).expand(len(q))
         best = torch.full((len(q), 0), float('-inf'))
         best_rows = torch.zeros((len(q), 0), dtype=torch.long)
-        keys = self._map(space, 'live_keys.f32' if live else 'keys.f32')
         rows = self._map(space, 'rows.i64')
+        if live and self._live is not None:
+            resident = self._live[space]['keys'].view()
+
+            def key_chunk(a: int, b: int) -> np.ndarray:
+                return resident[a:b].cpu().numpy().copy()
+        else:
+            keys = self._map(space, 'live_keys.f32' if live else 'keys.f32')
+
+            def key_chunk(a: int, b: int) -> np.ndarray:
+                return np.array(keys[a:b])
         override = {}
         if live and generation is not None:
             override = {row: self._live_state(space, row, generation)[1]
                         for row in self._pre.get(space, {})}
-        for start in range(0, len(keys), chunk_rows):
+        for start in range(0, len(rows), chunk_rows):
             block = np.array(rows[start:start + chunk_rows])
             ok = torch.from_numpy(self._visible(block, cursor))
             ok = ok[None] & (torch.from_numpy(block[:, TIME])[None] <= times[:, None])
             if not ok.any():
                 continue
-            chunk = np.array(keys[start:start + chunk_rows])
+            chunk = key_chunk(start, start + len(block))
             for row, key in override.items():
                 if start <= row < start + len(chunk):
                     chunk[row - start] = key
@@ -942,21 +1092,27 @@ class KnowledgeBase:
 
     def enable_live(self, space: str) -> None:
         """Start live mode: fp32 values from the stored payloads, live keys from the stored
-        keys, Adam state at zero."""
+        keys, Adam state at zero. With resident live state the space joins it."""
         with self._lock:
             self._check_space(space)
             if not self.writable or self.is_live(space):
                 raise ValueError('live mode needs a writer and a space that is not live yet')
-            root, payload = self.root / space, self._map(space, 'payload.bf16')
+            self.sync_live()
+            root, s = self.root / space, self._manifest['spaces'][space]
             for file in LIVE_FILES:
                 (root / file).write_bytes(b'')
-            with (root / 'live_values.f32').open('ab') as out:
-                for start in range(0, len(payload), 65536):
-                    chunk = torch.from_numpy(np.array(payload[start:start + 65536]))
-                    out.write(chunk.view(torch.bfloat16).float().numpy().astype('<f4').tobytes())
+            with (root / 'payload.bf16').open('rb') as src, \
+                    (root / 'live_values.f32').open('ab') as out:
+                remaining = s['positions'] * s['width'] * 2
+                while remaining > 0:
+                    data = src.read(min(_CHUNK, remaining))
+                    if not data:
+                        raise ValueError(f'{root / "payload.bf16"} is shorter than committed')
+                    remaining -= len(data)
+                    chunk = torch.frombuffer(bytearray(data), dtype=torch.bfloat16)
+                    out.write(chunk.float().numpy().astype('<f4').tobytes())
                 out.flush()
                 os.fsync(out.fileno())
-            s = self._manifest['spaces'][space]
             _copy_hashed(self._manifest['checksum'], root / 'keys.f32', root / 'live_keys.f32',
                          s['items'] * s['key_width'] * 4)
             for file, size in (('live_m.f32', s['positions'] * s['width'] * 4),
@@ -967,111 +1123,417 @@ class KnowledgeBase:
             _atomic_json(self.root / 'manifest.json', manifest)
             self._manifest = manifest
             self._maps = {k: v for k, v in self._maps.items() if k[0] != space}
+            if self._live is not None:
+                self._live[space] = self._load_space(space)
 
-    def _live_rows(self, space: str, ids: Sequence[str]) -> tuple[list[int], np.ndarray]:
+    # resident live state ------------------------------------------------------------------
+
+    def load_live(self, *, device: str | torch.device | None = None,
+                  sync_every: int = 0) -> None:
+        """Keep the live state of every live space resident: fp32 values, Adam moments and
+        live keys on ``device`` (default CPU; on Spark CPU and GPU memory are the same
+        physical memory), step counts on the CPU. ``live_step`` and ``set_live_keys``
+        then touch only memory.
+
+        Durability: resident updates reach disk only when synced: every ``sync_every``
+        updates (0: never automatically), at ``sync_live()``, ``enable_live``,
+        ``export_live``, ``compact``, ``unload_live`` and a clean ``close``. After a crash
+        the writer reopens at the last sync (``synced_live_updates``), generally not at
+        the step of the last model checkpoint: exact resume is ``restore_live`` of a
+        ``checkpoint_live`` taken with the model checkpoint (written straight from
+        memory). Stored commits (append, supersede, rewrite) stay durable at once."""
+        with self._lock:
+            if not self.writable:
+                raise PermissionError('KB opened read-only')
+            if self._live is not None:
+                raise ValueError('live state is already resident')
+            if sync_every < 0:
+                raise ValueError('sync_every >= 0')
+            # normalized ('cuda' -> 'cuda:<current>'), so buffers compare equal to it
+            self._device = torch.empty(0, device='cpu' if device is None else device).device
+            self._sync_every, self._generation = sync_every, self._manifest['live_updates']
+            # unmap the live files: their touched pages would stay in this process's RSS
+            self._maps = {k: v for k, v in self._maps.items() if k[1] not in LIVE_FILES}
+            self._live = {}
+            try:
+                for space in self._manifest['live_spaces']:
+                    self._live[space] = self._load_space(space)
+            except BaseException:
+                self._live = None
+                raise
+
+    def _read_into(self, path: Path, out: Tensor) -> None:
+        """Fill a contiguous tensor from the start of a file, in chunks (no memory map, so
+        no file pages stay mapped in this process), then drop the file's cached pages."""
+        flat = _flat_bytes(out)
+        cpu = out.device.type == 'cpu'
+        bounce = None if cpu else torch.empty(min(_CHUNK, len(flat)), dtype=torch.uint8)
+        with path.open('rb', buffering=0) as handle:
+            for start in range(0, len(flat), _CHUNK):
+                count = min(_CHUNK, len(flat) - start)
+                target = flat[start:start + count] if cpu else bounce[:count]
+                view, done = memoryview(target.numpy()), 0
+                while done < count:
+                    got = handle.readinto(view[done:])
+                    if not got:
+                        raise ValueError(f'{path} is shorter than its committed size')
+                    done += got
+                if not cpu:
+                    flat[start:start + count].copy_(target)
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+    def _load_space(self, space: str) -> dict[str, _Grow]:
+        s = self._manifest['spaces'][space]
+        shapes = {'values': (s['positions'], s['width']), 'm': (s['positions'], s['width']),
+                  'v': (s['positions'], s['width']), 'step': (s['items'],),
+                  'keys': (s['items'], s['key_width'])}
+        state = {}
+        for name, file in LIVE_FIELDS.items():
+            if name == 'step':
+                out = torch.empty(shapes[name], dtype=torch.long)
+            else:
+                out = torch.empty(shapes[name], dtype=torch.float32, device=self._device)
+            self._read_into(self.root / space / file, out)
+            state[name] = _Grow(out)
+        table = self._map(space, 'rows.i64')
+        state['offset'] = _Grow(torch.from_numpy(np.array(table[:, OFFSET])))
+        state['length'] = _Grow(torch.from_numpy(np.array(table[:, LENGTH])))
+        state['dirty'] = _Grow(torch.zeros(s['items'], dtype=torch.bool))
+        return state
+
+    def _resident_parts(self, space: str, rows: Tensor) -> Iterable[dict[str, Tensor]]:
+        """Journal parts (``<space>.<field>`` CPU tensors) holding the resident state of
+        ``rows`` (ascending), each at most about ``_PART_BYTES``."""
+        state, spec = self._live[space], self.spaces[space]
+        offset, length = state['offset'].view()[rows], state['length'].view()[rows]
+        cost = length * (12 * spec.width) + 8 + 4 * spec.key_width
+        ends = cost.cumsum(0)
+        start = 0
+        while start < len(rows):
+            base = int(ends[start] - cost[start])
+            end = max(start + 1, int(torch.searchsorted(ends, base + _PART_BYTES, right=True)))
+            part = rows[start:end]
+            _, positions = self._index(offset[start:end], length[start:end])
+            pos = positions.to(self._device)
+            yield {f'{space}.positions': positions, f'{space}.rows': part,
+                   **{f'{space}.{name}': state[name].view()[pos].cpu() for name in POSITION_FIELDS},
+                   f'{space}.step': state['step'].view()[part],
+                   f'{space}.keys': state['keys'].view()[part.to(self._device)].cpu()}
+            start = end
+
+    def sync_live(self) -> None:
+        """Make the resident live state durable and record the generation as
+        ``synced_live_updates``. Items changed since the last sync are journaled (bounded
+        parts, one commit point) and applied to the live files; when they cover more than
+        ``_SWAP_FRACTION`` of the positions, the live files are instead rewritten from
+        memory and swapped in (one commit point), which writes fewer bytes. Syncs are
+        bound by disk writes. A no-op without resident state or changes."""
+        with self._lock:
+            if self._live is None or self._generation == self._manifest['live_updates']:
+                return
+            dirty = {space: state['dirty'].view().nonzero().flatten()
+                     for space, state in self._live.items()}
+            changed = sum(int(self._live[space]['length'].view()[rows].sum())
+                          for space, rows in dirty.items())
+            total = sum(self._manifest['spaces'][space]['positions'] for space in self._live)
+            if changed > _SWAP_FRACTION * total:    # a journal writes changes twice
+                self._swap_live(self._generation)
+            else:
+                self._write_journal((part for space, rows in dirty.items()
+                                     for part in self._resident_parts(space, rows)),
+                                    self._generation)
+            for state in self._live.values():
+                state['dirty'].view().zero_()
+
+    def _swap_live(self, update: int) -> None:
+        """Sync by replacement: write every live file from memory as ``<file>.next``
+        (fsynced), then ``live.swap`` naming them and ``update`` (renamed into place: the
+        commit point), then rename each over its file."""
+        algorithm, files = self._manifest['checksum'], []
+        for space, state in self._live.items():
+            for name, file in LIVE_FIELDS.items():
+                path = self.root / space / (file + '.next')
+                self._write_resident(state[name].view(), path, algorithm,
+                                     self._sizes(space)[file])
+                files.append(f'{space}/{file}')
+        _atomic_json(self.root / 'live.swap', {'update': update, 'files': files})
+        self._apply_swap(self.root / 'live.swap')
+
+    def _apply_swap(self, marker: Path) -> None:
+        """Finish a committed swap (idempotent: a file already renamed has no ``.next``)."""
+        info = json.loads(marker.read_text())
+        for rel in info['files']:
+            nxt = self.root / (rel + '.next')
+            if nxt.exists():
+                os.replace(nxt, self.root / rel)
+        for space in {rel.split('/')[0] for rel in info['files']}:
+            _fsync_dir(self.root / space)
+        self._maps = {k: v for k, v in self._maps.items() if k[1] not in LIVE_FILES}
+        manifest = dict(self._manifest, live_updates=int(info['update']))
+        _atomic_json(self.root / 'manifest.json', manifest)
+        self._manifest = manifest
+        marker.unlink()
+        _fsync_dir(self.root)
+
+    def unload_live(self) -> None:
+        """Sync and drop the resident live state (back to journaling every update)."""
+        with self._lock:
+            self.sync_live()
+            self._live = None
+            self._workspaces.clear()
+
+    # updates ------------------------------------------------------------------------------
+
+    @staticmethod
+    def _index(offset: Tensor, length: Tensor) -> tuple[Tensor, Tensor]:
+        """For rows with position ranges [offset, offset + length): the row (0..k-1) of
+        every concatenated position, and the positions themselves, in order."""
+        if len(length) and bool(length.min() == length.max()):     # uniform lengths
+            n = int(length[0])
+            span = torch.arange(n)
+            row_of = torch.arange(len(length))[:, None].expand(-1, n).reshape(-1)
+            return row_of, (offset[:, None] + span).reshape(-1)
+        total = int(length.sum())
+        row_of = torch.repeat_interleave(torch.arange(len(length)), length, output_size=total)
+        start = offset - (length.cumsum(0) - length)
+        return row_of, torch.arange(total) + start[row_of]
+
+    def _live_rows(self, space: str, ids: Sequence[str]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Rows, lengths, row-of-position and positions of the current versions of
+        ``ids`` (writer, live space)."""
         if not self.writable or not self.is_live(space):
             raise ValueError(f'space {space} is not live in a writer')
-        if len(set(ids)) != len(ids):
+        current = self._current.get(space)
+        if current is None:     # id -> current row at the writer's cursor, kept by _commit
+            table = self._map(space, 'rows.i64')
+            names = self._row_ids[space]
+            current = self._current[space] = {
+                names[r]: r for r in np.flatnonzero(self._visible(table, self.cursor)).tolist()}
+        try:
+            found = np.fromiter(map(current.__getitem__, ids), np.int64, len(ids))
+        except KeyError as error:
+            raise KeyError(f'no current item {error} in space {space} of KB {self.name}') \
+                from None
+        if len(np.unique(found)) != len(found):
             raise ValueError('duplicate ids would apply an update twice')
-        rows = [self._row(space, i, self.cursor) for i in ids]
-        table = self._map(space, 'rows.i64')
-        positions = np.concatenate([np.arange(table[r, OFFSET], table[r, OFFSET] + table[r, LENGTH])
-                                    for r in rows]) if rows else np.zeros(0, np.int64)
-        return rows, positions
+        rows = torch.from_numpy(found)
+        if self._live is not None:
+            offset = self._live[space]['offset'].view()[rows]
+            length = self._live[space]['length'].view()[rows]
+        else:
+            table = self._map(space, 'rows.i64')
+            offset = torch.from_numpy(table[found, OFFSET])
+            length = torch.from_numpy(table[found, LENGTH])
+        row_of, positions = self._index(offset, length)
+        return rows, length, row_of, positions
 
-    def live_step(self, space: str, ids: Sequence[str], grads: Sequence[Tensor], *, lr: float,
-                  betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
+    def _save_preimages(self, space: str, rows: Tensor) -> None:
+        """Copy on write for pinned snapshots, before update ``live_updates + 1``."""
+        if not self._pins:
+            return
+        newest, update = max(self._pins.values()), self.live_updates + 1
+        saved = self._pre.setdefault(space, {})
+        # a row whose last saved pre-image is newer than every pin: no pin sees it now
+        need = [r for r in rows.tolist() if not (saved.get(r) and newest < saved[r][-1][0])]
+        for row, (values, key) in zip(need, self._live_states(space, need)):
+            saved.setdefault(row, []).append((update, values, key))
+
+    def _to_live(self, tensor: Tensor) -> Tensor:
+        """A small CPU tensor on the live device; to CUDA through pinned memory without
+        blocking, so a resident step never waits for the GPU."""
+        if self._device.type == 'cuda':
+            return tensor.pin_memory().to(self._device, non_blocking=True)
+        return tensor.to(self._device)
+
+    def _workspace(self, space: str, n: int) -> list[Tensor]:
+        """Five persistent (n, width) float32 buffers on the live device, so a step
+        allocates nothing large (fresh large allocations page-fault every step)."""
+        width = self.spaces[space].width
+        buffers = self._workspaces.get(space)
+        if buffers is None or buffers[0].shape[0] < n or buffers[0].device != self._device:
+            size = max(n, 1024, 0 if buffers is None else buffers[0].shape[0] * 5 // 4)
+            buffers = [torch.empty(size, width, device=self._device) for _ in range(5)]
+            self._workspaces[space] = buffers
+        return [b[:n] for b in buffers]
+
+    def _coefficients(self, steps: Tensor, lr: float,
+                      betas: tuple[float, float]) -> tuple[Tensor, Tensor]:
+        """Per item: ``-lr / (1 - b1**t)`` and ``(1 - b2**t) ** 0.5`` as float32. The powers
+        come from float64 tables computed with Python floats and the division is IEEE
+        float64, so every value is the one ``torch.optim.Adam`` passes as a scalar."""
+        top = int(steps.max())
+        table = self._bias.get(betas)
+        if table is None or len(table[0]) <= top:
+            b1, b2 = betas
+            n = max(top + 1, 1024, 2 * (0 if table is None else len(table[0])))
+            table = (torch.tensor([1 - b1 ** float(t) for t in range(n)], dtype=torch.float64),
+                     torch.tensor([(1 - b2 ** float(t)) ** 0.5 for t in range(n)],
+                                  dtype=torch.float64))
+            self._bias[betas] = table
+        step_size = torch.tensor(lr, dtype=torch.float64) / table[0][steps]
+        return step_size.neg().float(), table[1][steps].float()
+
+    @staticmethod
+    def _adam(p: Tensor, m: Tensor, v: Tensor, g: Tensor, neg_step: Tensor, bias2_sqrt: Tensor,
+              t: Tensor, u: Tensor, *, lr: float, betas: tuple[float, float], eps: float,
+              weight_decay: float) -> None:
+        """In-place Adam(W) on concatenated items with per-position coefficients (column
+        tensors from ``_coefficients``); the float32 operation order of
+        ``torch.optim.Adam``'s single-tensor path, where ``addcdiv`` computes
+        ``p + (value * m) / denom``. ``t`` and ``u`` are scratch buffers of ``p``'s shape."""
+        b1, b2 = betas
+        if weight_decay:
+            p.mul_(1 - lr * weight_decay)
+        m.lerp_(g, 1 - b1)
+        v.mul_(b2).addcmul_(g, g, value=1 - b2)
+        torch.sqrt(v, out=t)
+        t.div_(bias2_sqrt).add_(eps)
+        torch.mul(neg_step, m, out=u)
+        p.addcdiv_(u, t)        # p + (1 * u) / t: the same rounding as p + u / t
+
+    def live_step(self, space: str, ids: Sequence[str], grads: Sequence[Tensor] | Tensor, *,
+                  lr: float, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
                   weight_decay: float = 0.0) -> None:
         """One Adam(W) step on the named items only, each with its own step count.
 
-        Matches ``torch.optim.Adam`` (``weight_decay=0``) or ``AdamW`` (decoupled decay)
-        applied to each item as its own parameter; items not named are untouched."""
-        with self._lock:
+        ``grads`` is one tensor per item, or all items' gradients concatenated along the
+        positions in ``ids`` order (cheapest; may already be on the live device). Matches
+        ``torch.optim.Adam`` (``weight_decay=0``) or ``AdamW`` (decoupled decay) applied to
+        each item as its own parameter; items not named are untouched. With resident
+        state (``load_live``) the step touches only memory; otherwise it is journaled and
+        durable when this returns."""
+        with self._lock, torch.no_grad():
             self._check_space(space)
-            rows, positions = self._live_rows(space, ids)
-            table = self._map(space, 'rows.i64')
-            for r, g in zip(rows, grads, strict=True):
-                if g.shape != (table[r, LENGTH], self.spaces[space].width):
+            rows, length, row_of, positions = self._live_rows(space, ids)
+            width = self.spaces[space].width
+            if isinstance(grads, Tensor):
+                g = grads
+                if g.shape != (len(positions), width):
+                    raise ValueError('concatenated gradients are (positions, width)')
+            else:
+                if len(grads) != len(rows) or any(x.ndim != 2 or x.shape[1] != width
+                                                  for x in grads) \
+                        or [x.shape[0] for x in grads] != length.tolist():
                     raise ValueError('each gradient has its item\'s shape')
-            if not rows:
+                g = torch.cat([x.detach() for x in grads]) if grads else None
+            if not len(rows):
                 return
-            p = torch.from_numpy(np.array(self._map(space, 'live_values.f32')[positions]))
-            m = torch.from_numpy(np.array(self._map(space, 'live_m.f32')[positions]))
-            v = torch.from_numpy(np.array(self._map(space, 'live_v.f32')[positions]))
-            g = torch.cat([x.detach().float().cpu() for x in grads])
-            steps = torch.from_numpy(np.array(self._map(space, 'live_step.i64')[rows])) + 1
-            per_position = torch.repeat_interleave(steps, torch.as_tensor(table[rows, LENGTH]))
-            b1, b2 = betas
-            # grouped by step count so each group uses torch's exact scalar arithmetic
-            for step in steps.unique().tolist():
-                sel = per_position == step
-                pp, mm, vv, gg = p[sel], m[sel], v[sel], g[sel]
-                if weight_decay:
-                    pp.mul_(1 - lr * weight_decay)
-                mm.lerp_(gg, 1 - b1)
-                vv.mul_(b2).addcmul_(gg, gg, value=1 - b2)
-                bias1, bias2 = 1 - b1 ** step, 1 - b2 ** step
-                denom = (vv.sqrt() / (bias2 ** 0.5)).add_(eps)
-                pp.addcdiv_(mm, denom, value=-lr / bias1)
-                p[sel], m[sel], v[sel] = pp, mm, vv
-            self._journal(space, {'values': p, 'm': m, 'v': v}, positions,
-                          {'step': steps}, np.asarray(rows))
+            self._save_preimages(space, rows)
+            options = {'lr': lr, 'betas': betas, 'eps': eps, 'weight_decay': weight_decay}
+            state = None if self._live is None else self._live[space]
+            if state is not None:
+                steps = state['step'].view()[rows] + 1
+            else:
+                steps = torch.from_numpy(self._map(space, 'live_step.i64')[rows.numpy()]) + 1
+            neg_step, bias2_sqrt = self._coefficients(steps, lr, betas)
+            if state is not None:
+                dev = self._device
+                pos = self._to_live(positions)
+                coefficients = self._to_live(torch.stack((neg_step, bias2_sqrt), 1)[row_of])
+                p, m, v, t, u = self._workspace(space, len(positions))
+                values, m_all, v_all = (state[name].view() for name in POSITION_FIELDS)
+                torch.index_select(values, 0, pos, out=p)
+                torch.index_select(m_all, 0, pos, out=m)
+                torch.index_select(v_all, 0, pos, out=v)
+                self._adam(p, m, v, g.detach().to(dev, torch.float32),
+                           coefficients[:, :1], coefficients[:, 1:], t, u, **options)
+                values.index_copy_(0, pos, p)
+                m_all.index_copy_(0, pos, m)
+                v_all.index_copy_(0, pos, v)
+                state['step'].view()[rows] = steps
+                state['dirty'].view()[rows] = True
+                self._bump()
+                return
+            index = positions.numpy()
+            p, m, v = (torch.from_numpy(self._live_gather(space, name, index))
+                       for name in POSITION_FIELDS)
+            self._adam(p, m, v, g.detach().float().cpu(), neg_step[row_of][:, None],
+                       bias2_sqrt[row_of][:, None], torch.empty_like(p), torch.empty_like(p),
+                       **options)
+            self._write_journal([{f'{space}.positions': positions, f'{space}.rows': rows,
+                                  f'{space}.values': p, f'{space}.m': m, f'{space}.v': v,
+                                  f'{space}.step': steps}], self.live_updates + 1)
 
     def set_live_keys(self, space: str, ids: Sequence[str], keys: Tensor) -> None:
         """Replace the live keys of items (e.g. from the trained key head); stored keys
         are unchanged. Live searches (``live=True``) scan the live keys."""
         with self._lock:
-            rows, _ = self._live_rows(space, ids)
+            rows = self._live_rows(space, ids)[0]
             if keys.shape != (len(rows), self.spaces[space].key_width) \
                     or not torch.isfinite(keys).all():
                 raise ValueError('keys are finite (items, key_width)')
-            self._journal(space, {}, np.zeros(0, np.int64),
-                          {'keys': keys.detach().float().cpu()}, np.asarray(rows))
+            if not len(rows):
+                return
+            self._save_preimages(space, rows)
+            keys = keys.detach().float()
+            if self._live is not None:
+                state = self._live[space]
+                state['keys'].view()[self._to_live(rows)] = keys.to(self._device)
+                state['dirty'].view()[rows] = True
+                self._bump()
+                return
+            self._write_journal([{f'{space}.positions': torch.zeros(0, dtype=torch.long),
+                                  f'{space}.rows': rows, f'{space}.keys': keys.cpu()}],
+                                self.live_updates + 1)
 
-    def _journal(self, space: str, position_data: dict[str, Tensor], positions: np.ndarray,
-                 row_data: dict[str, Tensor], rows: np.ndarray) -> None:
-        """Write a redo journal, apply it, count the update, drop the journal."""
-        tensors = {'positions': torch.from_numpy(positions.astype(np.int64)),
-                   'rows': torch.from_numpy(rows.astype(np.int64)),
-                   **{'p.' + k: t.contiguous() for k, t in position_data.items()},
-                   **{'r.' + k: t.contiguous() for k, t in row_data.items()}}
+    def _bump(self) -> None:
+        self._generation += 1
+        if self._sync_every and \
+                self._generation - self._manifest['live_updates'] >= self._sync_every:
+            self.sync_live()
+
+    def _write_journal(self, parts: Iterable[dict[str, Tensor]], update: int) -> None:
+        """Redo journal: each part (``<space>.<field>`` tensors) as a fsynced
+        ``live.journal.part<k>``, then ``live.journal`` naming the part count and
+        ``update`` (renamed into place: the commit point); then apply it. Parts bound the
+        memory a sync holds."""
+        count = 0
+        for count, part in enumerate(parts, 1):
+            path = self.root / f'{JOURNAL_PART}{count}'
+            save_file({k: t.contiguous() for k, t in part.items()}, path)
+            _fsync_file(path)
         journal = self.root / 'live.journal'
         pending = journal.with_name(journal.name + '.pending')
-        save_file(tensors, pending, metadata={'space': space,
-                                              'update': str(self.live_updates + 1)})
-        with pending.open('rb') as handle:
-            os.fsync(handle.fileno())
+        save_file({}, pending, metadata={'update': str(update), 'parts': str(count)})
+        _fsync_file(pending)
         os.replace(pending, journal)
         _fsync_dir(self.root)
         self._apply_journal(journal)
 
     def _apply_journal(self, journal: Path) -> None:
+        """Apply a committed journal to the live files part by part (``pwrite``, fsync,
+        pages dropped), record its update as the durable ``live_updates``, delete it."""
         from safetensors import safe_open
         with safe_open(journal, 'pt') as handle:
             meta = handle.metadata()
-        tensors = load_file(journal)
-        space, positions, rows = meta['space'], tensors['positions'].numpy(), tensors['rows'].numpy()
-        update = int(meta['update'])
-        if self._pins:   # copy on write for pinned snapshots
-            newest = max(self._pins.values())
-            saved = self._pre.setdefault(space, {})
-            for row in rows.tolist():
-                entries = saved.get(row)
-                if entries and newest < entries[-1][0]:
-                    continue    # no pin has seen the current state of this row
-                values, key = self._live_state(space, row, None)
-                saved.setdefault(row, []).append((update, values, key))
-        targets = {'p.values': 'live_values.f32', 'p.m': 'live_m.f32', 'p.v': 'live_v.f32',
-                   'r.step': 'live_step.i64', 'r.keys': 'live_keys.f32'}
-        for name, tensor in tensors.items():
-            if name in targets:
-                array = self._map(space, targets[name])
-                array[positions if name.startswith('p.') else rows] = tensor.numpy()
-                array.flush()
-        manifest = dict(self._manifest, live_updates=update)
+        parts = [self.root / f'{JOURNAL_PART}{k}' for k in range(1, int(meta['parts']) + 1)]
+        for path in parts:
+            tensors = load_file(path)
+            fds = {}
+            try:
+                for name, tensor in tensors.items():
+                    space, field_name = name.split('.', 1)
+                    if field_name not in LIVE_FIELDS:
+                        continue
+                    index = tensors[f'{space}.positions' if field_name in POSITION_FIELDS
+                                    else f'{space}.rows'].numpy()
+                    target = self.root / space / LIVE_FIELDS[field_name]
+                    if target not in fds:
+                        fds[target] = os.open(target, os.O_WRONLY)
+                    _scatter_write(fds[target], index, tensor.numpy())
+                for fd in fds.values():
+                    os.fdatasync(fd)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                for fd in fds.values():
+                    os.close(fd)
+            del tensors
+        manifest = dict(self._manifest, live_updates=int(meta['update']))
         _atomic_json(self.root / 'manifest.json', manifest)
         self._manifest = manifest
         journal.unlink()
+        for path in parts:
+            path.unlink()
         _fsync_dir(self.root)
 
     def pin_live(self) -> LiveSnapshot:
@@ -1107,7 +1569,8 @@ class KnowledgeBase:
         """Save the exact live state (values, keys, Adam moments, step counts,
         ``live_updates``) and the manifest under ``live_checkpoints/<tag>``, built under
         ``<tag>.pending`` and renamed, with a checksum per file. Costs a full copy of the
-        live files (three fp32 copies of every payload)."""
+        live state (three fp32 copies of every payload), written straight from memory
+        when it is resident (unsynced updates included; the live files are not synced)."""
         with self._lock:
             if not self.writable:
                 raise PermissionError('KB opened read-only')
@@ -1123,18 +1586,41 @@ class KnowledgeBase:
             files = {}
             for space in self._manifest['live_spaces']:
                 (pending / space).mkdir()
-                for file in LIVE_FILES:
-                    size = self._sizes(space)[file]
-                    files[f'{space}/{file}'] = {
-                        'bytes': size, 'hash': _copy_hashed(algorithm, self.root / space / file,
-                                                            pending / space / file, size)}
+                for name, file in LIVE_FIELDS.items():
+                    size, dst = self._sizes(space)[file], pending / space / file
+                    if self._live is None:
+                        digest = _copy_hashed(algorithm, self.root / space / file, dst, size)
+                    else:
+                        digest = self._write_resident(self._live[space][name].view(), dst,
+                                                      algorithm, size)
+                    files[f'{space}/{file}'] = {'bytes': size, 'hash': digest}
                 _fsync_dir(pending / space)
+            manifest = dict(self._manifest, live_updates=self.live_updates)
             info = {'tag': tag, 'cursor': self.cursor, 'live_updates': self.live_updates,
-                    'checksum': algorithm, 'files': files, 'manifest': self._manifest}
+                    'checksum': algorithm, 'files': files, 'manifest': manifest}
             _atomic_json(pending / 'checkpoint.json', info)
             os.replace(pending, final)
             _fsync_dir(base)
             return {k: info[k] for k in ('tag', 'cursor', 'live_updates')}
+
+    @staticmethod
+    def _write_resident(tensor: Tensor, dst: Path, algorithm: str, size: int) -> str:
+        """Write a resident tensor's bytes to ``dst`` in chunks (fsynced, cached pages
+        dropped); returns their hash."""
+        flat = _flat_bytes(tensor)
+        if len(flat) != size:
+            raise AssertionError(f'resident live state of {dst.name} has {len(flat)} bytes, '
+                                 f'the manifest {size}')
+        h = _hasher(algorithm)
+        with dst.open('wb') as out:
+            for start in range(0, size, _CHUNK):
+                data = flat[start:start + _CHUNK].cpu().numpy()
+                h.update(data)
+                out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+            os.posix_fadvise(out.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        return h.hexdigest()
 
     def live_checkpoints(self) -> list[str]:
         base = self.root / CHECKPOINTS
@@ -1221,6 +1707,10 @@ class KnowledgeBase:
         (self.root / 'live.restore').unlink()
         _fsync_dir(self.root)
         self._build_index()
+        if self._live is not None:      # reload the resident state from the restored files
+            self._live, self._workspaces = None, {}
+            self._generation = target['live_updates']
+            self._live = {space: self._load_space(space) for space in target['live_spaces']}
 
     # -- export, compaction, verification ------------------------------------------------
 
@@ -1269,7 +1759,8 @@ class KnowledgeBase:
             for start in range(0, len(current), batch):
                 rows = current[start:start + batch].tolist()
                 items = [self._item(space, r, self.cursor, live and export) for r in rows]
-                steps = self._map(space, 'live_step.i64')[rows] if live else [0] * len(rows)
+                steps = self._live_gather(space, 'step', np.asarray(rows)) if live \
+                    else [0] * len(rows)
                 fresh = [NewItem(i.values, i.key,
                                  Provenance(i.provenance.sources, 'live-update', int(s))
                                  if live and export else i.provenance, i.mass, i.time, i.id)
@@ -1281,11 +1772,10 @@ class KnowledgeBase:
                     positions = np.concatenate([np.arange(table[r, OFFSET],
                                                           table[r, OFFSET] + table[r, LENGTH])
                                                 for r in rows])
-                    for file, index in (('live_values.f32', positions), ('live_m.f32', positions),
-                                        ('live_v.f32', positions), ('live_step.i64', rows),
-                                        ('live_keys.f32', rows)):
+                    for name, file in LIVE_FIELDS.items():
+                        index = positions if name in POSITION_FIELDS else np.asarray(rows)
                         with (pending / space / file).open('ab') as handle:
-                            handle.write(np.ascontiguousarray(self._map(space, file)[index]).tobytes())
+                            handle.write(self._live_gather(space, name, index).tobytes())
                             handle.flush()
                             os.fsync(handle.fileno())
         self._write_history(pending, out)
@@ -1306,6 +1796,7 @@ class KnowledgeBase:
         left behind are summarized in ``history.jsonl``; the manifest's origin names this
         KB, its cursor and ``live_updates``. Built under ``dest.pending``."""
         with self._lock:
+            self.sync_live()     # the origin names a durable live generation
             origin = {'name': self.name, 'cursor': self.cursor, 'live_updates': self.live_updates}
             return self._copy_current(dest, name or f'{self.name}@live{self.live_updates}',
                                       origin, export=True, batch=batch)
@@ -1319,6 +1810,7 @@ class KnowledgeBase:
         ``live_updates``; a frozen KB's compaction is frozen. Live checkpoints are not
         carried (their row layout is the old one). Returns the new KB read-only."""
         with self._lock:
+            self.sync_live()     # the origin names a durable live generation
             origin = {'name': self.name, 'cursor': self.cursor, 'live_updates': self.live_updates,
                       'compacted': True}
             return self._copy_current(dest, name or self.name, origin, export=False, batch=batch)
