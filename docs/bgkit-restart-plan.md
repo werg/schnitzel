@@ -478,3 +478,11 @@ log your decisions and changes of direction"), newest last.
   The teacher cache script is smoke-tested and kept for then. Note: LFM2.5-1.2B-Base
   lacks `<think>`/`</think>` (ids 64400-64401 in our decoder); the script compares
   every output id and keeps such ids out of the stored top-k.
+- **28 Sep, locality kernel in the MLP-matrix operator.** K1 with uniform pair
+  weights learned a position-only average span (step 1000: stack 0.078 captured
+  vs 0.074 shuffled, every space ablation identical), because each target averaged
+  all ~110 source positions equally. Pair weights now carry a learnable Gaussian
+  locality kernel in units of position spacing (starts at one spacing, can widen
+  to flat), for codecs and the recombiner; S_s over unordered neighbourhoods has
+  none. K1 restarted from scratch (`kb-k1`); the first run is kept as
+  `kb-k1-uniform`.

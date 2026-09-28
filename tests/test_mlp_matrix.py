@@ -49,9 +49,9 @@ def test_each_item_weighs_its_gate_whatever_its_length():
     layer = op.layers[0]
     original = layer.forward
 
-    def spy(h, sources, source_pos, relative, weights, target_pos, cond):
+    def spy(h, sources, source_pos, relative, weights, target_pos, cond, locality=None):
         seen['weights'] = weights
-        return original(h, sources, source_pos, relative, weights, target_pos, cond)
+        return original(h, sources, source_pos, relative, weights, target_pos, cond, locality)
 
     layer.forward = spy
     op([('a', torch.randn(8, 6), 1.0), ('b', torch.randn(2, 10), 0.5)], 3)
@@ -85,3 +85,19 @@ def test_checkpointed_layers_give_identical_gradients():
         grads.append([p.grad.clone() for p in op.parameters() if p.grad is not None])
     for g1, g2 in zip(*grads):
         assert torch.allclose(g1, g2, atol=1e-6)
+
+
+def test_locality_kernel_lets_a_target_read_its_aligned_source():
+    torch.manual_seed(0)
+    op = MLPMatrix({'a': 4}, 4, state=8, hidden=8, layers=1, frequencies=2)
+    x = torch.randn(10, 4)
+    base, _ = op([('a', x, 1.0)], 10)
+    x2 = x.clone()
+    x2[0] += 5.0   # change the first source position only
+    changed, _ = op([('a', x2, 1.0)], 10)
+    effect = (changed - base).norm(dim=-1)
+    assert effect[0] > 5 * effect[-1]   # the aligned target moves, the far one barely
+    for p in op.parameters():
+        p.requires_grad_(False)
+    flat = MLPMatrix({'a': 4}, 4, state=8, hidden=8, layers=1, frequencies=2, relative=False)
+    assert flat.layers[0].bandwidth is None

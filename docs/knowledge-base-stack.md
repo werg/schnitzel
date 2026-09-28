@@ -151,6 +151,15 @@ h_i ← h_i + FFN(LN(h_i))
 - φ are Fourier features. The relative term φ(p_j − t_i) lets a codec align
   source and target positions; a neighbourhood read by S_s has no meaningful
   cross-item order, so its sources carry only their within-item position.
+- **Locality kernel** (codecs and recombiner, where positions align): the pair
+  weight is w_ij = w_j · exp(−(p_j − t_i)² / 2σ²), σ = β · max(1/m, 1/n_item), β
+  learnable per layer and input kind, starting at one position spacing. Without
+  it, every target averages all sources equally and one source's signal is
+  diluted by their number: the first K1 run (uniform weights) learned a
+  position-only average span and ignored the spaces (content 0.01 nats at step
+  1000, every space ablation identical). β can grow until the combination is
+  flat, so dense superposition stays reachable; training decides how local each
+  layer is. S_s over unordered neighbourhoods uses no kernel.
 - **Gates only modulate mass.** An item's gate scales its positions'
   contributions to the numerator and the mass; it is not an input feature. A gate
   of 0 removes an item exactly, and scaling all gates together changes only the
@@ -286,8 +295,8 @@ are the levers; the dense per-pair form is kept on purpose.
 | Part | State |
 |---|---|
 | Writer (B2/B3) | training (restart plan B3) |
-| MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 7 property tests) |
-| K1 codecs and recombiner | training from 28 Sep (`scripts/train_kb_codecs.py`, run `kb-k1`: B1 teacher spans, B3 reader at step 11500, 28M parameters) |
+| MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
+| K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
 | K2 keys | not built (R5d5 key table exists) |
 | K3 superposition operator | not built |
 | K4-K6, L1-L2 | not built |
