@@ -661,3 +661,17 @@ log your decisions and changes of direction"), newest last.
   write step (`schnitz.kb.bank`, shared with L1's KB build); B4 starts without it
   and switches it on by resuming with the cache. Empty slots taught writes to
   encode content the model never read and to ignore memory results.
+- 28 Sep (WP5, L1 read path and trainer built). Choices: the query state is taken at
+  the token holding the call's closing parenthesis (calls in one tool-call block get
+  their own positions); each later query is computed from a prefix pass with every
+  earlier read's span spliced in (exact causal prefix, full gradient path, one pass
+  per site truncated at the query layer and recomputed in backward) rather than
+  detaching earlier reads. Reads touch only the episode's own KB. Sigmoid gates on
+  scores of item keys recomputed from current values (the stored keys are the
+  search's cache, refreshed from the item-key heads), sparse top 2/2/3/4 items per
+  space, span budget 16 reps. Item values train in place with the live state
+  resident on the CPU (per-item live reads from a GPU-resident state cost about 9 ms
+  each in the store's per-row gather). Write calls are dropped from L1 renders until
+  in-context writes land. Validation items are the same live items the training
+  episodes update (one KB per dataset), so evaluation measures reads of trained
+  items for held-out questions, not held-out records.

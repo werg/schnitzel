@@ -391,7 +391,49 @@ inputs are. Training data is regenerated where the format changes (owner:
   sandboxed code execution.
 - **WP5 - Stack training after K1**: K2 key and query heads, K3a warm-up of S_s,
   the L1 read path (retrieve per space, gates from similarity, S_s, R, `<|mem|>`
-  span).
+  span). Built (28 September): the read path `src/schnitz/kb/read.py` and the stage
+  `scripts/train.py l1 build|train` (`src/schnitz/kb/stages/l1.py`), on the shared
+  `schnitz.kb.stack`/`losses`/`bank` modules.
+  - *Build* (offline bank creation, invariant 1): the records the transcripts'
+    slots name (plus `--distractors` per KB), their writer spans through
+    `schnitz.kb.bank` (per-KB span caches shared with `train.py bank`; B3 free run
+    at level s0, or `--span-source teacher`), the stack's codecs (K1 `stack.pt`, or
+    random init with span statistics from the records), keys from the initial
+    item-key heads; one `kb_store` KB per dataset, item time = `created_at`.
+  - *Read*: query state = the frozen decoder's state after `--query-layer` (8 of
+    16) layers at the token holding the call's closing parenthesis; query heads per
+    space; exact top-k over the live keys of the episode's own KB only (candidates
+    A/B/C/D 8/16/32/64), time <= the episode's query time; scores from the item-key
+    heads applied to the candidates' current values; gates
+    `sigmoid(scale (cos - b_s))`; sparse reads (top 2/2/3/4 per space enter, the rest
+    gate exactly 0); S_s per space on the query key; R over the space reads with
+    their masses; `read_count` capped at 16 reps; span spliced between `<|mem|>`
+    and `<|/mem|>`.
+  - *Causality and gradients*: the query at call k comes from a pass over the prefix
+    up to the call with all earlier reads' spans spliced in (one pass per site,
+    truncated at the query layer, recomputed in backward); retrieval (discrete) runs
+    outside the recomputed function. Gradients reach earlier reads through later
+    queries (tested). The decoder is frozen.
+  - *Training (L1a)*: task NLL on assistant tokens plus the retrieval loss (weight
+    0.5, `--retrieval-anneal`) and the balance loss (0.01); reader parameters by
+    AdamW, item values by one sparse `live_step` per touched (KB, space) with the
+    live state resident (`load_live`, CPU by default); stored search keys refreshed
+    from the item-key heads every `--rekey-every` steps; each reader checkpoint is
+    paired with `checkpoint_live` of every KB, restored on resume (the store's
+    restore is tested bit-exact; the trainer resumed cleanly in the GPU smoke, but a
+    resumed run was not compared with an uninterrupted one).
+    `--retrieval-only` is K2 (only the retrieval loss; spans enter later prefixes
+    detached; item values fixed). `--phase l1b` (gradients through the sources by
+    selective producer replay) is a marked hook, not built.
+  - *Evaluation arms* (invariant 9): no memory (empty `<|mem|><|/mem|>`), the slot
+    records' text as the tool result (the information-matched text control, the
+    `full` of `kb_eval.nll_summary`), the retrieved read, another episode's reads
+    (shuffled), the gold items at gate 1 (no retrieval) and its shuffled control;
+    content nats over shuffled, captured fractions, recall@k, effective items per
+    read.
+  - *Not in L1 yet*: writes (write calls and acknowledgements are dropped from the
+    render; v3 in-context writes whose items enter the KB are not built), in-batch
+    negatives for the retrieval loss, tasks beyond the transcripts' SFT.
 
 ## 10. Status
 
@@ -404,6 +446,8 @@ inputs are. Training data is regenerated where the format changes (owner:
 | KB store (WP2) | built (`src/schnitz/kb_store.py`, 29 tests, schema `schnitz.kb/2`): per-dataset KBs, per-space items with keys, masses, provenance, versions and lineage; cursor-pinned commits; exact chunked scan over memory-mapped keys. Rewrites carry per-(output, input) responsibility shares (each input's shares sum to one, output mass = share-weighted input mass, stored exactly; several outputs require explicit shares), and `lineage()`/`source_composition()` resolve share x mass through `kb_eval.source_composition`. Per-commit segment checksums (xxh3-128, else blake2b), hash-chained with the head in the manifest; `verify()`, optional on open. Live mode: per-item Adam state, live keys separate from the immutable stored keys (cursor-pinned and other-process reads never see live state), `pin_live()` snapshots of a live generation by in-memory copy on write, `checkpoint_live`/`restore_live` with bit-identical resume (optionally discarding later commits), export as a frozen KB. Resident live mode (`load_live(device, sync_every)`): values, Adam moments and live keys held as fp32 tensors in RAM or on the GPU, so `live_step` touches only memory; disk is written only by `sync_live()` (every `sync_every` updates, `enable_live`, export, compaction, `unload_live`, clean `close`), which journals the changed items in bounded parts with one commit point, or rewrites and swaps the live files when most items changed; `checkpoint_live` writes straight from memory. A crash reopens at the last sync (`synced_live_updates`); exact resume is `restore_live` of the `checkpoint_live` taken with the model checkpoint. Resident and per-step journaled modes run the same vectorized per-item Adam and are bit-identical on CPU, and both match `torch.optim.Adam`/`AdamW` bitwise. `compact()` writes a KB without superseded rows, their metadata in `history.jsonl`. 200k-item check (4 x 384 positions each): append 12 s, verify 0.3 s, 64-query scan 0.2 s, composition 3 s, checkpoint 4 s, compaction 19 s. Live step at 3000 touched items (28 Sep, machine shared with training runs): journaled 0.2-0.9 s; resident CPU 19-27 ms (1000/5000 items: 10-14/31-40 ms, memory-bandwidth bound); resident CUDA 13 ms median, 19 ms p90 (1000/5000: 4/28 ms; queued without host sync 3/13 ms per step, 2-11 ms host time). Disk-bound, varying with other I/O: sync after one 3000-item step 0.2-0.5 s, after 10 such steps 4-22 s (journal), of the whole state 15-27 s (swap); checkpoint from memory 3-25 s; restore 11-26 s. Resident state 3.9 GB; peak RSS 5.4 GB on CPU, 3.7 GB plus 5.0 GB CUDA. Not yet used by a trainer; live mode is single-process |
 | Memory-protocol transcripts (WP3) | version 3 generated (`scripts/prepare_memory_transcripts.py`, 17 tests): 526,709 of 526,802 episodes of 22 corpora in `/archive/corpora/memory-<name>-20260928v3` (v1 and v2 dirs kept). Reads are `memory_search()` without arguments (record ids per call in the slot and in `search_sites` with `step` and `trigger`); writes are `memory_write()` without arguments, rendered with the model's own `<|bg|>`…`<|/bg|>` span in the same assistant turn (placeholder `<|reserved_20|><|reserved_22|>`, open and close in the loss); the content text is kept only as `write_sites[i].teacher_text` for B4 distillation and never rendered (audited). Agent trajectories search mid-episode (protocol at the start; tool docs and action-specific policy sections before the first call; ALFWorld know-how before the first action naming a listed object or place; worked examples before the first use of their most specific command and again before the next; protocol again after a failed action; placement is label-side, accepted by the owner). ScienceWorld episodes without examples get three same-task examples from the KB's held-out pool (3.2 searches per train episode, v1 1.3). Writes (`--writes reusable`): trajectories plus SQL, table answers, tool calls, code up to 900 characters and multi-hop answers (281,875). Audit clean; LFM2.5-350M render check clean on the first 200 transcripts of every split (9,085). Open: 93 reasoning-gym episodes have no records; no trainer reads them yet (B4 write sites, L1) |
 | Evaluation harness (WP4) | built (`scripts/benchmark_models.py`, `src/schnitz/kb_eval.py`, verifiers in `src/schnitz/task_verifiers.py`; 57 tests): benchmark of reference models on 9 task corpora with oracle context and closed book; superposition metrics, counterfactual edits, removal and insertion reports. Harness 2 (28 Sep; results of harness 1 are redone on rerun): required records are never cut and per-task context budgets (8k to 80k characters) cover every validation episode (0 truncated; longest full-context prompt 20.6k LFM2.5 / 25.4k Ling tokens, spider_memory; knights 18.1k; all fit the 32k LFM2.5 window with their generation budget, `--measure` reproduces this); APIGen-MT scores every tool-call turn on its gold causal prefix (1,228 calls in 274 validation episodes instead of 19 opening calls; first-call and opening-call rates kept); Reasoning Gym per-family normalizations (`reasoning_gym` is not installed; 521 of 549 validation episodes have a unique stored answer, 28 in 9 families whose scorer accepts any valid solution still undercount; +7 of 400 answers on the 350M run); SynLogic added with the repository's verifiers (local checkout, run sandboxed; 23 families, 3 `math_verify` families reimplemented; 286 validation episodes, `futoshiki` excluded because 12 of 20 stored puzzles have no solution); model code and SynLogic verifiers run in a sandbox (time, CPU, heap and file-size limits, own temporary directory, Internet sockets blocked in Python; KodCode gold pass rate unchanged, 179/200). `kb_eval.nll_summary(..., gain=False)` reproduces the K1 evaluation record exactly (tested) for the K1 stage to report through. Smoke-tested on 350M (5 episodes per task, harness 1; harness 2 on 3 episodes of 5 tasks); reference runs (8B-A1B, Ling-3.0-tiny, 24B-A2B) pending |
-| K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
-| L1, L2 | not built |
+| K2 keys | built as `train.py l1 train --retrieval-only` (item-key and query heads of `schnitz.kb.stack`, retrieval loss of `schnitz.kb.losses`); GPU smoke only, not trained |
+| K3a superposition operator | see `schnitz.kb.stages.k3` |
+| L1 | built, not trained: `train.py l1 build|train` (`src/schnitz/kb/read.py`, `src/schnitz/kb/stages/l1.py`; 18 read-path tests, 3 bank tests). L1a only (L1b a marked hook). GPU smoke (200 R6 transcripts of `memory-r6-mixed-20260928v3`, 17 per-dataset KBs, 1,452 records with 64 distractors per KB, random-init codecs, B3 reader at step 11500, batch 4): 20 L1a steps plus a resume to 26 and 10 K2 steps run; content over shuffled stays at noise level (retrieved -0.003 to 0.001 nats, gold -0.001 to 0.006) as expected with random codecs; retrieved and shuffled reads both lower the NLL from 2.19 to 1.86-1.92 (format, not content; the text arm is 1.62); recall of the slot's items among the scored candidates at step 20: A 0.13, B 0.29, C 0.35, D 0.84 (D scores 64 of about 70-140 items per KB). About 5-10 s per step. Launch waits for K1 (and K2 as its first phase) |
+| L2 | not built |
 | Teacher distributions | later phase; cache script smoke-tested (LFM2.5-1.2B-Base, 300 records: mass sums to 1, true token in the top 32 for 84% of positions); models in `/home/werg/sdkb-runs/hf-models` |
