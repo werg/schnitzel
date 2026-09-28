@@ -38,9 +38,9 @@ reads), ``gold`` (the target items, gate 1, no retrieval) and ``gold_shuffled``.
 Reported with ``kb_eval.nll_summary`` (captured fractions of the text arm's gain,
 content nats over the shuffled controls), recall and effective items per read.
 Writes: ``memory_write`` calls (and their acknowledgements) are left out of the L1
-render (``--keep-writes`` keeps them): their text argument is the dropped v0.5 form,
-writes are single-pass latent spans trained in B4 (owner, 28 September), and L1 does
-not train writes.
+render: v1/v2 carry the dropped v0.5 text argument, and in-context single-pass writes
+(v3: the model generates the span at the write site and its items enter the KB) are
+not built in L1 yet (B4c trains the writes).
 
 Entry point (until ``scripts/train.py <stage>`` exists): ``python -m
 schnitz.kb.stages.l1 build|train ...``. Training-only; the decoder parts run in
@@ -51,32 +51,23 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import math
 from pathlib import Path
 import random
 import re
 import shutil
-import sys
 import time
 
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from schnitz.kb.bank import SpanCache, Transcripts, read_sources, record_sources, slots_of
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, L1Reader,
                              ReadConfig, source_index, splice)
 from schnitz.kb.stack import KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
-
-# the writer's length schedule (s0 factor) still lives in scripts/
-SCRIPTS = Path(__file__).resolve().parents[4] / 'scripts'
-
-
-def _scripts() -> None:
-    if str(SCRIPTS) not in sys.path:
-        sys.path.insert(0, str(SCRIPTS))
 
 MEM, MEM_END = SPAN_TOKENS['mem'][0], SPAN_TOKENS['mem_end'][0]
 MEM_ID = SPAN_TOKENS['mem'][1]
@@ -85,49 +76,6 @@ CALL = re.compile(r'memory_search\(\s*\)')
 
 
 # -- transcripts ---------------------------------------------------------------------
-class Transcripts:
-    """The first ``limit`` transcripts of ``split`` per directory, in file order, read
-    lazily by byte offset (the full corpora do not fit in memory as parsed rows)."""
-
-    def __init__(self, dirs: list[Path], split: str, limit: int | None):
-        self.entries: list[tuple[Path, int, str]] = []
-        for d in dirs:
-            path = d / f'transcripts-{split}.jsonl'
-            if not path.exists():
-                continue
-            with path.open('rb') as handle:
-                n = 0
-                while limit is None or n < limit:
-                    offset = handle.tell()
-                    if not handle.readline():
-                        break
-                    self.entries.append((path, offset, str(d)))
-                    n += 1
-
-    def __len__(self) -> int:
-        return len(self.entries)
-
-    def __getitem__(self, i: int) -> dict:
-        path, offset, d = self.entries[i]
-        with path.open('rb') as handle:
-            handle.seek(offset)
-            row = json.loads(handle.readline())
-        row['_dir'] = d
-        return row
-
-    def __iter__(self):
-        return (self[i] for i in range(len(self)))
-
-
-def load_rows(dirs: list[Path], split: str, limit: int | None) -> list[dict]:
-    return list(Transcripts(dirs, split, limit))
-
-
-def slots_of(row: dict) -> list[dict]:
-    return [m['content']['slot'] for m in row['messages']
-            if isinstance(m.get('content'), dict) and 'slot' in m['content']]
-
-
 def query_time(row: dict) -> int:
     prov = row.get('provenance') or {}
     return int(prov.get('source_query_time', prov.get('query_time', 2)))
@@ -396,42 +344,6 @@ def _safe(name: str) -> str:
     return re.sub(r'[^A-Za-z0-9_.-]', '__', name)
 
 
-def needed_records(rows: list[dict]) -> dict[str, dict[str, str]]:
-    """kb -> record id -> transcript dir (whose manifest names the corpus)."""
-    out: dict[str, dict[str, str]] = {}
-    for row in rows:
-        for slot in slots_of(row):
-            if slot['kb'] != row['kb']:
-                raise PermissionError(f'{row["episode_id"]}: slot of another KB')
-            for r in slot['record_ids']:
-                out.setdefault(row['kb'], {})[r] = row['_dir']
-    return out
-
-
-def read_sources(dirs: set[str], wanted: set[str],
-                 extra: dict[str, int] | None = None) -> dict[str, dict]:
-    """Text and time of the ``wanted`` records. ``extra`` asks for up to that many more
-    records of a KB (in corpus order; distractors, so a KB holds more than the slots
-    name); every record is returned with its ``kb``."""
-    records, extra, added = {}, dict(extra or {}), {}
-    for d in sorted(dirs):
-        manifest = json.loads((Path(d) / 'manifest.json').read_text())
-        corpus = Path(manifest['input'])
-        with (corpus / 'sources.jsonl').open(encoding='utf-8') as handle:
-            for line in handle:
-                rec = json.loads(line)
-                kb = (f'{manifest["kb"]}:{rec.get("domain", "")}'
-                      if manifest.get('kb_per_domain') else manifest['kb'])
-                take = rec['record_id'] in wanted
-                if not take and added.get(kb, 0) < extra.get(kb, 0):
-                    take = True
-                    added[kb] = added.get(kb, 0) + 1
-                if take:
-                    records[rec['record_id']] = {'text': rec['text'], 'kb': kb,
-                                                 'created_at': int(rec['created_at'])}
-    return records
-
-
 def initial_heads(path: Path, hidden: int, key_hidden: int, seed: int) -> KeyHeads:
     """The initial query and item-key heads (seeded), shared by every KB of a build
     and the trainer's starting point."""
@@ -446,102 +358,97 @@ def initial_heads(path: Path, hidden: int, key_hidden: int, seed: int) -> KeyHea
 
 @torch.no_grad()
 def build(args) -> None:
-    _scripts()
-    from cache_bgkit_teacher import length_factors
-    rows = []
-    for split, limit in (('train', args.limit), ('validation', args.eval_limit)):
-        rows += load_rows(args.transcripts, split, limit)
-    needed = needed_records(rows)
-    wanted = {r for recs in needed.values() for r in recs}
-    records = read_sources({d for recs in needed.values() for d in recs.values()}, wanted,
-                           {kb: args.distractors for kb in needed})
-    missing = wanted - set(records)
-    if missing:
-        raise ValueError(f'{len(missing)} slot records are not in the corpus sources')
-    for rid, rec in records.items():      # distractor records join their own KB
-        if rid not in wanted and rec['kb'] in needed:
-            needed[rec['kb']][rid] = ''
+    """One KB per dataset from the records the transcripts' slots name (plus
+    ``--distractors``): the writer's span of each record (``schnitz.kb.bank``; cached in
+    ``<output>/spans`` or ``--span-cache``), the codecs' items per space and their keys
+    from the initial item-key heads. Resumable: records already in a KB are skipped."""
+    records = record_sources(args.transcripts, {'train': args.limit,
+                                                'validation': args.eval_limit},
+                             args.distractors)
     model = load_model(args)
     args.output.mkdir(parents=True, exist_ok=True)
-    stack_path = args.output / 'stack.pt'
-    resumed = stack_path.exists()
-    stack, codec_step, dims = load_stack(stack_path if resumed else args.codecs,
-                                         model.target_norm, model.device, args.seed)
-    # a random-init stack has no span statistics yet: taken from the first batch
-    needs_statistics = not resumed and args.codecs is None
-    hidden = model.decoder.base_lm.config.hidden_size
-    heads = initial_heads(args.output / 'key_heads_init.pt', hidden, args.key_hidden,
-                          args.seed).to(model.device)
-    teacher = None
+    teacher, cache = None, None
     if args.span_source == 'teacher':
         from schnitz.kb.decoder import TeacherCache
         teacher = TeacherCache(args.cache, None, texts=[])
         teacher.by_id = {item[2]: item for item in teacher.items}
+    else:
+        cache = SpanCache.build(args.span_cache or args.output / 'spans', model,
+                                {r: rec['text'] for r, rec in records.items()}, args.level,
+                                batch_size=args.batch_size,
+                                meta={'reader_state': str(args.reader_state),
+                                      'checkpoint': str(args.checkpoint)})
+
+    def span_of(record_id: str) -> torch.Tensor:
+        if teacher is None:
+            return cache.get(record_id).to(model.device).float()
+        if record_id not in teacher.by_id:
+            raise ValueError(f'record {record_id} has no cached teacher span')
+        shard, row = teacher.by_id[record_id][:2]
+        return teacher.reps(shard, row, args.level).to(model.device).float()
+
+    stack_path = args.output / 'stack.pt'
+    resumed = stack_path.exists()
+    stack, codec_step, dims = load_stack(stack_path if resumed else args.codecs,
+                                         model.target_norm, model.device, args.seed)
+    if not resumed:
+        if args.codecs is None:   # a random-init stack takes its span statistics here
+            sample = sorted(records)[:1024]
+            stack.set_statistics([span_of(r) for r in sample])
+        torch.save({'stack': stack.state_dict(), 'step': codec_step, 'dims': dims,
+                    'source': str(args.codecs)}, stack_path)
+    hidden = model.decoder.base_lm.config.hidden_size
+    heads = initial_heads(args.output / 'key_heads_init.pt', hidden, args.key_hidden,
+                          args.seed).to(model.device)
+    by_kb: dict[str, list[str]] = {}
+    for r, rec in records.items():
+        by_kb.setdefault(rec['kb'], []).append(r)
     report = {}
     started = time.time()
-    for kb_name, recs in sorted(needed.items()):
+    for kb_name, recs in sorted(by_kb.items()):
         root = args.output / _safe(kb_name)
         kb = KnowledgeBase(root, writable=True) if (root / 'manifest.json').exists() else \
             KnowledgeBase.create(root, name=_safe(kb_name), dataset=kb_name,
                                  origin={'command': 'train.py l1 build',
-                                         'span_source': args.span_source,
+                                         'span_source': args.span_source, 'level': args.level,
                                          'codecs': str(args.codecs), 'codec_step': codec_step,
-                                         'reader_state': str(args.reader_state),
-                                         'query_layer': args.query_layer})
+                                         'reader_state': str(args.reader_state)})
         done = set(source_index(kb, 'D'))
-        todo = sorted((r for r in recs if r not in done),
-                      key=lambda r: len(records[r]['text']))
+        todo = sorted(r for r in recs if r not in done)
         for start in range(0, len(todo), args.batch_size):
             batch = todo[start:start + args.batch_size]
-            ids = [model.text_ids(records[r]['text']) for r in batch]
-            if teacher is not None:
-                spans = []
-                for r in batch:
-                    if r not in teacher.by_id:
-                        raise ValueError(f'record {r} has no cached teacher span')
-                    shard, row = teacher.by_id[r][:2]
-                    spans.append(teacher.reps(shard, row, 's0').to(model.device).float())
-            else:
-                factors = [length_factors(int(x.shape[0]))[0] for x in ids]
-                examples = [{'ids': x, 'prompt': 'memory', 'factor': f}
-                            for x, f in zip(ids, factors)]
-                lengths = [max(1, math.ceil(x.shape[0] / f)) for x, f in zip(ids, factors)]
-                with model.core.autocast():
-                    spans, _ = model.free_run(examples, lengths)
-                spans = [s.float() for s in spans]
-            if needs_statistics:
-                stack.set_statistics(spans)
-                needs_statistics = False
-            if not stack_path.exists():
-                torch.save({'stack': stack.state_dict(), 'step': codec_step, 'dims': dims,
-                            'source': str(args.codecs)}, stack_path)
-            per_space = {s: [] for s in DEFAULT_SPACES}
             with model.core.autocast():
-                encoded = [stack.encode(span) for span in spans]
-            for i, r in enumerate(batch):
+                encoded = [stack.encode(span_of(r)) for r in batch]
+            per_space = {s: [] for s in DEFAULT_SPACES}
+            for r, items in zip(batch, encoded):
                 for s in DEFAULT_SPACES:
-                    values = encoded[i][s].float()
+                    values = items[s].float()
                     per_space[s].append(NewItem(
                         values.cpu(), heads.item_key(s, values).float().cpu(),
-                        Provenance((r,), 'codec', codec_step), 1.0, records[r]['created_at']))
+                        Provenance((r,), 'codec', codec_step), 1.0,
+                        records[r]['created_at']))
             for s, items in per_space.items():
                 kb.append(s, items)
-            print(json.dumps({'kb': kb_name, 'done': start + len(batch), 'of': len(todo),
-                              'elapsed_s': round(time.time() - started)}), flush=True)
+        print(json.dumps({'kb': kb_name, 'items_per_space': len(recs),
+                          'elapsed_s': round(time.time() - started)}), flush=True)
         report[kb_name] = {'dir': root.name, 'records': len(recs), 'stats': kb.stats()}
         kb.close()
     manifest = {'command': 'build', 'transcripts': [str(d) for d in args.transcripts],
                 'limit': args.limit, 'eval_limit': args.eval_limit,
-                'span_source': args.span_source, 'codecs': str(args.codecs),
-                'distractors': args.distractors, 'codec_step': codec_step, 'reader_state': str(args.reader_state),
-                'query_layer': args.query_layer, 'seed': args.seed, 'kbs': report}
+                'span_source': args.span_source, 'level': args.level,
+                'span_cache': str(args.span_cache or args.output / 'spans'),
+                'codecs': str(args.codecs), 'distractors': args.distractors,
+                'codec_step': codec_step, 'reader_state': str(args.reader_state),
+                'seed': args.seed, 'kbs': report}
     (args.output / 'banks.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps({'built': {k: v['records'] for k, v in report.items()}}), flush=True)
 
 
 # -- train --------------------------------------------------------------------------
-def open_live(banks: Path, output: Path) -> dict[str, KnowledgeBase]:
-    """The live copies of the banks under ``output/kbs`` (copied on first start)."""
+def open_live(banks: Path, output: Path, device=None,
+              sync_every: int = 0) -> dict[str, KnowledgeBase]:
+    """The live copies of the banks under ``output/kbs`` (copied on first start), with
+    the live state resident on ``device`` (``KnowledgeBase.load_live``)."""
     live_root = output / 'kbs'
     manifest = json.loads((banks / 'banks.json').read_text())
     if not live_root.exists():
@@ -558,6 +465,7 @@ def open_live(banks: Path, output: Path) -> dict[str, KnowledgeBase]:
         for s in kb.spaces:
             if not kb.is_live(s):
                 kb.enable_live(s)
+        kb.load_live(device=device, sync_every=sync_every)
         kbs[name] = kb
     return kbs
 
@@ -735,7 +643,7 @@ def train(args) -> None:
     usage: dict = {}
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'reader.pt'
-    kbs = open_live(args.banks, args.output)
+    kbs = open_live(args.banks, args.output, model.device, args.sync_every)
     if not state_path.exists():
         for kb in kbs.values():         # a crash before the first save restarts from the banks
             if kb.live_updates:
@@ -770,7 +678,7 @@ def train(args) -> None:
         if not slots_of(row) or row['kb'] not in kbs:
             reason = 'no_reads_or_kb'
         else:
-            ep = layout(row, tok, keep_writes=args.keep_writes)
+            ep = layout(row, tok)
             if ep.ids.numel() > args.max_tokens:
                 reason = 'too_long'
             elif not ctx.covered(ep):
@@ -821,7 +729,7 @@ def train(args) -> None:
                     kb.drop_live_checkpoint(old)
 
     if step == 0 and args.eval_every:
-        log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
+        log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok)})
     order: list[int] = []
     window: dict[str, list[float]] = {}
     started = time.time()
@@ -854,7 +762,7 @@ def train(args) -> None:
             rekey()
             save()
             reader.eval()
-            log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
+            log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok)})
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
@@ -878,6 +786,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--batch-size', type=int, help='build: records (32); train: episodes (8)')
     build_args = parser.add_argument_group('build')
     build_args.add_argument('--span-source', choices=('writer', 'teacher'), default='writer')
+    build_args.add_argument('--level', default='s0', help='ratio level of the written spans')
+    build_args.add_argument('--span-cache', type=Path,
+                            help='SpanCache directory (default <output>/spans)')
     build_args.add_argument('--cache', type=Path, help='B1 teacher cache (span source teacher)')
     build_args.add_argument('--distractors', type=int, default=0,
                             help='extra records per KB beyond those the transcripts name')
@@ -907,7 +818,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                    help='L1a items in place; L1b (through the sources) is not built')
     t.add_argument('--max-reps', type=int, default=16, help='span budget per read')
     t.add_argument('--max-tokens', type=int, default=3072)
-    t.add_argument('--keep-writes', action='store_true')
+    t.add_argument('--sync-every', type=int, default=500,
+                   help='resident live state: sync to disk every N updates (resume is exact '
+                        'through the live checkpoints taken with each reader checkpoint)')
     t.add_argument('--eval-every', type=int, default=500)
     t.add_argument('--eval-items', type=int, default=128)
     t.add_argument('--log-every', type=int, default=25)

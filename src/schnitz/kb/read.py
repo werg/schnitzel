@@ -121,10 +121,9 @@ class ItemCache:
         count = 0
         if item_lr > 0:
             for (dataset, space), ids in self.touched().items():
-                refs = [(dataset, space, i) for i in ids]
-                self.kbs[dataset].live_step(space, ids, [self.values[r].grad for r in refs],
-                                            lr=item_lr, betas=betas, eps=eps,
-                                            weight_decay=weight_decay)
+                grads = torch.cat([self.values[(dataset, space, i)].grad for i in ids])
+                self.kbs[dataset].live_step(space, ids, grads, lr=item_lr, betas=betas,
+                                            eps=eps, weight_decay=weight_decay)
                 count += len(ids)
         return {'items': count}
 
