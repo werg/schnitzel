@@ -757,3 +757,54 @@ def test_layout_with_write_sites_matches_the_site_prefix():
     assert '[memory_write()]' not in tok.decode(plain.ids)
     text = l1.layout(row, tok, {'a': 'alpha'}, writes=True)
     assert text.targets.numel() == ep.targets.numel()
+
+
+def test_gates_carry_stored_mass_and_caller_weights(tmp_path):
+    """Invariant 5: an item's gate is multiplied by its stored mass (and by the caller's
+    per-item weight), so its share of the read mass and read_count follow."""
+    kb = make_kb(tmp_path, records=(('r1', 1),))
+    half = KnowledgeBase.create(tmp_path / 'half', name='half', dataset='ds', spaces=SPACES)
+    for s in SPACES:
+        item = kb.read(s, kb._row_ids[s])[0]
+        half.append(s, [NewItem(item.values, item.key, item.provenance, 0.5, item.time)])
+    r = reader()
+    state = torch.randn(HIDDEN)
+    one = r.read(state, [kb], ['ds'], 3, ItemCache(train=False), targets=targets_of(kb, ['r1']),
+                 gold=True)
+    masses = r.read(state, [half], ['ds'], 3, ItemCache(train=False),
+                    targets=targets_of(half, ['r1']), gold=True)
+    weighted = r.read(state, [kb], ['ds'], 3, ItemCache(train=False),
+                      targets=targets_of(kb, ['r1']), gold=True,
+                      weights={i: 0.5 for s in SPACES for i in kb._row_ids[s]})
+    for s in SPACES:
+        assert masses.spaces[s].mass == pytest.approx(0.5 * one.spaces[s].mass, rel=1e-6)
+        assert weighted.spaces[s].mass == pytest.approx(masses.spaces[s].mass, rel=1e-6)
+    torch.testing.assert_close(masses.span, weighted.span)
+
+
+def test_search_exclude_masks_items_before_top_k(tmp_path):
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(6)))
+    q = torch.randn(1, SPACES['A'].key_width)
+    full = kb.search('A', q, 3)
+    gone = set(full.ids[0][:2])
+    hits = kb.search('A', q, 3, exclude=gone | {'not-an-item'})
+    assert len(hits.ids[0]) == 3 and not gone & set(hits.ids[0])
+    assert hits.ids[0] == [i for i in kb.search('A', q, 5).ids[0] if i not in gone][:3]
+
+
+def test_context_rows_follow_appends(tmp_path):
+    ctx, _ = context(tmp_path)
+    kb = ctx.kbs['ds']
+    before = dict(ctx.rows('ds', 'A'))
+    item = kb.read('A', kb._row_ids['A'][:1])[0]
+    new, = kb.append('A', [NewItem(item.values, item.key, Provenance(('r9',), 'codec'), 1.0, 1)])
+    rows = ctx.rows('ds', 'A')
+    assert rows[new] == len(before) and all(rows[k] == v for k, v in before.items())
+
+
+def test_ste_round_is_exactly_the_serialized_value():
+    x = (torch.randn(4096) * 3).requires_grad_()
+    y = l1.ste_round(x)
+    assert torch.equal(y, x.detach().bfloat16().float())        # bitwise, not up to an ulp
+    y.sum().backward()
+    assert torch.equal(x.grad, torch.ones_like(x))

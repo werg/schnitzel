@@ -32,7 +32,7 @@ its teacher text (the transcript's write-site ``teacher_text``, else question an
 is written by the bank writer under the memory prompt (bank creation) and appended as a
 ``gold`` record. Its gate is multiplied by w = global schedule (``--gold-start``, linear to
 0 over ``--gold-anneal`` steps) x ``--gold-decay`` ** (supersedes of the task's own record);
-gates scale mass, so w is its exact share (``experience.weigh_operators``); at w = 0 it is
+gates scale mass, so w is its exact share (the read's ``weights``); at w = 0 it is
 hidden. Records that read a gold-carrying record are ``hinted``.
 
 Held-out evaluation (validation episodes, never trained on, never given gold): rounds
@@ -66,9 +66,9 @@ import time
 import torch
 
 from schnitz.kb.bank import Transcripts, slots_of, write_spans as bank_write_spans
-from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, WeightedCache,
-                                   generate, read_items, read_mass, weigh_operators,
-                                   write_prefix)
+from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, generate,
+                                   read_items, read_mass, write_prefix)
+from schnitz.kb.read import ItemCache
 from schnitz.kb.producer import produce_items, span_length
 from schnitz.kb_store import NewItem, Provenance
 from schnitz.task_verifiers import check_episode
@@ -165,12 +165,12 @@ class Experience:
     # -- the three parts of a round -----------------------------------------------------
     @torch.no_grad()
     def attempt(self, row: dict, ep, view: KBView, weights: dict):
-        cache = WeightedCache(self.device, train=False, weights=weights)
-        weigh_operators(self.reader, cache.weight)
+        cache = ItemCache(self.device, train=False)
 
         def read(state):
             with self.frozen.autocast():
-                return self.reader.read(state, [view], [ep.kb], ep.query_time, cache)
+                return self.reader.read(state, [view], [ep.kb], ep.query_time, cache,
+                                        weights=weights)
         policy = self.policy
         if getattr(self.args, 'open_with_search', False):
             # the attempt opens with a memory_search() call (as every teacher transcript
@@ -183,16 +183,14 @@ class Experience:
                            read, prompt_ids(row, self.model.tok), self.proto,
                            self.args.max_new, policy, self.args.max_reads,
                            self.frozen.autocast)
-        weigh_operators(self.reader, None)
         return attempt, verify(attempt.answer, row['verify'])
 
     def sft(self, ep, view: KBView, weights: dict, weight: float, task: str) -> dict:
         from schnitz.kb.stages.l1 import run_episode
-        cache = WeightedCache(self.device, train=self.args.item_lr > 0, weights=weights)
-        weigh_operators(self.reader, cache.weight)
+        cache = ItemCache(self.device, train=self.args.item_lr > 0)
         self.ctx.kbs = {ep.kb: view}
         try:
-            nll, n, reads, _ = run_episode(self.ctx, ep, cache, 'retrieve')
+            nll, n, reads, _ = run_episode(self.ctx, ep, cache, 'retrieve', weights=weights)
             loss = weight * nll / n
             aux = [r.aux for r in reads if r.aux is not None]
             if aux and self.args.retrieval_weight:
@@ -200,7 +198,6 @@ class Experience:
             loss.backward()
         finally:
             self.ctx.kbs = dict(self.kbs)
-            weigh_operators(self.reader, None)
         items = cache.apply(self.args.item_lr)['items'] if self.args.item_lr > 0 else 0
         reg = self.registries[view.dataset]
         return {'nll': nll.item() / n, 'tokens': n, 'items_updated': items,
@@ -380,7 +377,6 @@ def run(args) -> None:
         p.requires_grad_(True)
     for p in reader.stack.codecs.parameters():
         p.requires_grad_(False)
-    weigh_operators(reader, None)
     args.output.mkdir(parents=True, exist_ok=True)
     kbs = open_live(args.banks, args.output, args.live_device, args.sync_every)
     ctx = Context(frozen, reader, kbs)

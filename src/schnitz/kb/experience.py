@@ -11,14 +11,14 @@ docs/knowledge-base-stack.md, 5.1 step 9). The stage is ``schnitz.kb.stages.b9``
   lineage, so held-out tasks can be restricted to records that never saw gold for
   them.
 - ``KBView``: a KB as one round sees it, for the read path (``schnitz.kb.read``):
-  hidden items are never searched or read (exact top-k over the visible items), and
+  hidden items are never searched (masked in the store's exact scan, so the top k are
+  over the visible items) or read, and
   substituted items return another item's values under their own key (the swapped
   control). Authorization stays with the KB's dataset (the reader's ``allowed``).
-- ``weigh_operators`` / ``WeightedCache``: the gold record's receding weight w. Gates
-  only scale mass in the MLP-matrix operator, so multiplying a gold item's gate by w
-  where S_s combines the read items makes w exactly that item's share of the read
-  mass (w = 0 removes it exactly). The weight is looked up by the item's value
-  tensor, which the step's ``WeightedCache`` hands out.
+- The gold record's receding weight w is the read path's per-item gate multiplier
+  (``L1Reader.read(..., weights=)``, ``l1.run_episode(..., weights=)``). Gates only
+  scale mass in the MLP-matrix operator, so w is exactly that item's share of the read
+  mass (w = 0 removes it exactly).
 - ``GenProtocol`` / ``generate``: an attempt generated autoregressively (KV cache) by
   the frozen decoder, executing a ``memory_search()`` read whenever the model emits
   the call: the query is the query-layer state at the call's closing parenthesis from
@@ -38,8 +38,6 @@ import re
 import torch
 from torch import Tensor
 
-from schnitz.kb.read import ItemCache
-from schnitz.kb.stack import SuperpositionOperator
 from schnitz.kb_store import KnowledgeBase, SearchHits
 
 KINDS = ('model', 'hinted', 'gold')
@@ -240,26 +238,9 @@ class KBView:
     def __getattr__(self, name):
         return getattr(self._kb, name)
 
-    def _hidden_in(self, space: str) -> int:
-        space_of = self._kb._space_of
-        return sum(space_of.get(i) == space for i in self.hidden)
-
     def search(self, space: str, queries: Tensor, k: int, **options) -> SearchHits:
-        extra = self._hidden_in(space)
-        hits = self._kb.search(space, queries, k + extra, **options)
-        if not extra:
-            return hits
-        out = SearchHits([], [], [], [], hits.cursor,
-                         [] if hits.items is not None else None)
-        for b in range(len(hits.ids)):
-            keep = [j for j, i in enumerate(hits.ids[b]) if i not in self.hidden][:k]
-            out.ids.append([hits.ids[b][j] for j in keep])
-            out.versions.append([hits.versions[b][j] for j in keep])
-            out.datasets.append([hits.datasets[b][j] for j in keep])
-            out.scores.append(hits.scores[b][keep] if keep else hits.scores[b][:0])
-            if out.items is not None:
-                out.items.append([hits.items[b][j] for j in keep])
-        return out
+        exclude = set(options.pop('exclude', ())) | self.hidden
+        return self._kb.search(space, queries, k, exclude=exclude, **options)
 
     def read(self, space: str, ids: Sequence[str], **options):
         blocked = [i for i in ids if i in self.hidden]
@@ -276,51 +257,6 @@ class KBView:
                 item = dataclasses.replace(item, values=values)
             out.append(item)
         return out
-
-
-# -- the gold record's weight ------------------------------------------------------------
-class WeightedCache(ItemCache):
-    """``ItemCache`` that remembers which item each handed-out value tensor is, so the
-    weighted operators can scale that item's gate (``weights``: item id -> w)."""
-
-    def __init__(self, device='cpu', train: bool = True,
-                 weights: Mapping[str, float] | None = None):
-        super().__init__(device, train)
-        self.weights = dict(weights or {})
-        self._owner: dict[int, str] = {}
-
-    def get(self, kb, space, ids):
-        got = super().get(kb, space, ids)
-        for item_id, (values, _) in zip(ids, got):
-            self._owner[values.data_ptr()] = item_id
-        return got
-
-    def weight(self, values: Tensor) -> float:
-        item_id = self._owner.get(values.data_ptr())
-        if item_id is None:
-            raise KeyError('a read item did not come from this step\'s cache')
-        return self.weights.get(item_id, 1.0)
-
-
-class WeightedOperator(SuperpositionOperator):
-    """S_s whose input gates are multiplied by ``weigh(values)`` (gates only scale mass,
-    so this is the item's exact share of the read mass). Same parameters and state as
-    ``SuperpositionOperator``; ``weigh`` None is the plain operator."""
-
-    weigh: Callable[[Tensor], float] | None = None
-
-    def forward(self, neighbours, target_key, count, neighbour_keys=False):
-        if self.weigh is not None:
-            neighbours = [(v, g * self.weigh(v), k) for v, g, k in neighbours]
-        return super().forward(neighbours, target_key, count, neighbour_keys)
-
-
-def weigh_operators(reader, weigh: Callable[[Tensor], float] | None) -> None:
-    """Make the reader's S_s weighted (once) and set the weight lookup (None: off)."""
-    for op in reader.operators.values():
-        if not isinstance(op, WeightedOperator):
-            op.__class__ = WeightedOperator
-        op.weigh = weigh
 
 
 # -- generation with reads ---------------------------------------------------------------

@@ -41,7 +41,9 @@ Phases (``--phase``, or alternating with ``--phase-schedule a:2000,b:500``):
   from their stored sources (a bank item: the writer's free run of its record under
   the memory prompt, then the codecs; a written item: the writer's free run at its
   write site from the logged prefix and reads), at the stored forward's serialized
-  precision, so at the start of L1b the recomputed items equal the stored payloads
+  precision and batch composition, so at the start of L1b the recomputed items equal
+  the stored payloads (bank spans written with `--span-batch-size 1`; writes replayed
+  with their writer batch)
   (checked every step: ``l1b_match_*``). The gradients of all reads of a step
   accumulate on the recomputed items, then the producers are recomputed with
   gradients and the task loss reaches the writer's span heads (ratio code, rep head)
@@ -310,7 +312,7 @@ class Context:
         self.written = {name: {s: {i for i, (p, _) in origin.items() if p == 'write'}
                                for s, origin in spaces.items()}
                         for name, spaces in self.origin.items()}
-        self._rows: dict[tuple[str, str], dict[str, int]] = {}
+        self._rows: dict[tuple[str, str], tuple[int, dict[str, int]]] = {}
 
     def added(self, dataset: str, space: str, ids: list[str], producer: str,
               sources: list[tuple[str, ...]]) -> None:
@@ -328,11 +330,14 @@ class Context:
                 for s in self.kbs[ep.kb].spaces} if ep.writes else {}
 
     def rows(self, dataset: str, space: str) -> dict[str, int]:
-        """Row index of every item id of a space (for usage statistics)."""
+        """Row index of the current version of every item id of a space (for usage
+        statistics); rebuilt when rows were appended (writes, supersedes)."""
         key = (dataset, space)
-        if key not in self._rows:
-            self._rows[key] = {i: r for r, i in enumerate(self.kbs[dataset]._row_ids[space])}
-        return self._rows[key]
+        names = self.kbs[dataset]._row_ids[space]
+        cached = self._rows.get(key)
+        if cached is None or cached[0] != len(names):
+            cached = self._rows[key] = (len(names), {i: r for r, i in enumerate(names)})
+        return cached[1]
 
     def covered(self, ep: Episode) -> bool:
         index = self.index.get(ep.kb)
@@ -350,7 +355,8 @@ class Context:
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
                 spans: list[torch.Tensor] | None = None, retrieval_only: bool = False,
-                negatives: dict | None = None, producer=None):
+                negatives: dict | None = None, producer=None,
+                weights: dict[str, float] | None = None):
     """Task NLL (summed over target tokens) of one transcript and its reads.
 
     ``mode`` 'retrieve' or 'gold' computes each read at its call from the exact causal
@@ -359,7 +365,8 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
     so only the retrieval loss trains, through the queries and the item keys.
     ``negatives`` (per space, the episode's own KB only): in-batch negatives of the
     retrieval loss. ``producer`` (L1b): read items' values from their sources. Reads
-    never retrieve the episode's own write items (``Context.own_writes``)."""
+    never retrieve the episode's own write items (``Context.own_writes``). ``weights``:
+    per-item gate multipliers (item id -> w; B9's gold weight)."""
     exclude = ctx.own_writes(ep)
     embeds = ctx.frozen.embed(ep.ids)
     reads = []
@@ -388,7 +395,8 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            gold=mode == 'gold', negatives=negatives,
                                            exclude=exclude,
-                                           producer=None if mode == 'gold' else producer)
+                                           producer=None if mode == 'gold' else producer,
+                                           weights=weights)
                 reads.append(read)
                 spans.append(read.span.float().detach() if retrieval_only
                              else read.span.float())
@@ -407,7 +415,8 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
 def ste_round(x: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
     """``x`` at the serialized precision in the forward (what the store or span cache
     holds), the identity in the backward."""
-    return x + (x.to(dtype).to(x.dtype) - x).detach()
+    # rounded + (x - x): exactly the rounded value (x + (rounded - x) is not, in float)
+    return x.detach().to(dtype).to(x.dtype) + (x - x.detach())
 
 
 @dataclasses.dataclass
@@ -647,8 +656,13 @@ class Producers:
     span enters the codecs at its serialized precision (bf16 in the span cache for
     bank items, float32 for writes) and the item at the store's (bf16), each by
     ``ste_round``, so at the start of L1b the recomputed item equals the stored
-    payload (``stats``: ``match_exact``, ``match_rel``). The forward is deterministic
-    (no dropout, no sampling); the backward recomputes it and checks the drift.
+    payload (``stats``: ``match_exact``, ``match_rel``) - given the producer's batch
+    composition, since on the GPU the free run's numerics depend on padding: bank
+    items are replayed ``batch`` at a time (exact at 1 when the bank's spans were
+    written one at a time, ``build --span-batch-size 1``; measured 0.5-3% relative
+    otherwise), writes together with the sources of their writer batch (the logged
+    ``group``). The forward is deterministic (no dropout, no sampling); the backward
+    recomputes each replay unit in the same composition and checks the drift.
 
     Items that L1a modified in place have no source-recompute equivalent: in L1b the
     value read is the producers' recomputation, not the live value (L2 reconciles the
@@ -1253,6 +1267,12 @@ def load_producers(args, ctx: Context, writer: Writer, log: WriteLog, model) -> 
         print(json.dumps({'warning': 'bank writer state differs from --reader-state',
                           'bank': manifest.get('reader_state'),
                           'reader_state': str(args.reader_state)}), flush=True)
+    if manifest.get('span_batch_size') != 1 or args.l1b_batch != 1:
+        # the GPU free run depends on its batch composition (padding): exact replay needs
+        # the bank's spans written one at a time and replayed one at a time
+        print(json.dumps({'warning': 'L1b replay of bank items is not exact (bank span batch '
+                          f'{manifest.get("span_batch_size")}, --l1b-batch {args.l1b_batch}); '
+                          'see l1b_match_* in the logs'}), flush=True)
     root = Path(manifest['span_cache'])
     caches = {}
     for name in ctx.kbs:

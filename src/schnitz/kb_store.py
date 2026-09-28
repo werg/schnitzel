@@ -1037,24 +1037,27 @@ class KnowledgeBase:
     def search(self, space: str, queries: Tensor, k: int, *, metric: str = 'cosine',
                query_time: int | Sequence[int] | Tensor | None = None,
                cursor: int | None = None, chunk_rows: int = 32768,
-               return_items: bool = False, live: bool = False) -> SearchHits:
+               return_items: bool = False, live: bool = False,
+               exclude: Iterable[str] = ()) -> SearchHits:
         """Exact top-k over the current keys of one space of this KB.
 
         ``queries`` is (batch, key_width); ``metric`` is 'cosine' or 'dot'. Keys are
         streamed from the memory-mapped matrix ``chunk_rows`` at a time, so memory is
         bounded by the chunk, not the KB. Superseded items and items whose time is after
         the query's time are never returned. ``live`` scans the live keys (writer only,
-        current cursor; ``pin_live`` for a stable view) instead of the stored keys."""
+        current cursor; ``pin_live`` for a stable view) instead of the stored keys.
+        ``exclude`` names item ids that are never returned (masked in the scan, so the
+        top k are taken over the remaining items; ids of other KBs are ignored)."""
         with self._lock:
             if live:
                 self._check_live(space, cursor)
             return self._search(space, queries, k, metric=metric, query_time=query_time,
                                 cursor=cursor, chunk_rows=chunk_rows,
-                                return_items=return_items, live=live)
+                                return_items=return_items, live=live, exclude=exclude)
 
     def _search(self, space, queries, k, *, metric='cosine', query_time=None, cursor=None,
                 chunk_rows=32768, return_items=False, live=False,
-                generation=None) -> SearchHits:
+                generation=None, exclude: Iterable[str] = ()) -> SearchHits:
         spec = self._check_space(space)
         cursor = self._view(cursor)
         if metric not in ('cosine', 'dot'):
@@ -1069,6 +1072,11 @@ class KnowledgeBase:
         best = torch.full((len(q), 0), float('-inf'))
         best_rows = torch.zeros((len(q), 0), dtype=torch.long)
         rows = self._map(space, 'rows.i64')
+        blocked = None
+        excluded = [r for i in exclude for r in self._rows[space].get(i, ())]
+        if excluded:
+            blocked = np.zeros(len(rows), bool)
+            blocked[excluded] = True
         if live and self._live is not None:
             resident = self._live[space]['keys'].view()
 
@@ -1085,7 +1093,10 @@ class KnowledgeBase:
                         for row in self._pre.get(space, {})}
         for start in range(0, len(rows), chunk_rows):
             block = np.array(rows[start:start + chunk_rows])
-            ok = torch.from_numpy(self._visible(block, cursor))
+            ok = self._visible(block, cursor)
+            if blocked is not None:
+                ok = ok & ~blocked[start:start + len(block)]
+            ok = torch.from_numpy(ok)
             ok = ok[None] & (torch.from_numpy(block[:, TIME])[None] <= times[:, None])
             if not ok.any():
                 continue

@@ -716,3 +716,31 @@ log your decisions and changes of direction"), newest last.
   item-weight hook and the stored item mass in the gates (the reader ignores item mass
   today, which rewrite outputs with mass other than 1 need, invariant 5); B9 meanwhile
   wraps S_s (`WeightedOperator`) and looks items up by their value tensor.
+- 28 Sep (L1 completed: writes, L1b, negatives, K2 chaining). Choices: (1) Writes are
+  generated after all reads of a step and committed at its end, so no read of the same
+  step (or batch) sees them, and an episode never reads its own writes (excluded in the
+  store scan): a revisited episode would otherwise read what it wrote about its own
+  answer. Items get time = the episode's query time and producer `write` (new store
+  producer), source = the write site; a revisited site supersedes its items (bounded KB
+  growth). The write span's length follows B4c's schedule (teacher text length at
+  s0; the text is never rendered); the `<|bg|><|/bg|>` pair stays empty in the task
+  pass of every arm and is not a target (B4c trains writes; arms differ only in reads).
+  (2) L1b replays the free run itself by default (the stored forward), with per-rep
+  checkpointing; the replayed span and item are rounded to bf16 straight-through; the
+  gradients of a step's reads accumulate on the recomputed items before one producer
+  backward per replay unit and the optimizer step. On the GPU the free run depends on
+  its batch composition (padding), so exactness needs banks written one span at a time
+  (`--span-batch-size 1`) and writes replayed with their logged writer batch; with that
+  the first L1b step matched the stored items bit for bit (smoke). Live items are not
+  updated in L1b and L1a-modified items are read as their recomputation (L2 reconciles).
+  L1b trains the writer's rep head and ratio code (the `<|bg|>` row is the protocol's,
+  frozen), codecs, keys, S_s and R; the decoder's write path is not trained. (3)
+  In-batch negatives: the batch's other slots' target items of the same KB only (a KB is
+  an authorization domain; the reader refuses other KBs' negatives). (4) `--init-reader`
+  loads K2's key heads and gate offsets and re-keys. (5) Read gates now carry the stored
+  item mass and an optional per-item weight (B9's gold weight replaces its wrapped S_s);
+  hidden items are masked in the store scan instead of over-fetching. (6) Live reads of a
+  resident KB gather once per call. Open: written items attract routing in space C in the
+  smoke without content; free replay costs about 1.5 s per source (L1b step 50-130 s at
+  batch 4); `schnitz.kb.producer` (L2) and `l1.Producers` replay the same producers
+  separately and could share one path.

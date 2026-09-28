@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, WeightedCache,
-                                   generate, read_items, weigh_operators, write_prefix)
+from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, generate,
+                                   read_items, write_prefix)
 from schnitz.kb.read import ItemCache, L1Reader, ReadConfig
 from schnitz.kb.stages import b9, l1
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
@@ -138,11 +138,9 @@ def test_gold_weight_recedes_and_scales_the_gate_mass_exactly(tmp_path):
     targets = {s: [('ds', gold.items[s])] for s in SPACES}
     masses = {}
     for w in (1.0, 0.25):
-        cache = WeightedCache('cpu', train=False, weights={i: w for i in gold.items.values()})
-        weigh_operators(r, cache.weight)
-        read = r.read(torch.randn(HIDDEN), [kb], ['ds'], 3, cache, targets=targets, gold=True)
+        read = r.read(torch.randn(HIDDEN), [kb], ['ds'], 3, ItemCache('cpu', train=False),
+                      targets=targets, gold=True, weights={i: w for i in gold.items.values()})
         masses[w] = {s: info.mass for s, info in read.spaces.items()}
-    weigh_operators(r, None)
     for s in SPACES:
         assert masses[0.25][s] == pytest.approx(0.25 * masses[1.0][s], rel=1e-6)
     kb.close()

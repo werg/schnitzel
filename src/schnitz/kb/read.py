@@ -97,6 +97,7 @@ class ItemCache:
         self.device, self.train = torch.device(device), train
         self.values: dict[tuple[str, str, str], Tensor] = {}
         self.times: dict[tuple[str, str, str], int] = {}
+        self.masses: dict[tuple[str, str, str], float] = {}     # stored item mass
         self.kbs: dict[str, KnowledgeBase] = {}
 
     def get(self, kb: KnowledgeBase, space: str, ids: Sequence[str]) -> list[tuple[Tensor, int]]:
@@ -113,8 +114,13 @@ class ItemCache:
                     values = values.clone()
                 self.values[ref] = values.requires_grad_(self.train)
                 self.times[ref] = item.time
+                self.masses[ref] = item.mass
         return [(self.values[(kb.dataset, space, i)], self.times[(kb.dataset, space, i)])
                 for i in ids]
+
+    def mass(self, dataset: str, space: str, item_id: str) -> float:
+        """The stored mass of an item fetched this step."""
+        return self.masses[(dataset, space, item_id)]
 
     def touched(self) -> dict[tuple[str, str], list[str]]:
         out: dict[tuple[str, str], list[str]] = {}
@@ -238,7 +244,8 @@ class L1Reader(nn.Module):
              targets: Mapping[str, Sequence[Ref]] | None = None, gold: bool = False,
              negatives: Mapping[str, Sequence[Ref]] | None = None,
              exclude: Mapping[str, Collection[Ref]] | None = None,
-             producer: Producer | None = None) -> Read:
+             producer: Producer | None = None,
+             weights: Mapping[str, float] | None = None) -> Read:
         """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
         they are the read). Every KB must be authorized, and so must every target and
@@ -250,7 +257,10 @@ class L1Reader(nn.Module):
         writes). ``producer`` (L1b): the values of the items read (not of the other
         scored candidates) come from ``producer.values`` - the producers' recomputation
         from the items' stored sources - and so do their gates; selection stays on the
-        scores of the current (live) values."""
+        scores of the current (live) values.
+
+        Each read item's gate is multiplied by its stored mass and by ``weights[id]``
+        (item id -> multiplier, default 1; weight 0 removes an item exactly)."""
         c = self.config
         allowed = set(allowed)
         denied = [kb.dataset for kb in kbs if kb.dataset not in allowed]
@@ -271,11 +281,10 @@ class L1Reader(nn.Module):
                 refs = [r for r in wanted if r not in banned]
             else:
                 live = all(kb.writable and kb.is_live(s) for kb in kbs)
-                hits = search_kbs(kbs, allowed, s, q.detach()[None],
-                                  c.candidates[s] + len(banned), query_time=query_time,
-                                  live=live)
-                refs = [r for r in zip(hits.datasets[0], hits.ids[0])
-                        if r not in banned][:c.candidates[s]]
+                options = {'exclude': {i for _, i in banned}} if banned else {}
+                hits = search_kbs(kbs, allowed, s, q.detach()[None], c.candidates[s],
+                                  query_time=query_time, live=live, **options)
+                refs = [r for r in zip(hits.datasets[0], hits.ids[0]) if r not in banned]
             got = [(ref, values) for ref, (values, time)
                    in zip(refs, _fetch(cache, by_dataset, s, refs))
                    if time <= query_time]            # causal even for gold items
@@ -315,6 +324,12 @@ class L1Reader(nn.Module):
                         keys = torch.stack([self.keys.item_key(s, v.to(q.device))
                                             for _, v in got])
                         gates = self.gates(s, self.keys.scores(s, q[None], keys)[0])
+            # gate x stored mass (invariant 5: a rewrite output carries its inputs' mass)
+            # x the caller's per-item weight (B9's receding gold weight); gates only
+            # scale mass, so this is each item's exact share, and read_count sees it
+            scale = [cache.mass(d, s, i) * (weights or {}).get(i, 1.0) for d, i in refs]
+            if any(x != 1.0 for x in scale):
+                gates = gates * torch.tensor(scale, device=gates.device, dtype=gates.dtype)
             g = gates.detach().float()
             size = torch.tensor([float(v.shape[0]) for _, v in got], device=g.device)
             count = max(1, round(float((g * size).sum() / g.sum().clamp_min(1e-12))))
