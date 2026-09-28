@@ -805,3 +805,10 @@ log your decisions and changes of direction"), newest last.
   (`producer.prefix_for`, bit-identical forward). B9 GPU smoke (k = 2, 3 rounds):
   depth-2 replays, exact, 18-26 s per step. Open: the smoke banks and K1 stacks have
   the old space widths (B9 smoke used random-init codecs at the new ones).
+- 28 Sep (owner). Directly trained KB contents are superposed from the start:
+  L1a keeps trainable parameters at the source level and reads see only items of
+  level >= 2 (recursive S_s over neighbourhoods, lazily computed, shares
+  normalized per source, a top-level item budget and drop-one against the
+  identity); the trained top-level items become targets, and L2 trains several
+  S_s layers mapping the original KB to them. K3 gains a depth-2 warm-up. Depth-0
+  items at the same budget are the control.

@@ -260,6 +260,10 @@ applies to every stage.
    - *K3b:* additionally each neighbour item's key enters at each of its
      positions (continues K3a; the key weights start at zero, so K3b begins as
      K3a).
+   - *Depth (owner, 28 September):* the warm-up also runs S_s recursively, at
+     least two levels (a neighbourhood of level-1 items, each itself S_s over a
+     neighbourhood of records), so the operator works on its own outputs before
+     L1 uses it that way.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
@@ -273,17 +277,33 @@ applies to every stage.
    Tasks: trajectory SFT over the task KBs, QA and reconstruction over the R6
    KBs, continuation of KB-domain text. Two gradient regimes, run as
    alternating phases:
-   - *L1a, items in place:* item values and keys are updated by gradients from
-     reads (live items, sparse optimizer state); key and query heads, S_s and R
-     train; the writer is detached. Fast loop to superposition.
+   - *L1a, superposed KB trained in place (owner, 28 September):* the trainable
+     parameters sit at the source level (one item per record per space, starting
+     from the codecs' output, live items with sparse optimizer state), and reads
+     never see them directly: what a read retrieves are items of level L >= 2
+     (default 2), each S_s over a neighbourhood of level L-1 items, down to the
+     sources. The task loss trains the source items, S_s, keys, query heads and
+     R together, so every source is shaped by all the items it feeds.
+     Mechanics: level items are computed lazily (only those a read retrieves,
+     their level-1 inputs from a cache refreshed on a schedule, gradients through
+     the read level and a sampled part of the level below); fixed neighbourhood
+     graphs per level from keys, rebuilt periodically; against the identity,
+     fewer top-level items than sources (the storage budget) and drop-one at
+     level 1; each source's contributions normalized to its mass (invariants 5
+     and 7), recorded as rewrite shares; an item's time is the latest of its
+     sources' (invariant 2); mixing only within one KB (invariant 6). Control:
+     depth 0 (the items themselves) at the same storage and read budget.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
      trains the writer's span heads, codecs, keys, S_s and R end to end.
      Training-only; inference still reads stored payloads (invariant 1).
-8. **L2 - Producers reproduce the L1a items** (two-step): writer, codecs and
-   recursive S_s trained to produce L1a's in-place-trained items from the
-   sources (the rewrite-then-recover objective with L1a's items as targets).
+8. **L2 - Producers reproduce the L1a items** (two-step): the trained top-level
+   items are the targets; several S_s layers learn to map the original KB (the
+   codecs' items of the sources) to them, with the writer and codecs trainable
+   too (the rewrite-then-recover objective with L1a's items as targets). This
+   S_s stack is also how a new corpus becomes a superposed KB without its own
+   L1 run.
 9. **B9 - Learning by experience** (restart plan B9): the model works on a task
    over its KB for several rounds; at the end of each round it writes what it
    learned with `memory_write()` (single pass, its attempt in context), the
