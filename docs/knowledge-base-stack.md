@@ -1,8 +1,8 @@
 # The knowledge-base stack: superposed spaces and MLP-matrix operators
 
-**Status: design, 28 September 2026 (owner direction). The writer (restart plan
-B2/B3) exists; everything else here is not yet implemented.** Section 9 tracks
-what is built. This document replaces restart plan B7 ("combiners") and the
+**Status: design, 28 September 2026 (owner direction).** The writer (restart
+plan B2/B3), the MLP-matrix operator and the K1 training script exist; section 9
+tracks what is built and running. This document replaces restart plan B7 ("combiners") and the
 restart plan's reading of "spaces" as BGKit compression ratios.
 
 ## 1. Goal
@@ -206,8 +206,8 @@ are the levers; the dense per-pair form is kept on purpose.
 | Part | State |
 |---|---|
 | Writer (B2/B3) | training (restart plan B3) |
-| MLP-matrix operator | not built |
-| K1 codecs and recombiner | not built |
+| MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 7 property tests) |
+| K1 codecs and recombiner | training from 28 Sep (`scripts/train_kb_codecs.py`, run `kb-k1`: B1 teacher spans, B3 reader at step 11500, 28M parameters) |
 | K2 keys | not built (R5d5 key table exists) |
 | K3 compactor | not built |
 | K4-K6 | not built |
