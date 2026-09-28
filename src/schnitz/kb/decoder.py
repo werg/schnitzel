@@ -17,12 +17,20 @@ import random
 import torch
 import torch.nn.functional as F
 
-from schnitz.bgkit_span import (MEMORY_PROMPT, MERGE_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
-                                attach_write_adapter, checkpoint_layers, span_mask)
+from schnitz.bgkit_span import (MEMORY_PROMPT, MERGE_PROMPT, SUMMARIZE_PROMPTS, PortHeads,
+                                SpanWriter, attach_write_adapter, checkpoint_layers, span_mask)
 from schnitz.span_protocol import ProtocolTokens, untie
 
 LEVELS = ('s0', 's1', 's2', 's3')
 ADAPTER_TARGETS = ('q_proj', 'k_proj', 'v_proj', 'out_proj', 'in_proj', 'w1', 'w2', 'w3')
+
+
+def length_factors(tokens: int, spaces: int = 4) -> list[float]:
+    """Compression factor per space for a source of ``tokens`` tokens: the B1 cache's
+    length schedule (``scripts/cache_bgkit_teacher.py``), c_0 = clamp(sqrt(N)/2, 4, 32),
+    c_s = min(128, c_0 * 2^s)."""
+    base = min(32.0, max(4.0, math.sqrt(max(tokens, 1)) / 2))
+    return [min(128.0, base * 2 ** space) for space in range(spaces)]
 
 
 def _heldout(record_id: str) -> bool:
@@ -109,6 +117,7 @@ class Model:
         self.reference = copy.deepcopy(self.decoder) if opening else None
         self.gate, self.adapter, self.gate_value, self.merged = None, None, 0.0, False
         self.protocol, self.protocol_losses, self.record_protocol = None, [], False
+        self.port = None  # B4b soft output port heads (``install_port``)
         self.tail = torch.tensor(self.tok('<|im_end|>', add_special_tokens=False)['input_ids'])
         if args.adapter_rank:
             self.gate, self.adapter = attach_write_adapter(
@@ -169,6 +178,25 @@ class Model:
         self.writer.marker_embedding = protocol.marker
         self.protocol = protocol
 
+    def install_port(self) -> None:
+        """B4b: the soft output port's own rep and stop heads (``PortHeads``). The
+        marker is the protocol's ``<|port|>`` input embedding plus the writer's ratio
+        code at x1; the heads start as copies of the writer's (rep head, and the
+        ``<|rep|>``/``<|/bg|>`` rows with their bias as the stop head), so the first
+        port reps are already writer-like, then train on their own."""
+        if self.protocol is None:
+            raise ValueError('the soft output port needs the span protocol (--protocol)')
+        protocol = self.protocol
+        port = PortHeads(self.writer.marker.shape[0], self.target_norm,
+                         lambda factor: protocol.embedding('port')
+                         + protocol.ratio(torch.ones_like(factor)))
+        port.rep.load_state_dict(self.writer.rep.state_dict())
+        with torch.no_grad():
+            port.stop.weight.copy_(protocol.outputs[[protocol.index('rep'),
+                                                     protocol.index('bg_end')]].float())
+            port.stop.bias.copy_(protocol.span_bias.float())
+        self.port = port.to(self.device)
+
     def port_reps(self, ids: list[torch.Tensor]) -> list[torch.Tensor]:
         """Soft input port: the frozen S2 encoder's x1 reps of each text."""
         from bgkit2.data.autoencode import Sample
@@ -186,6 +214,9 @@ class Model:
         if self.merged:
             groups.append({'params': list(self.decoder.base_lm.parameters()),
                            'lr': args.decoder_lr})
+        if self.port is not None:  # last, so a state saved before the port still loads
+            groups.append({'params': list(self.port.parameters()),
+                           'lr': getattr(args, 'port_lr', args.lr)})
         return groups
 
     def trained_state(self) -> dict:
@@ -197,6 +228,8 @@ class Model:
             state['decoder'] = self.decoder.base_lm.state_dict()
         if self.protocol is not None:
             state['protocol'] = self.protocol.state_dict()
+        if self.port is not None:
+            state['port'] = self.port.state_dict()
         return state
 
     def load_trained(self, state: dict) -> None:
@@ -212,6 +245,10 @@ class Model:
             self.adapter.load_state_dict(state['adapter'])
         if 'protocol' in state:
             self.protocol.load_state_dict(state['protocol'])
+        if 'port' in state:  # absent in states saved before B4b
+            if self.port is None:
+                self.install_port()
+            self.port.load_state_dict(state['port'])
 
     def hidden(self, dec, inputs_embeds, attention_mask, spans=None) -> torch.Tensor:
         """Final hidden states; the write adapter weighs span positions 1 and all
@@ -251,7 +288,7 @@ class Model:
         weight outside spans, so it is exact for no-gradient passes; a gradient pass
         uses it only while nothing trainable acts on the prefix (``_rollout``)."""
         inner = self.decoder.base_lm.model
-        if any('source_embeds' in ex for ex in examples):
+        if any(key in ex for ex in examples for key in ('source_embeds', 'inputs', 'prefix_ids')):
             seqs = [self.write_inputs(ex) for ex in examples]
             lengths = torch.tensor([x.shape[0] for x in seqs], device=self.device)
             embeds = torch.zeros(len(seqs), int(lengths.max()), seqs[0].shape[1],
@@ -349,13 +386,17 @@ class Model:
             x = inner.embedding_norm(x)
         return [x[i, :n] for i, n in enumerate(size)]
 
-    def write(self, examples, feed: list[torch.Tensor], prefix: dict | None = None):
+    def write(self, examples, feed: list[torch.Tensor], prefix: dict | None = None, heads=None):
         """Writer forward with ``feed`` reps as span inputs (teacher- or self-fed).
 
         Returns per example the span-position hidden states (marker, feed_1..). With a
-        ``prefix`` (``Model.prefix``) only the span positions are computed."""
+        ``prefix`` (``Model.prefix``) only the span positions are computed. ``heads`` is
+        the head set whose marker opens the span (default the memory writer; the soft
+        output port's ``PortHeads`` open ``<|port|>`` and close ``<|/port|>``)."""
+        heads = self.writer if heads is None else heads
+        opening, closing = getattr(heads, 'tokens', ('bg', 'bg_end'))
         if prefix is not None:
-            spans = [torch.cat([self.writer.marker_embedding(
+            spans = [torch.cat([heads.marker_embedding(
                 torch.tensor(ex['factor'], device=self.device)).unsqueeze(0),
                 fed.to(self.device).float()]) for ex, fed in zip(examples, feed)]
             return self.span_hidden(prefix, spans)
@@ -364,11 +405,11 @@ class Model:
         protocol = self.protocol is not None and (torch.is_grad_enabled() or self.record_protocol)
         for ex, fed in zip(examples, feed):
             source = self.write_inputs(ex)
-            marker = self.writer.marker_embedding(
+            marker = heads.marker_embedding(
                 torch.tensor(ex['factor'], device=self.device)).unsqueeze(0)
             parts = [source, marker, fed.to(self.device).float()]
             if protocol:  # close the span and end the turn (B4): <|/bg|> then <|im_end|>
-                parts += [self.protocol.embedding('bg_end')[None].float(),
+                parts += [self.protocol.embedding(closing)[None].float(),
                           embed(ex.get('tail', self.tail).to(self.device)).float()]
             seqs.append(torch.cat(parts))
             starts.append(source.shape[0])
@@ -382,19 +423,21 @@ class Model:
         spans = span_mask(starts, [1 + fed.shape[0] for fed in feed], width, self.device)
         hidden = self.hidden(self.decoder, inputs, mask, spans)
         if protocol:
-            self.protocol_losses.append(self._protocol_losses(hidden, examples, feed, starts))
+            self.protocol_losses.append(self._protocol_losses(hidden, examples, feed, starts,
+                                                              opening))
         return [hidden[i, starts[i]:starts[i] + 1 + feed[i].shape[0]] for i in range(len(seqs))]
 
-    def _protocol_losses(self, hidden, examples, feed, starts) -> dict[str, torch.Tensor]:
-        """Opening ``<|bg|>`` from the last prompt position, the turn end after
-        ``<|/bg|>``, and (for prompts that state it) the ratio head."""
+    def _protocol_losses(self, hidden, examples, feed, starts,
+                         opening: str = 'bg') -> dict[str, torch.Tensor]:
+        """Opening ``<|bg|>`` (or ``opening``) from the last prompt position, the turn
+        end after the closing token, and (for prompts that state it) the ratio head."""
         head = self.decoder.base_lm.lm_head
         states, targets, ratio_pred, ratio_true = [], [], [], []
         for i, (ex, fed) in enumerate(zip(examples, feed)):
             tail = ex.get('tail', self.tail)
             close = starts[i] + 1 + fed.shape[0]          # the <|/bg|> position
             states.append(hidden[i, [starts[i] - 1] + list(range(close, close + tail.shape[0]))])
-            targets.append(torch.cat([torch.tensor([self.protocol.token('bg')]), tail]))
+            targets.append(torch.cat([torch.tensor([self.protocol.token(opening)]), tail]))
             if ex.get('ratio_stated'):
                 ratio_pred.append(self.protocol.ratio_head(hidden[i, starts[i] - 1].float()))
                 ratio_true.append(torch.tensor([math.log2(ex['factor']) / 8], device=self.device))
@@ -425,31 +468,38 @@ class Model:
     def write_inputs(self, ex: dict) -> torch.Tensor:
         """The writer's prompt and source as input embeddings. The source is text
         (``ids``) or, for a merge, stored spans in the decoder's input space
-        (``source_embeds``, records separated by a blank line)."""
-        pre, post = self.prompts[ex['prompt']]
+        (``source_embeds``, records separated by a blank line). A write in context
+        brings its whole causal prefix instead: rendered token ids (``prefix_ids``,
+        B4c write sites) or embeddings (``inputs``, the B4b answer position)."""
         embed = self.decoder.embed_tokens
+        if 'inputs' in ex:
+            return ex['inputs'].to(self.device).float()
+        if 'prefix_ids' in ex:
+            return embed(ex['prefix_ids'].to(self.device)).float()
+        pre, post = self.prompts[ex['prompt']]
         if 'source_embeds' not in ex:
             return embed(torch.cat([pre, ex['ids'], post]).to(self.device)).float()
         return torch.cat([embed(pre.to(self.device)).float(),
                           ex['source_embeds'].to(self.device).float(),
                           embed(post.to(self.device)).float()])
 
-    def free_run(self, examples, lengths: list[int]):
+    def free_run(self, examples, lengths: list[int], heads=None):
         """Self-fed generation of ``lengths[i]`` reps; also the first predicted stop."""
+        heads = self.writer if heads is None else heads
         reps = [torch.zeros(0, self.decoder.embed_tokens.weight.shape[1], device=self.device)
                 for _ in examples]
         stops = [None] * len(examples)
         prefix = self.prefix(examples)
         for step in range(max(lengths)):
-            hidden = self.write(examples, reps, prefix)
+            hidden = self.write(examples, reps, prefix, heads)
             for i, h in enumerate(hidden):
                 last = h[-1:]
-                if stops[i] is None and self.writer.stop(last.float()).argmax(-1).item() == 1:
+                if stops[i] is None and heads.stop(last.float()).argmax(-1).item() == 1:
                     stops[i] = step
                 if step < lengths[i]:
-                    reps[i] = torch.cat([reps[i], self.writer.rep(last)])
-        for i, h in enumerate(self.write(examples, reps, prefix)):
-            if stops[i] is None and self.writer.stop(h[-1:].float()).argmax(-1).item() == 1:
+                    reps[i] = torch.cat([reps[i], heads.rep(last)])
+        for i, h in enumerate(self.write(examples, reps, prefix, heads)):
+            if stops[i] is None and heads.stop(h[-1:].float()).argmax(-1).item() == 1:
                 stops[i] = reps[i].shape[0]
         return reps, stops
 
@@ -513,6 +563,21 @@ class Model:
                           p.embedding('port_end')[None]]
             blocks.append(torch.cat(parts) if parts else torch.zeros(0, width, device=self.device))
         return blocks if reps is not None or any('port' in ex for ex in examples) else None
+
+    def answer_inputs(self, view: dict, span: torch.Tensor | None) -> torch.Tensor:
+        """Input embeddings of ``read``'s layout up to the answer (template prefix, the
+        delimited memory span and input port, the instruction ending in the assistant
+        turn): where the B4b soft output port opens instead of the text answer."""
+        if self.protocol is None:
+            raise ValueError('the answer layout with delimiters needs the span protocol')
+        embed = self.decoder.embed_tokens
+        block = self._delimit([view], None if span is None else [span], wrap=True)
+        parts = [embed(self.tpl.prefix.to(self.device)).float()]
+        if block is not None:
+            parts.append(block[0])
+        instr = view['instr'] if 'instr' in view else self.instr[view['task']]
+        parts.append(embed(instr.to(self.device)).float())
+        return torch.cat(parts)
 
     def text_logits(self, examples, decoder=None, index: torch.Tensor | None = None):
         """Plain-text next-token logits over each example's source (no span, no chat)."""
