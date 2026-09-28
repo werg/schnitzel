@@ -71,13 +71,15 @@ def slots_of(row: dict) -> list[dict]:
 
 
 def needed_records(rows: Iterable[dict]) -> dict[str, dict[str, str]]:
-    """kb -> record id -> transcript dir (whose manifest names the corpus)."""
+    """kb -> record id -> transcript dir (whose manifest names the corpus): the records
+    a slot reads and its ``alternatives`` (redundant copies of the same fact, all banked
+    so a read can find any of them)."""
     out: dict[str, dict[str, str]] = {}
     for row in rows:
         for slot in slots_of(row):
             if slot['kb'] != row['kb']:
                 raise PermissionError(f'{row["episode_id"]}: slot of another KB')
-            for r in slot['record_ids']:
+            for r in [*slot['record_ids'], *(slot.get('alternatives') or [])]:
                 out.setdefault(row['kb'], {})[r] = row['_dir']
     return out
 

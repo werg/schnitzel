@@ -15,6 +15,11 @@ structured form ``tok.apply_chat_template(messages, tools=tools)`` renders:
   latent span + ``<|/mem|>`` (``schnitz.span_tokens``). The target record ids of every
   call are in its slot and in the row's ``search_sites`` entry (with the placement
   ``step`` and ``trigger``);
+- redundant copies: an episode with ``alternatives`` (per hop, every record that alone
+  states that hop's fact; the synthetic worlds of ``schnitz.synth_world``) names them in
+  the slot of the hop's read (``alternatives``, audited like the slot's records), so the
+  L1 bank build (``schnitz.kb.bank.needed_records``) stores every copy; the slot's
+  ``record_ids`` stay the one copy the transcript reads;
 - the answer: an ``assistant`` message (text, or native tool calls for function
   calling); multi-turn corpora keep their ``turns`` (customers and observations as
   ``user``, API results as ``tool``, agent API calls as native tool calls);
@@ -836,6 +841,17 @@ class Builder:
                 for lk in lookups:
                     lk.trigger = '+'.join(sorted({triggers[r['record_id']] for r in lk.records}))
         stages += by_step.pop(0, [])
+        # redundant copies (``alternatives``, per hop: every record that alone states that
+        # hop's fact): a slot names its hop's copies too, so the bank build stores them all
+        hops = [[r for r in hop if r in supports and self._valid(supports[r], qt, Counter())
+                 and self.kb_of(r) == kb] for hop in episode.get('alternatives') or []]
+        for lookups in [*stages, *(ls for v in by_step.values() for ls in v)]:
+            for lk in lookups:
+                ids = {r['record_id'] for r in lk.records}
+                alts = [r for hop in hops if ids & set(hop) for r in hop]
+                if alts:
+                    lk.flags['alternatives'] = list(dict.fromkeys(alts))
+                    counts['alternative_records'] += len(lk.flags['alternatives'])
         if self.opt.gold_slots and split == 'train' and len(tokens(answer)) >= OWN_GOLD_TOKENS:
             gold = gold_record(kb, episode)
             self.gold_ids.add(gold['record_id'])
@@ -984,7 +1000,10 @@ class Builder:
                     if not all(r in self.gold_ids for r in ids) or 'receding_weight' not in body:
                         bad['gold_unflagged'] += 1
                 else:
-                    for r in ids:
+                    alternatives = body.get('alternatives') or []
+                    if alternatives and not set(ids) <= set(alternatives):
+                        bad['slot_not_in_alternatives'] += 1
+                    for r in dict.fromkeys([*ids, *alternatives]):
                         if r not in self.index:
                             bad['record_not_in_kb'] += 1
                         elif self.index[r][0] >= query_time:

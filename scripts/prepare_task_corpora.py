@@ -526,6 +526,25 @@ def knights(output: Path, examples: int, seed: int) -> dict:
     return writer.close({'domain': domain, 'worked_examples': len(worked)})
 
 
+# -- synthetic people world ---------------------------------------------------------
+def synth_people(output: Path, *, seed: int, people: int, redundancy: int, hops: int,
+                 validation: float, two_hop_rate: float, max_groups: int) -> dict:
+    """A fictional world (``schnitz.synth_world``) whose every asked fact is stated in
+    ``redundancy`` records (bios, rosters, registers, alumni lists); short-answer questions
+    split by person. Each question lists every copy: supports, one sufficient group per
+    copy (2-hop: sampled combinations) and ``alternatives`` per hop."""
+    from schnitz import synth_world
+    _, recs, episodes, summary = synth_world.build(
+        seed, people, redundancy, hops=hops, validation=validation,
+        two_hop_rate=two_hop_rate, max_groups=max_groups)
+    writer = Writer(output, synth_world.DOMAIN)
+    for split, rows in episodes.items():
+        for item in rows:
+            writer.add(split, item, recs if not writer.sources else [])
+    return writer.close({'domain': synth_world.DOMAIN, 'generator': 'schnitz.synth_world',
+                         **summary, 'max_groups': max_groups, 'two_hop_rate': two_hop_rate})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='dataset', required=True)
@@ -558,6 +577,16 @@ def main() -> None:
     k = sub.add_parser('knights')
     k.add_argument('--examples', type=int, default=20)
     k.add_argument('--seed', type=int, default=0)
+    sp = sub.add_parser('synth-people', help='fictional people world, redundancy-controlled')
+    sp.add_argument('--seed', type=int, default=0)
+    sp.add_argument('--people', type=int, default=20000)
+    sp.add_argument('--redundancy', type=int, default=8, help='records stating each fact')
+    sp.add_argument('--hops', type=int, choices=(1, 2), default=1)
+    sp.add_argument('--two-hop-rate', type=float, default=0.3,
+                    help='with --hops 2: share of people with one 2-hop question')
+    sp.add_argument('--validation', type=float, default=0.1, help='share of people')
+    sp.add_argument('--max-groups', type=int, default=32,
+                    help='2-hop: sampled sufficient groups (one record per hop)')
     for s in sub.choices.values():
         s.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -577,6 +606,11 @@ def main() -> None:
         manifest = synlogic(args.output, args.pool, args.min_ascii)
     elif args.dataset == 'knights':
         manifest = knights(args.output, args.examples, args.seed)
+    elif args.dataset == 'synth-people':
+        manifest = synth_people(args.output, seed=args.seed, people=args.people,
+                                redundancy=args.redundancy, hops=args.hops,
+                                validation=args.validation, two_hop_rate=args.two_hop_rate,
+                                max_groups=args.max_groups)
     else:
         manifest = sql_corpus(args.output, args.dataset, full_rows=args.full_rows,
                               sample_rows=args.sample_rows, value_limit=args.value_limit)
