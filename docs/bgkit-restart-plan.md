@@ -472,3 +472,9 @@ log your decisions and changes of direction"), newest last.
   superposition operator S_s: rewriting increases superposition; compaction is
   its special case with fewer outputs. Added: storage budget, superposition
   metrics, KB-dependence tests, frequent reads (knowledge-base stack 5.2).
+- **28 Sep, SFT before distillation (owner).** While basic function is being
+  trained, the stack trains by SFT on existing trajectories and corpora (one pass
+  of our own model per token); teacher distillation is a later capability phase.
+  The teacher cache script is smoke-tested and kept for then. Note: LFM2.5-1.2B-Base
+  lacks `<think>`/`</think>` (ids 64400-64401 in our decoder); the script compares
+  every output id and keeps such ids out of the stored top-k.

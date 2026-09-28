@@ -43,12 +43,17 @@ decoder alone, the same retrieval as plain text, and a shuffled KB as controls.
 | LFM2.5-8B-A1B | 8.5B / about 1B | different (128k vocabulary) | benchmark |
 | Ling-3.0-tiny | 7.9B, 128 experts / 8 active | different (157k vocabulary) | benchmark (stronger on code) |
 
-Next-token distributions can be distilled only from models with our tokenizer.
-Teachers' distributions are cached offline (top-k log-probabilities plus the
-remaining mass per token) on corpus text; the KB stack is trained so that the
-decoder plus the KB matches them. The gap between the small and the large model
-is what the KB has to supply, and every token carries signal, so this objective
-is dense and spread out, with no "gold record".
+Training signal (owner, 28 September): while basic function and capability are
+being built, the stack trains by SFT on existing trajectories and corpora (the B9
+task corpora, KB-domain text): one forward and backward pass of our own model per
+token, no teacher cost. Teacher distillation comes later, once the system works,
+to hammer in capability for real tasks: next-token distributions can be distilled
+only from models with our tokenizer, cached offline (top-k log-probabilities plus
+the remaining mass per token, `scripts/cache_teacher_distributions.py`, smoke-
+tested with LFM2.5-1.2B-Base); the KB stack is then trained so that the decoder
+plus the KB matches them. That objective is dense and spread out, with no "gold
+record"; the gap between the small and the large model is what the KB has to
+supply.
 
 ## 2. What drifted, and what is kept
 
@@ -201,10 +206,11 @@ The decoder that reads is the B3 decoder, frozen, unless stated.
   (the routing half of a mixture of experts). The distilled R5d5 keys are only
   the starting point.
 - **K5 - End-to-end tasks, decoder frozen.** Only the KB stack trains (codecs,
-  S_s, recombiner, key and query heads). Main task: distillation of the teachers'
-  next-token distributions (section 1.1) on corpus text, from LFM2.5-1.2B first,
-  then LFM2-24B-A2B. Also held-out continuation of KB-domain text; QA and the B9
-  task corpora as secondary checks.
+  S_s, recombiner, key and query heads). Tasks: SFT on the existing trajectories
+  (B9 task corpora) with their documentation, schemas and background in the KB,
+  and held-out continuation of KB-domain text; QA as a check. Teacher
+  distillation (section 1.1) is a later capability phase, from LFM2.5-1.2B first,
+  then LFM2-24B-A2B.
 - **K6 - Rewriting levels.** Periodic recursive rewriting passes with S_s on
   stored neighbourhoods, written back; the store is evaluated before and after.
 
@@ -213,8 +219,8 @@ The decoder that reads is the B3 decoder, frozen, unless stated.
 Stored items can be trained directly: gradients from reads update the retrieved
 items in place (sparse updates, optimizer state per item), as in an embedding
 table. This gives a quick loop to real superposition, since items absorb what
-the task needs from many sources, and with teacher distillation (K5) they absorb
-the larger model's knowledge directly. On their own, trained items would be
+the task needs from many sources (and, in the later distillation phase, a larger
+model's knowledge directly). On their own, trained items would be
 static artifacts that a new corpus cannot produce, which defeats continual
 learning and modularity. So training is split:
 
@@ -285,4 +291,4 @@ are the levers; the dense per-pair form is kept on purpose.
 | K2 keys | not built (R5d5 key table exists) |
 | K3 superposition operator | not built |
 | K4-K6, L1-L2 | not built |
-| Teacher distributions | not cached (LFM2.5-1.2B first, then LFM2-24B-A2B) |
+| Teacher distributions | later phase; cache script smoke-tested (LFM2.5-1.2B-Base, 300 records: mass sums to 1, true token in the top 32 for 84% of positions); models in `/home/werg/sdkb-runs/hf-models` |
