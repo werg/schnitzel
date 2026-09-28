@@ -635,3 +635,12 @@ log your decisions and changes of direction"), newest last.
   Targeted corpora and tasks with trajectories of more capable models; no
   corpus-exact reproduction of a reference model (owner). One code base:
   `scripts/train.py <stage>` over `schnitz.kb`.
+- 28 Sep (K1 diagnosis, two fixes). (1) Input scale: decoder-space spans have a
+  per-dimension RMS near 0.025 against Fourier position features near 1, so the
+  operator learned a position-only code; every input kind is now layer-normalized.
+  (2) A shared direction: the corpus-mean span alone has cosine 0.82 to a typical
+  S2 span, and K1 after the first fix still trained to a cosine loss of 0.37, worse
+  than outputting the mean (0.18), while the stack overfits 8 spans to 0.001. The
+  stack now standardizes spans per dimension with corpus statistics and the cosine
+  is measured in that space (weight 1). K1 restarted a third time; earlier runs
+  kept as `kb-k1-uniform`, `kb-k1-kernel-unnormed`, `kb-k1-inputnorm`.
