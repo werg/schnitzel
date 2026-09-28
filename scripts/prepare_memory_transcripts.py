@@ -104,6 +104,8 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS  # noqa: E402
+# the renderer is shared with the trainers (B4c write sites, L1)
+from schnitz.memory_transcripts import WRITE_CALL, WRITE_FILL, render_ids, render_text  # noqa: E402
 
 FORMAT = 3
 NGRAM = 5
@@ -387,50 +389,6 @@ def is_memory(message: dict) -> bool:
     calls = message.get('tool_calls') or []
     return bool(calls) and all(tc['function']['name'] in ('memory_search', 'memory_write')
                                for tc in calls)
-
-
-WRITE_CALL = '[memory_write()]<|tool_call_end|>'
-WRITE_FILL = SPAN_TOKENS['bg'][0] + SPAN_TOKENS['bg_end'][0]
-
-
-def _shown(messages: list[dict], fill: str) -> list[dict]:
-    return [{**m, 'content': fill} if isinstance(m.get('content'), dict) and 'slot' in m['content']
-            else m for m in messages]
-
-
-def render_text(messages: list[dict], tools: list[dict], tok,
-                slot_text: str | None = None) -> str:
-    """Render through the tokenizer's chat template with every search slot replaced by
-    an empty ``<|mem|><|/mem|>`` pair and an empty ``<|bg|><|/bg|>`` write span right
-    after every ``memory_write()`` call, in the same assistant turn (the trainer puts
-    the latent spans between them)."""
-    fill = slot_text or SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
-    text = tok.apply_chat_template(_shown(messages, fill), tools=tools, tokenize=False)
-    return text.replace(WRITE_CALL + '<|im_end|>', WRITE_CALL + WRITE_FILL + '<|im_end|>')
-
-
-def render_ids(tok, messages: list[dict], tools: list[dict]) -> tuple[list[int], list[int]]:
-    """Token ids and assistant (loss) mask of ``render_text``: the template's own mask,
-    with the ``<|bg|>``/``<|/bg|>`` pair of each write span inserted after the call's
-    ``<|tool_call_end|>`` inside the assistant turn (both in the loss)."""
-    fill = SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
-    out = tok.apply_chat_template(_shown(messages, fill), tools=tools, tokenize=True,
-                                  return_dict=True, return_assistant_tokens_mask=True)
-    ids, mask = list(out['input_ids']), list(out['assistant_masks'])
-    call_start = tok.convert_tokens_to_ids('<|tool_call_start|>')
-    call_end = tok.convert_tokens_to_ids('<|tool_call_end|>')
-    new_ids, new_mask, opened = [], [], None
-    for i, (t, m) in enumerate(zip(ids, mask)):
-        new_ids.append(t)
-        new_mask.append(m)
-        if t == call_start:
-            opened = i
-        elif t == call_end and opened is not None:
-            if tok.decode(ids[opened + 1:i]) == '[memory_write()]':
-                new_ids += [SPAN_TOKENS['bg'][1], SPAN_TOKENS['bg_end'][1]]
-                new_mask += [m, m]
-            opened = None
-    return new_ids, new_mask
 
 
 def render_check(tok, row: dict) -> Counter:
