@@ -1019,4 +1019,13 @@ log your decisions and changes of direction"), newest last.
   (median 17). The wording is hard to guess without the KB and nearly fixed by it
   (nearest stored version: median word-sequence similarity 0.97 for WEB, whose
   derivative NHEB is stored, 0.60 for BBE, which has no close relative). Split by chapter.
-  4000/300 episodes, one `memory_search()` per covering translation.
+  4000/300 episodes.
+- 28 September: parallel-recall reads are shared, not per version. The first build
+  made 17.7 searches per episode, one per translation, and each search had a single
+  translation as its retrieval target, which defeats the redundancy. The default is
+  now one search per verse chunk (1.31 per episode): it reads one seeded
+  translation's record and lists every other translation's covering records as slot
+  `alternatives`, which L1 treats as positives (`--parallel-reads per-version` keeps
+  the old form, archived as `...v3-perversion`). A harder WEB condition
+  (`tasks-parallel-recall-hard-20260928`) drops the NHEB editions: nearest-version
+  similarity for WEB has a median of 0.87 instead of 0.97.

@@ -211,29 +211,49 @@ has high entropy for the model alone but is nearly determined by the KB.
   `nearest_version` / `nearest_similarity` (word-sequence ratio) and `target_tokens`.
 - **Split** by chapter: about 10% of chapters (hashed) are validation. Validation
   passages are never trained on, although their other versions are in the KB.
-- **Transcripts.** The builder searches once per covering translation (`kind`
-  `parallel_passage`, space hint `fine`), all before the answer. With the v3
-  defaults, 30% of the multi-call sites are split into sequential calls. There are no
-  write sites, and the role line is "Other translations of the requested text are in
-  the knowledge base."
+- **Transcripts** (`--parallel-reads`). The default is `shared`: one
+  `memory_search()` per covering record of a single translation. The translation is
+  a seeded choice that varies across episodes, so a search covers one verse chunk and
+  there are usually 1-2 searches. Each slot's `record_ids` holds that one record. Its
+  `alternatives` hold that record plus every other stored translation's records
+  covering the same target verses. They are the same redundant-copy field as in the
+  synthetic worlds: L1 treats them as retrieval positives, never negatives, and the
+  bank build stores all of them. The other mode, `per-version`, searches once per
+  covering translation, with no alternatives. With `kind` `parallel_passage` and
+  space hint `fine`, all searches come before the answer. There are no write sites,
+  and the role line is "Other translations of the requested text are in the knowledge
+  base."
 
-Built 28 September (`tasks-parallel-recall-20260928`, `memory-parallel-recall-20260928v3`,
-same transcript options as the other v3 corpora, LFM2.5-350M render check on 200 per
-split):
+Built 28 September with the same transcript options as the other v3 corpora and an
+LFM2.5-350M render check on 200 per split:
 
-- The KB has 23 English versions and 90,651 records.
-- There are 4000 train episodes (712 chapters) and 300 validation episodes (54 of the
-  119 validation chapters), half WEB and half BBE. 47% are continuation queries.
-- Redundancy is 11-22 (median 17). Old-Testament passages are covered by about 16-18
-  versions and New-Testament passages by 20-22.
-- Target length: quartiles of 92/111/131 tokens.
-- How close the nearest stored version comes differs by target. For WEB the median
-  similarity is 0.97, because its derivative NHEB is stored. For BBE it is 0.60,
-  because no stored version is close to it. Use `--versions` without `NHEB-JE
-  NHEB-ME` for a harder WEB condition. 19% of target verses appear verbatim in some
-  stored version.
-- Transcripts average 17.7 `memory_search()` calls per episode, with about 23 slot
-  records.
+- **`tasks-parallel-recall-20260928`.**
+  - The KB has 23 English versions and 90,651 records.
+  - There are 4000 train episodes (712 chapters) and 300 validation episodes (54 of
+    the 119 validation chapters), half WEB and half BBE. 47% are continuation queries.
+  - Redundancy is 11-22 (median 17). Old-Testament passages are covered by about
+    16-18 versions and New-Testament passages by 20-22.
+  - Target length: quartiles of 92/111/131 tokens.
+  - How close the nearest stored version comes differs by target. For WEB the median
+    similarity is 0.97, because its derivative NHEB is stored. For BBE it is 0.60,
+    because no stored version is close to it. 19% of target verses appear verbatim in
+    some stored version.
+- **`tasks-parallel-recall-hard-20260928`** (the harder WEB condition). This is the
+  same build without NHEB-JE and NHEB-ME.
+  - The KB has 21 versions and 80,425 records.
+  - Redundancy is 11-20 (median 15).
+  - Nearest-version similarity has a median of 0.87 for WEB (nearest is usually ACV or
+    ASV) and 0.58 for BBE.
+  - 4% of target verses appear verbatim in some stored version.
+  - There are 4000 train episodes (706 chapters) and 300 validation episodes
+    (53 chapters).
+- **`memory-parallel-recall[-hard]-20260928v3`** (`shared` reads):
+  - 1.31 searches per episode (69% of episodes 1, 31% 2, a few 3) and 1.09 search
+    sites per episode.
+  - 21.0 alternatives per search (hard: 18.6), which is 27.6 per episode (hard: 24.5).
+  - The read translation varies over all 23 stored versions (hard: 21).
+  - The earlier per-version build (17.7 searches and 23 slot records per episode) is
+    kept as `memory-parallel-recall-20260928v3-perversion`.
 
 ## Stored-only measurement
 
