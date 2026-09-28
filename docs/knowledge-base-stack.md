@@ -28,6 +28,28 @@ therefore used as a scaffold: its compressed spans are a representation the
 decoder already reads well. The stack below starts from that localized
 representation and diffuses it into superposed spaces.
 
+### 1.1 Benchmark and teachers (owner, 28 September)
+
+The measure of success is the small decoder plus the KB against larger models,
+on held-out text and tasks from domains whose corpus is in the KB, with the
+decoder alone, the same retrieval as plain text, and a shuffled KB as controls.
+
+| Model | Params (total / active) | Tokenizer | Role |
+|---|---|---|---|
+| LFM2.5-350M (our decoder) | 0.35B | ours | |
+| LFM2.5-1.2B | 1.2B dense | identical | first distillation teacher (cheap) |
+| LFM2-8B-A1B | 8.3B / about 1B | identical except 2 special tokens | distillation teacher |
+| LFM2-24B-A2B | 23.8B / about 2B | identical (all 64,400 + 509 added tokens) | main distillation teacher |
+| LFM2.5-8B-A1B | 8.5B / about 1B | different (128k vocabulary) | benchmark |
+| Ling-3.0-tiny | 7.9B, 128 experts / 8 active | different (157k vocabulary) | benchmark (stronger on code) |
+
+Next-token distributions can be distilled only from models with our tokenizer.
+Teachers' distributions are cached offline (top-k log-probabilities plus the
+remaining mass per token) on corpus text; the KB stack is trained so that the
+decoder plus the KB matches them. The gap between the small and the large model
+is what the KB has to supply, and every token carries signal, so this objective
+is dense and spread out, with no "gold record".
+
 ## 2. What drifted, and what is kept
 
 Between 27 and 28 September the restart plan's "spaces" became four BGKit
@@ -55,10 +77,10 @@ write:  source ──writer──▶ span x (n reps × 1024)
 
 read:   query ──query head──▶ q_s per space
         space s: retrieve the neighbourhood N_s(q_s) (exact scan first)
-                 compactor C_s(neighbourhood | target key q_s) ──▶ one item in space s
+                 superposition operator S_s(neighbourhood | target key q_s) ──▶ one item
         recombiner R(items of all spaces) ──▶ span (decoder input space) ──▶ decoder reads
 
-compact: C_s(neighbourhood | cluster key) ──▶ fewer items in space s, written back
+rewrite: S_s(neighbourhood | target keys) ──▶ items in space s, written back (recursively)
 ```
 
 - **Spaces** differ in granularity and width. An item's position count scales
@@ -79,24 +101,26 @@ compact: C_s(neighbourhood | cluster key) ──▶ fewer items in space s, writ
   Retrieval neighbourhoods grow with coarseness: fine spaces retrieve few items,
   coarse spaces many.
 - **Forward codecs** F_s map the writer's span to each space.
-- **Compactor = combiner, per space.** C_s maps a neighbourhood of items of space
-  s to an item of space s, conditioned on a target key. Because input and output
-  live in the same space (closure), the same operator serves reads (combine a
-  retrieved neighbourhood for a query) and compaction (replace a neighbourhood by
-  fewer items, written back). Compaction can be repeated at several levels, and
-  may add re-representation and superposition even where it does not shrink the
-  store.
+- **Superposition operator, per space.** S_s maps a neighbourhood of items of
+  space s to items of space s, conditioned on target keys. Because input and
+  output live in the same space (closure), the same operator serves reads
+  (combine a retrieved neighbourhood into one item for a query) and rewriting the
+  store (replace a neighbourhood by new items, written back). Rewriting is meant
+  to increase superposition and the availability of knowledge, not to reduce the
+  amount of representation: *compaction* (fewer outputs than inputs) is only its
+  special case. Applied recursively, it spreads each source over more items and
+  lets each item carry more sources. (Earlier drafts called it the compactor.)
 - **Recombiner (reverse codec)** R reads the items of all spaces and produces a
   span in the decoder's input space. Spaces may be missing (a space may not
   retrieve anything relevant), so R is trained with spaces dropped.
 - **Output positions** are variable. In pre-training the target count is given by
-  the target (the original span's n). At inference a compactor emits the average
+  the target (the original span's n). At inference S_s emits the average
   position count of its inputs, and R emits a span whose length follows from the
   spaces' position counts (n ≈ m_s / r_s).
 
 ## 4. The MLP-matrix operator
 
-All three components (codecs, compactors, recombiner) use one operator family,
+All three components (codecs, superposition operators, recombiner) use one operator family,
 built for dense joint recombination of inputs. Attention retrieves sparsely at
 each layer; here every source position contributes to every target position
 through its own learned function of both positions.
@@ -120,7 +144,7 @@ h_i ← h_i + FFN(LN(h_i))
   linear it commutes with the weighted sum, so the per-pair cost is one hidden
   vector (size H), not a full output vector: O(n · m · H) per layer.
 - φ are Fourier features. The relative term φ(p_j − t_i) lets a codec align
-  source and target positions; a compactor's neighbourhood has no meaningful
+  source and target positions; a neighbourhood read by S_s has no meaningful
   cross-item order, so its sources carry only their within-item position.
 - **Gates only modulate mass.** An item's gate scales its positions'
   contributions to the numerator and the mass; it is not an input feature. A gate
@@ -137,9 +161,9 @@ h_i ← h_i + FFN(LN(h_i))
   Output: a linear map of LN(h_i) to the target width, then a fixed-norm rms
   normalization (for the recombiner, BGKit's interface norm into the decoder's
   input space).
-- Keys: the compactor's condition is the target key. In its first, short
-  pre-training phase the compactor sees no input keys (it must combine by
-  content); afterwards the input items' keys are added as source features.
+- Keys: S_s's condition is the target key. In its first, short pre-training
+  phase S_s sees no input keys (it must combine by content); afterwards the input
+  items' keys are added as source features.
 
 ## 5. Training stages
 
@@ -159,26 +183,70 @@ The decoder that reads is the B3 decoder, frozen, unless stated.
   stack close to reading the span itself; each space's ablation costs something.
 - **K2 - Keys.** A key head per space, initialized by distillation from the R5d5
   key table; query heads likewise from R5d5's routing addresses.
-- **K3a - Compactor warm-up, no keys, drop-one.** Neighbourhood of items in space s
-  (nearest neighbours by key), the target item removed; C_s, conditioned on the
-  target key only, produces an item from which R (with the other spaces)
-  reconstructs the target's span. Only needs to be roughly right.
-- **K3b - Compact, then recover (the superposition objective).** A neighbourhood
-  of N items is compacted by C_s into M < N items (conditioned on cluster keys);
-  then every one of the N originals must be recovered from the M compacted items
-  queried at its own key (C_s again), through R and the decoder. Several records
-  must share each stored item. Input keys become available to C_s here.
+- **K3a - Superposition operator warm-up, no keys, drop-one.** Neighbourhood of
+  items in space s (nearest neighbours by key), the target item removed; S_s,
+  conditioned on the target key only, produces an item from which R (with the
+  other spaces) reconstructs the target's span. Only needs to be roughly right.
+- **K3b - Rewrite, then recover (the superposition objective).** A neighbourhood
+  of N items is rewritten by S_s into M items (conditioned on target keys; M < N
+  is compaction, M = N pure superposition); then every one of the N originals
+  must be recovered from the rewritten items queried at its own key (S_s again),
+  through R and the decoder. Several records must share each stored item. Input
+  keys become available to S_s here.
 - **K4 - End-to-end reconstruction through retrieval.** Neighbourhoods retrieved
-  from the stored KB per space, compactors, R, decoder: reproduce the original.
+  from the stored KB per space, S_s, R, decoder: reproduce the original.
+  *Routing through gates:* each space retrieves a generous candidate set and
+  every candidate's gate is derived from its query-key similarity; gates scale
+  mass exactly, so the task loss trains keys and query heads through the gates
+  (the routing half of a mixture of experts). The distilled R5d5 keys are only
+  the starting point.
 - **K5 - End-to-end tasks, decoder frozen.** Only the KB stack trains (codecs,
-  compactors, recombiner, key and query heads). Tasks:
-  - *spread-out use:* next-token prediction on held-out text of a domain whose
-    corpus is in the KB, with many items each contributing a little; measured as
-    NLL reduction per resident parameter, against no memory, shuffled KB, BM25
-    top-k as text, and a larger model;
-  - QA and the B9 task corpora as secondary checks.
-- **K6 - Compaction levels.** Periodic compaction passes with C_s on stored
-  neighbourhoods, written back; the store is evaluated before and after.
+  S_s, recombiner, key and query heads). Main task: distillation of the teachers'
+  next-token distributions (section 1.1) on corpus text, from LFM2.5-1.2B first,
+  then LFM2-24B-A2B. Also held-out continuation of KB-domain text; QA and the B9
+  task corpora as secondary checks.
+- **K6 - Rewriting levels.** Periodic recursive rewriting passes with S_s on
+  stored neighbourhoods, written back; the store is evaluated before and after.
+
+### 5.1 Live items: a fast loop to superposition, then learn to reproduce it (owner, 28 September)
+
+Stored items can be trained directly: gradients from reads update the retrieved
+items in place (sparse updates, optimizer state per item), as in an embedding
+table. This gives a quick loop to real superposition, since items absorb what
+the task needs from many sources, and with teacher distillation (K5) they absorb
+the larger model's knowledge directly. On their own, trained items would be
+static artifacts that a new corpus cannot produce, which defeats continual
+learning and modularity. So training is split:
+
+- **L1 - Items updated in place.** Starting from items produced by the forward
+  codecs (and the writer), training runs update the items directly (with K4's
+  routing and K5's tasks), with recursive applications of S_s between updates to
+  spread content across items. Items stay versioned with provenance
+  (invariants 1 and 2 hold: this is training, and inference reads stored items).
+- **L2 - Learn to reproduce the trained items.** The writer, forward codecs and
+  recursive applications of S_s are trained to produce the L1 items from the
+  sources alone: the in-place-trained items become distillation targets. The
+  producers then derive superposed items live from a new corpus.
+- Later, S_s can also be distilled on the rewriting trajectories of L1.
+
+### 5.2 Standing requirements
+
+- **Storage budget.** A fixed item budget per space, below one item per source in
+  the coarse spaces, so rewriting with sharing is necessary, not optional.
+- **Superposition metrics** at every evaluation: sources served per item, items
+  per source, the effective number of items carrying mass in a read (from the
+  gate masses), and retention of old knowledge after new items are written in.
+- **The knowledge must be in the KB (invariant 9).** Edit a fact in the KB and
+  the output must follow the KB, not the decoder's weights; removing a domain's
+  items must remove the capability; inserting new knowledge must keep old
+  knowledge.
+- **Frequent reads.** A parameter store is consulted throughout generation: reads
+  every chunk of tokens or at every loop boundary, queries from hidden states.
+  Reads enter as spliced spans for now (the BGKit scaffold); adding read results
+  into the hidden states, like expert outputs, is a later option.
+- **Routine:** K1 inputs switch to the B3 writer's own spans (offline generation);
+  per-space storage and exact-scan index first, ANN measured separately
+  (invariant 8); operator throughput per read.
 
 ## 6. Relation to other plan stages
 
@@ -188,7 +256,7 @@ The decoder that reads is the B3 decoder, frozen, unless stated.
   exploration) carry over unchanged.
 - B6 (reads at loop boundaries) reads through this stack.
 - B9 (recursive improvement) stores its trajectories through the writer and this
-  stack; one persistent KB per dataset still holds. Compaction only merges items
+  stack; one persistent KB per dataset still holds. Rewriting only mixes items
   within one authorization domain (one KB), and learned selection is never used
   as authorization (invariant 6).
 
@@ -202,9 +270,10 @@ are the levers; the dense per-pair form is kept on purpose.
 ## 8. Open questions
 
 - Space count, widths and position ratios (the table above is a starting point).
-- Neighbourhood sizes per space, and M/N in compact-then-recover.
+- Neighbourhood sizes per space, and M/N in rewrite-then-recover.
 - Whether R also receives the query (question-conditioned recombination).
-- How compaction levels are scheduled once the store is large.
+- How rewriting levels are scheduled once the store is large.
+- Top-k size for cached teacher distributions, and the distillation corpus.
 
 ## 9. Status
 
@@ -214,5 +283,6 @@ are the levers; the dense per-pair form is kept on purpose.
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 7 property tests) |
 | K1 codecs and recombiner | training from 28 Sep (`scripts/train_kb_codecs.py`, run `kb-k1`: B1 teacher spans, B3 reader at step 11500, 28M parameters) |
 | K2 keys | not built (R5d5 key table exists) |
-| K3 compactor | not built |
-| K4-K6 | not built |
+| K3 superposition operator | not built |
+| K4-K6, L1-L2 | not built |
+| Teacher distributions | not cached (LFM2.5-1.2B first, then LFM2-24B-A2B) |

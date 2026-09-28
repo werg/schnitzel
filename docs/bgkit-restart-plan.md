@@ -226,7 +226,7 @@ kept those queries apart, so later loops could repeat the first query. From B5 o
 (1) one query per loop boundary and space plus 2 query heads per space, later
 loops conditioned on what was read (multi-hop bridges); (2) coverage over
 repetition - within a site, a record already retrieved by an earlier query gets a
-discounted gate in the compactor, and the query set is trained on union recall of a
+discounted gate in the superposition operator, and the query set is trained on union recall of a
 sufficient group; (3) a margin-hinged repulsion between one site's query vectors;
 (4) exploration while training (Gumbel-perturbed top-k, an entropy floor on each
 query's routing), annealed off; (5) tasks that need several reads (multi-hop QA,
@@ -234,7 +234,7 @@ SQL schema + values + evidence, per-step agent reads, B9 rounds). Tracked:
 distinct records per site, union recall, pairwise query similarity.
 
 **B6 — Reads.** A read retrieves a neighbourhood per KB space, combines each
-with that space's compactor and the spaces with the recombiner
+with that space's superposition operator and the spaces with the recombiner
 ([knowledge-base stack](knowledge-base-stack.md)), and splices the resulting
 span into the read workspace at the loop boundary, instead of the MLP reader's
 fixed slots. Build the bank by frozen-writer generation and the forward codecs;
@@ -368,7 +368,7 @@ datasets) and periodic memory-use evaluation.
 1. Dense compression, above x4, scaled with input size; logarithmic output sizes
    after distillation (3.3).
 2. Recurrent loops are kept: reads happen at loop boundaries as in R5.
-3. Reads are gated. Retrieved items pass through the per-space compactors and
+3. Reads are gated. Retrieved items pass through the per-space superposition operators and
    the recombiner of the knowledge-base stack, which produce the spliced read
    span; raw rep sequences are not spliced unweighted. Gates only modulate mass.
 4. R5d5 is stopped (27 September, step ~1480) and serves as the frozen key
@@ -460,3 +460,15 @@ log your decisions and changes of direction"), newest last.
   state). Superposition is an explicit objective (compact then recover,
   drop-one), plus tasks that reward spread-out use. B7 is superseded; combiner
   stage 2 was stopped at step 2000. B3 continues (the writer feeds the stack).
+- **28 Sep, benchmark, teachers, live items (owner).** Model family checked on
+  Hugging Face (token-to-id maps compared): LFM2.5-1.2B, LFM2-8B-A1B and
+  LFM2-24B-A2B share our tokenizer exactly (LFM2-8B-A1B differs in 2 special
+  tokens), so their next-token distributions can be distilled; LFM2.5-2.6B,
+  LFM2.5-8B-A1B (128k vocabulary) and Ling-3.0-tiny (157k) cannot and serve as
+  benchmarks. Order: cache LFM2.5-1.2B distributions first, LFM2-24B-A2B later
+  (about 48 GB in bf16, after B3 frees memory). Live items (stored items trained
+  in place for a fast loop to superposition, then the producers trained to
+  reproduce them) enter the stack as L1/L2. The in-space operator is renamed the
+  superposition operator S_s: rewriting increases superposition; compaction is
+  its special case with fewer outputs. Added: storage budget, superposition
+  metrics, KB-dependence tests, frequent reads (knowledge-base stack 5.2).
