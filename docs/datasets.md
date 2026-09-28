@@ -255,6 +255,76 @@ LFM2.5-350M render check on 200 per split:
   - The earlier per-version build (17.7 searches and 23 slot records per episode) is
     kept as `memory-parallel-recall-20260928v3-perversion`.
 
+## Task corpus: citance recall
+
+`scripts/prepare_task_corpora.py citance-recall` builds `tasks-citance-recall-<date>`.
+The generator is `schnitz.citances` and its tests are in `tests/test_citances.py`.
+The KB holds many independent *descriptions of the same content*: the citation
+contexts (citances) of one cited paper, written by different citing papers.
+
+- **Data.** [saier/unarXive_citrec](https://huggingface.co/datasets/saier/unarXive_citrec)
+  at `df769ff` (CC BY-SA 4.0; derived from unarXive 2022). It has 2.49M paragraphs of
+  computer-science arXiv papers. Each has one annotated citation marker and the cited
+  work's OpenAlex id. `license_info.jsonl` maps samples to citing arXiv papers and
+  their own open licences. Raw files are in `/archive/raw/citances-20260928/` (6.8 GB,
+  README with sources and checksums). `scripts/fetch_citance_metadata.py` needs no
+  key. It counts distinct citing papers per cited work in one streaming pass. Then it
+  resolves candidates in hash order with the OpenAlex API to works with an arXiv
+  version (4520 of 16,900 looked up). It fetches titles and abstracts from the arXiv
+  API, whose metadata is CC0. A cited work is dropped when its arXiv title and current
+  OpenAlex title disagree, because OpenAlex merges re-point ids (47 dropped).
+  OpCitance and S2ORC were not used. OpCitance has no cited abstracts, and not all of
+  its articles are CC-licensed. S2ORC needs an API key.
+- **KB records** (`kind: passage`, `record_type: citance`). There is one per citing
+  paper and cited work: `Citing paper: <title>` followed by the citing sentence and
+  one sentence either side. Every `[n]}` marker is removed together with the
+  punctuation it leaves behind. The cited paper's title is never added. The citing
+  sentence needs at least 8 words, at most 3 markers and at most 20% inline math.
+  When a citing paper cites the work several times, the context with the fewest
+  markers is used. Records are capped at `RECORD_CHARS` (1500) and are 470
+  characters on average. A record whose text serves several cited works (one
+  sentence citing two papers) is stored once and lists them all in
+  `provenance.cited`. Stored per cited work: the first `--max-citances` (32) citing
+  papers in hash order. A cited work needs at least `--min-citances` (8).
+- **Abstract recall** (`public_citance_abstract`): "Summarize the paper "<title>" as
+  its abstract states it." The target is the arXiv abstract's first 128-256 LFM2.5
+  tokens (whole sentences, else cut at a word; median 210). Shorter abstracts are
+  dropped. **No abstract is stored.** Any citance that shares a 12-word sequence with
+  *any* target abstract is dropped (191), so quoted abstract sentences cannot leak.
+- **Citance recall** (`public_citance_description`). The KB machinery has one KB per
+  corpus and no per-episode removal, so whole citing papers are held out instead:
+  10% by hash (`--heldout-rate`). None of their citances is stored. One held-out
+  citance per cited work becomes a target. The query gives the citing title, the
+  cited title and the neighbouring sentences with `[...]` in place of the citing
+  sentence. The target is dropped when it shares a 12-word sequence with, or is a
+  substring of, any stored record (34 cases of authors reusing text). It is also
+  dropped when it has no neighbouring sentence.
+- **Episodes.** Both families list every stored citance of the cited work in
+  `supports`. Each citance alone is a `sufficient_groups` entry, and all of them are
+  one `alternatives` hop, so the bank build stores every copy. `redundancy` is their
+  number. `verify` is `{"type": "reference"}`: there is no verifier, and the
+  measurement is teacher NLL or overlap with the target. The split is by cited
+  paper: the first 300 kept works in hash order are validation. Their citances are in
+  the KB, but no training episode targets them.
+
+Built 28 September, with the same transcript options as the other v3 corpora and an
+LFM2.5-350M render check on 200 per split:
+
+- **`tasks-citance-recall-20260928`.**
+  - 2217 cited works and 33,984 records. Licences of the citing papers: CC BY 4.0
+    89%, CC BY-SA 4.0 5%, CC0 5%, other 1%.
+  - Train has 1917 abstract and 1347 citance episodes. Validation has 300 abstract
+    and 216 citance episodes.
+  - Redundancy is 8-32, with quartiles 9/13/20 and a mean of 15.8. 280 works reach
+    the cap of 32.
+- **`memory-citance-recall-20260928v3`.**
+  - 3264/516 transcripts, none rejected.
+  - Each transcript has one search, which reads one citance and lists all of that
+    work's citances as `alternatives` (16.5 per search).
+  - There are no write sites.
+  - One citance is far from enough to reconstruct an abstract. To make several
+    citances the positives, the reader must use the alternatives.
+
 ## Stored-only measurement
 
 Evaluation has a separate write phase, serializes payload precision, reopens the bank,

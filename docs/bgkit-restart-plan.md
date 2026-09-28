@@ -1041,3 +1041,12 @@ log your decisions and changes of direction"), newest last.
   the old form, archived as `...v3-perversion`). A harder WEB condition
   (`tasks-parallel-recall-hard-20260928`) drops the NHEB editions: nearest-version
   similarity for WEB has a median of 0.87 instead of 0.97.
+- 28 September: the queued citance probe is started (`tasks-citance-recall-20260928`,
+  `memory-citance-recall-20260928v3`). The source is unarXive citrec (CC BY-SA 4.0;
+  CS arXiv paragraphs with OpenAlex-linked citations) plus arXiv abstracts (CC0). PMC
+  citances (OpCitance) have no cited abstracts and are not all CC-licensed; S2ORC
+  needs an API key. The KB has 2217 cited arXiv papers, each with 8-32 citances from
+  distinct citing papers (median 13), 33,984 records in all. Episodes recall the
+  cited abstract, which is never stored (1917/300), or a held-out citing paper's
+  citance (1347/216), with whole citing papers held out. The split is by cited
+  paper. Transcripts read one citance and name the rest as `alternatives`.
