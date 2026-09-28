@@ -69,8 +69,7 @@ from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
 
-# The decoder wrapper, K1 stack and length schedule still live in scripts/; the shared
-# modules (schnitz.kb.decoder, schnitz.kb.stack) replace these imports at merge.
+# the writer's length schedule (s0 factor) still lives in scripts/
 SCRIPTS = Path(__file__).resolve().parents[4] / 'scripts'
 
 
@@ -294,11 +293,13 @@ class Context:
 
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
-                spans: list[torch.Tensor] | None = None):
+                spans: list[torch.Tensor] | None = None, retrieval_only: bool = False):
     """Task NLL (summed over target tokens) of one transcript and its reads.
 
     ``mode`` 'retrieve' or 'gold' computes each read at its call from the exact causal
-    prefix; 'fixed' splices the given ``spans`` (controls)."""
+    prefix; 'fixed' splices the given ``spans`` (controls). ``retrieval_only`` (K2):
+    the reads' spans enter later prefixes detached and no task pass runs (NLL None),
+    so only the retrieval loss trains, through the queries and the item keys."""
     embeds = ctx.frozen.embed(ep.ids)
     reads = []
     if mode == 'fixed':
@@ -326,8 +327,11 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            gold=mode == 'gold')
                 reads.append(read)
-                spans.append(read.span.float())
+                spans.append(read.span.float().detach() if retrieval_only
+                             else read.span.float())
             k = group[-1] + 1
+    if retrieval_only:
+        return None, int(ep.targets.numel()), reads, spans
     x, index = splice(embeds, ep.mems, spans)
     hidden = ctx.frozen.final(x[None])[0]
     positions = index[ep.targets] - 1
@@ -339,8 +343,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
 # -- model loading (GPU container) ------------------------------------------------------
 def load_model(args):
     """The frozen decoder (and writer) from S2 plus ``--reader-state``; protocol installed."""
-    _scripts()
-    from train_bgkit_reps import Model
+    from schnitz.kb.decoder import Model
     model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
                                      checkpoint=args.checkpoint,
                                      adapter_rank=16 if args.reader_state else 0,
@@ -363,8 +366,7 @@ def load_model(args):
 
 def load_stack(path: Path | None, target_norm: float, device, seed: int):
     """K1 codecs and recombiner (``train_kb_codecs.Stack``): trained, or random init."""
-    _scripts()
-    from train_kb_codecs import Stack
+    from schnitz.kb.stack import Stack
     dims = {'state': 512, 'hidden': 256, 'layers': 3}
     if path is not None and (path.parent / 'config.json').exists():
         config = json.loads((path.parent / 'config.json').read_text())
@@ -460,7 +462,7 @@ def build(args) -> None:
                           args.seed).to(model.device)
     teacher = None
     if args.span_source == 'teacher':
-        from train_bgkit_reps import TeacherCache
+        from schnitz.kb.decoder import TeacherCache
         teacher = TeacherCache(args.cache, None, texts=[])
         teacher.by_id = {item[2]: item for item in teacher.items}
     report = {}
@@ -566,28 +568,54 @@ def _mean(sink: dict) -> dict:
     return {k: round(sum(v) / len(v), 4) for k, v in sorted(sink.items()) if v}
 
 
-def train_step(ctx: Context, episodes: list[Episode], optimizer, args) -> dict:
+def retrieval_weight(args, step: int) -> float:
+    """The retrieval loss weight, annealed linearly to its floor as the task loss takes
+    over (stack doc 5.2); constant in K2 (``--retrieval-only``)."""
+    if args.retrieval_only or not args.retrieval_anneal:
+        return args.retrieval_weight
+    done = min(step / args.retrieval_anneal, 1.0)
+    return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
+
+
+def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0) -> dict:
+    """One L1a step (items in place; K2 with ``--retrieval-only``): gradients of all
+    episodes accumulate, then one optimizer step for the reader and one sparse live
+    update per touched (KB, space) for item values and keys."""
+    if args.phase != 'l1a':
+        # L1b (through the sources): recompute each retrieved item's write from its
+        # stored source with gradients (selective producer replay, the serialized
+        # forward exactly: invariant 3) so the task loss reaches the writer's span heads
+        # and the codecs. Not built; this is where it plugs in.
+        raise NotImplementedError('L1b (gradients through the sources) is not built')
     cache = ItemCache(ctx.frozen.device, train=True)
     optimizer.zero_grad(set_to_none=True)
     tokens = sum(int(ep.targets.numel()) for ep in episodes)
+    weight = retrieval_weight(args, step)
     stats: dict[str, list] = {}
     nll_total, aux_total = 0.0, 0.0
     for ep in episodes:
-        nll, _, reads, _ = run_episode(ctx, ep, cache, 'retrieve')
+        nll, _, reads, _ = run_episode(ctx, ep, cache, 'retrieve',
+                                       retrieval_only=args.retrieval_only)
         aux = [r.aux for r in reads if r.aux is not None]
-        loss = nll / tokens
-        if aux and args.retrieval_weight:
+        loss = nll / tokens if nll is not None else None
+        if aux and weight:
             aux_mean = torch.stack(aux).mean()
-            loss = loss + args.retrieval_weight * aux_mean / len(episodes)
+            term = weight * aux_mean / len(episodes)
+            loss = term if loss is None else loss + term
             aux_total += aux_mean.item() / len(episodes)
-        loss.backward()
-        nll_total += nll.item()
+        if loss is not None and loss.requires_grad:
+            loss.backward()
+        if nll is not None:
+            nll_total += nll.item()
         _read_stats(reads, stats)
     torch.nn.utils.clip_grad_norm_(ctx.reader.parameters(), args.clip)
     optimizer.step()
-    counts = cache.apply(args.item_lr, args.key_lr)
-    return {'nll': nll_total / tokens, 'aux': aux_total, 'tokens': tokens, **counts,
-            **_mean(stats)}
+    counts = cache.apply(0.0 if args.retrieval_only else args.item_lr, args.key_lr)
+    out = {'aux': aux_total, 'retrieval_weight': weight, 'tokens': tokens, **counts,
+           **_mean(stats)}
+    if not args.retrieval_only:
+        out['nll'] = nll_total / tokens
+    return out
 
 
 @torch.no_grad()
@@ -645,7 +673,7 @@ def train(args) -> None:
                         span_width=lm.get_input_embeddings().weight.shape[1],
                         target_norm=model.target_norm, state=dims['state'],
                         op_hidden=dims['hidden'], layers=dims['layers'], gate=args.gate,
-                        max_items=args.max_items, max_reps=args.max_reps,
+                        retrieval_tau=args.retrieval_tau, max_reps=args.max_reps,
                         checkpointing=not args.no_operator_checkpoint)
     torch.manual_seed(args.seed)
     reader = L1Reader(config)
@@ -671,7 +699,7 @@ def train(args) -> None:
         optimizer.load_state_dict(state['optimizer'])
         step = state['step']
         rng.setstate(state['rng'])
-        torch.set_rng_state(state['torch_rng'])
+        torch.set_rng_state(state['torch_rng'].cpu())
         # items and keys back to exactly the state paired with the reader checkpoint
         for name, kb in kbs.items():
             kb.restore_live(state['live_tag'])
@@ -752,7 +780,7 @@ def train(args) -> None:
             if ep is not None:
                 batch.append(ep)
         reader.train()
-        result = train_step(ctx, batch, optimizer, args)
+        result = train_step(ctx, batch, optimizer, args, step)
         step += 1
         for key, value in result.items():
             window[key] = window.get(key, 0.0) + value
@@ -800,7 +828,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--candidates', default='', help='scored per space, e.g. A=8,B=16,C=32,D=64')
     t.add_argument('--keep', default='', help='read per space (nonzero gates), e.g. A=2,D=4')
     t.add_argument('--gate', choices=('sigmoid', 'softmax'), default='sigmoid')
-    t.add_argument('--max-items', type=float, default=4.0)
+    t.add_argument('--retrieval-tau', type=float, default=0.1)
+    t.add_argument('--retrieval-anneal', type=int, default=0,
+                   help='steps over which the retrieval weight decays linearly to '
+                        '--retrieval-floor (0: constant)')
+    t.add_argument('--retrieval-floor', type=float, default=0.0)
+    t.add_argument('--retrieval-only', action='store_true',
+                   help='K2: only the retrieval loss; trains key heads and item keys')
+    t.add_argument('--phase', choices=('l1a', 'l1b'), default='l1a',
+                   help='L1a items in place; L1b (through the sources) is not built')
     t.add_argument('--max-reps', type=int, default=16, help='span budget per read')
     t.add_argument('--max-tokens', type=int, default=3072)
     t.add_argument('--keep-writes', action='store_true')

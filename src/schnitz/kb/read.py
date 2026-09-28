@@ -26,18 +26,19 @@ space's key width (queries are vectors, never text). Per space:
 The **recombiner** R (an ``MLPMatrix`` over the space reads, the K1 recombiner's form)
 takes each space read with its mass as gate (numerator and mass, invariant 5: space
 reads are never averaged without their masses) and produces the span of ``n`` reps in
-the decoder's input space. Choice of ``n`` (documented in the stack doc, WP5):
+the decoder's input space. Its count ``n`` is the owner's read-count rule (stack doc
+5.2): the gate-mass-weighted mean length of the items read, in decoder reps (an item
+of m positions in space s stands for m / r_s reps), capped by the per-read budget:
 
-    L = sum_s mu_s (mbar_s / r_s) / sum_s mu_s     (the implied length of one record)
-    M = mean_s mu_s, clamped to [1, max_items]     (with sigmoid gates, about the number
-                                                    of relevant items found per space)
-    n = clamp(ceil(L * M), min_reps, max_reps)
+    n = clamp(ceil(sum_j g_j m_j / r_s(j) / sum_j g_j), min_reps, max_reps)
 
-with ``mu_s`` a space's total gate mass and ``mbar_s`` its gate-weighted mean item
-length (r_s positions per writer rep). A read that finds one record gets about that
-record's span length, a read over several records proportionally more, capped. With
-softmax gates every space has mass 1 and ``n`` is one record's length. ``n`` is
-computed from detached values (a count is not differentiable).
+computed from detached gates (a count is not differentiable). To be replaced by
+``schnitz.kb.stack.read_count`` once it lands (same rule).
+
+Retrieval loss (stack doc 5.2), per space over the scored candidates plus any target
+item the search missed: -log sum_{positive} softmax(cos / tau), positives being the
+items of the slot's records; missed targets are scored with their live keys but never
+enter the read. To be replaced by ``schnitz.kb.losses.retrieval_loss``.
 
 Gold mode skips retrieval: the items of the slot's target records, gate 1 (the
 information-matched control, never used in training reads). Items come from an
@@ -79,7 +80,7 @@ class ReadConfig:
     op_hidden: int = 256
     layers: int = 3
     gate: str = 'sigmoid'         # or 'softmax'
-    max_items: float = 4.0
+    retrieval_tau: float = 0.1
     min_reps: int = 1
     max_reps: int = 16
     checkpointing: bool = True
@@ -272,8 +273,10 @@ class L1Reader(nn.Module):
             else:
                 logits = self.router.logits(s, q, keys.to(q.device))
                 if wanted:
-                    aux.append(self._retrieval_loss(s, q, refs, logits, wanted, by_dataset,
-                                                    cache, query_time))
+                    loss = self._retrieval_loss(s, q, refs, keys, wanted, by_dataset, cache,
+                                                query_time)
+                    if loss is not None:
+                        aux.append(loss)
                 # sparse read: only the top ``keep`` candidates by gate logit carry mass;
                 # the rest are scored (retrieval loss) but read with gate exactly 0
                 keep = min(c.keep.get(s, len(got)), len(got))
@@ -302,33 +305,25 @@ class L1Reader(nn.Module):
             return Read(torch.zeros(0, width, device=state.device), info, aux_loss, 0)
         mu = torch.stack([masses[s].detach().float() for s in live])
         implied = torch.tensor([lengths[s] / c.spaces[s].ratio for s in live], device=mu.device)
-        record_len = float((mu * implied).sum() / mu.sum())
-        found = min(max(float(mu.mean()), 1.0), c.max_items)
-        n = int(min(max(math.ceil(record_len * found), c.min_reps), c.max_reps))
+        reps = float((mu * implied).sum() / mu.sum())
+        n = int(min(max(math.ceil(reps), c.min_reps), c.max_reps))
         span, _ = self.recombiner([(s, reads[s], masses[s]) for s in live], n)
         return Read(span, info, aux_loss, n)
 
-    def _retrieval_loss(self, space, q, refs, logits, wanted, by_dataset, cache, query_time):
-        """Balanced BCE on gate logits: target items (retrieved or not) up, other
-        candidates down. Missing targets are scored with their live keys but do not
-        enter the read."""
+    def _retrieval_loss(self, space, q, refs, keys, wanted, by_dataset, cache, query_time):
+        """-log sum_{positive} softmax(cos / tau) over the scored candidates and the
+        targets the search missed (scored with their live keys, never read)."""
         extra = [r for r in wanted if r not in set(refs)]
-        all_logits, labels = [logits], [torch.tensor([float(r in set(wanted)) for r in refs])]
-        if extra:
-            fetched = _fetch(cache, by_dataset, space, extra)
-            keys = [key for _, key, time in fetched if time <= query_time]
-            if keys:
-                all_logits.append(self.router.logits(space, q, torch.stack(keys).to(q.device)))
-                labels.append(torch.ones(len(keys)))
-        z = torch.cat(all_logits).float()
-        y = torch.cat(labels).to(z.device)
-        pos, neg = y > 0, y == 0
-        loss = z.new_zeros(())
-        if pos.any():
-            loss = loss + F.softplus(-z[pos]).mean()
-        if neg.any():
-            loss = loss + F.softplus(z[neg]).mean()
-        return loss
+        fetched = _fetch(cache, by_dataset, space, extra) if extra else []
+        missed = [key for _, key, time in fetched if time <= query_time]
+        pool = torch.cat([keys, torch.stack(missed)]) if missed else keys
+        positive = torch.tensor([r in set(wanted) for r in refs] + [True] * len(missed),
+                                device=q.device)
+        if not positive.any():
+            return None
+        z = F.cosine_similarity(q.float()[None], pool.float().to(q.device), dim=-1) \
+            / self.config.retrieval_tau
+        return torch.logsumexp(z, 0) - torch.logsumexp(z[positive], 0)
 
 
 def _fetch(cache: ItemCache, by_dataset: Mapping[str, KnowledgeBase], space: str,

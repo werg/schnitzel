@@ -20,8 +20,9 @@ MEM, MEM_END = SPAN_TOKENS['mem'][1], SPAN_TOKENS['mem_end'][1]
 
 
 def config(**kw):
-    return ReadConfig(spaces=SPACES, candidates={'A': 3, 'B': 4}, hidden=HIDDEN, span_width=HIDDEN,
-                      target_norm=1.0, state=16, op_hidden=12, layers=2, **kw)
+    kw = {'candidates': {'A': 3, 'B': 4}, **kw}
+    return ReadConfig(spaces=SPACES, hidden=HIDDEN, span_width=HIDDEN, target_norm=1.0,
+                      state=16, op_hidden=12, layers=2, **kw)
 
 
 def reader(**kw):
@@ -345,3 +346,46 @@ def test_layout_with_the_real_template():
     assert '1842' in tok.decode(ep.ids[ep.targets])
     text = l1.layout(row, tok, {'a': 'alpha', 'b': 'beta'})
     assert text.targets.numel() == ep.targets.numel()
+
+
+def test_retrieval_loss_is_softmax_over_candidates(tmp_path):
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(4)))
+    r = reader(candidates={'A': 4, 'B': 4})
+    cache = ItemCache(train=False)
+    state = torch.randn(HIDDEN)
+    targets = targets_of(kb, ['r2'])
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets)
+    q = r.keys(state)
+    want = []
+    for s in SPACES:     # all four items are scored: -log softmax(cos / tau)[target]
+        keys = torch.stack([cache.get(kb, s, [i])[0][1] for i in kb._row_ids[s]])
+        z = torch.nn.functional.cosine_similarity(q[s][None], keys, dim=-1) / 0.1
+        pos = kb._row_ids[s].index(targets[s][0][1])
+        want.append(-torch.log_softmax(z, 0)[pos])
+        assert len(read.spaces[s].refs) == r.config.keep[s]     # the read stays sparse
+    torch.testing.assert_close(read.aux, torch.stack(want).mean())
+
+
+def test_read_count_is_mass_weighted_length_in_reps_capped(tmp_path):
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1)))   # items 2 and 3 positions long
+    targets = targets_of(kb, ['r1', 'r2'])
+    read = reader(max_reps=64).read(torch.randn(HIDDEN), [kb], ['ds'], 3,
+                                    ItemCache(train=False), targets=targets, gold=True)
+    # gates 1: A items stand for 2.5 reps on average (r = 1), B items for 5 (r = 1/2)
+    assert read.n == 4          # ceil(mean(2.5, 5.0)), both spaces with mass 2
+    capped = reader(max_reps=3).read(torch.randn(HIDDEN), [kb], ['ds'], 3,
+                                     ItemCache(train=False), targets=targets, gold=True)
+    assert capped.n == 3
+
+
+def test_retrieval_only_trains_keys_not_values(tmp_path):
+    ctx, _ = context(tmp_path)
+    ep = episode(IDS, [3, 10], [6, 13])
+    cache = ItemCache(train=True)
+    nll, _, reads, spans = l1.run_episode(ctx, ep, cache, retrieval_only=True)
+    assert nll is None and not any(s.requires_grad for s in spans)
+    torch.stack([rd.aux for rd in reads]).mean().backward()
+    assert all(v.grad is None for v in cache.values.values())
+    assert any(k.grad is not None and k.grad.abs().sum() > 0 for k in cache.keys.values())
+    assert ctx.reader.keys.heads['A'].weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in ctx.reader.operators.parameters())
