@@ -644,3 +644,12 @@ log your decisions and changes of direction"), newest last.
   stack now standardizes spans per dimension with corpus statistics and the cosine
   is measured in that space (weight 1). K1 restarted a third time; earlier runs
   kept as `kb-k1-uniform`, `kb-k1-kernel-unnormed`, `kb-k1-inputnorm`.
+- 28 Sep (B4b/B4c built and merged; B4 launch updated). B4 runs B4a from its start,
+  B4c in-context writes from its start (15% of steps, over the v3 transcripts'
+  write sites; target: the writer's own free-running span of the site's teacher
+  text under the memory prompt, so in-context writes match what bank creation
+  stores; the frozen S2 reader must reconstruct the text), and B4b's soft output
+  port from step 4000 (after the input port's ramp), ramped to half of QA answers
+  over 2000 steps. Write batches kept small (4 sites, prefixes up to 1536 tokens)
+  because the launch is unattended and larger sizes were not tried at B4's memory
+  cap.

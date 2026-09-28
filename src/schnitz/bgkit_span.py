@@ -89,6 +89,24 @@ class SpanWriter(nn.Module):
         return self.marker + self.ratio(factor)
 
 
+class PortHeads(nn.Module):
+    """Soft output port heads (B4b): a rep head and an emit/stop head of their own, not
+    the memory writer's. The marker is supplied by the owner (the protocol's
+    ``<|port|>`` input embedding plus the writer's ratio code at x1), so it is not a
+    parameter here. ``tokens`` names the protocol tokens that open and close the span."""
+
+    tokens = ('port', 'port_end')
+
+    def __init__(self, width: int, target_norm: float, marker=None):
+        super().__init__()
+        self.rep = RepHead(width, target_norm)
+        self.stop = nn.Linear(width, 2)  # logits over (emit, <|/port|>)
+        self.__dict__['marker_fn'] = marker
+
+    def marker_embedding(self, factor: torch.Tensor) -> torch.Tensor:
+        return self.marker_fn(factor)
+
+
 def span_targets(counts: list[int], device=None) -> torch.Tensor:
     """Stop labels for spans of ``counts`` reps: k positions of 0 (emit), then 1 (stop).
 
