@@ -196,3 +196,48 @@ def test_rewrite_outputs_are_produced_through_their_lineage(tmp_path):
     assert float(loss) < 1e-4 and parts['cos_A'] < 1e-4
     kb.close()
     export.close()
+
+
+def test_stack_fit_trains_codecs_through_the_producer_replay(tmp_path):
+    from schnitz.kb import superpose as sp
+    from schnitz.kb.producer import Producers, Writer
+    model, reader = FakeModel(), tiny_reader()
+    texts = {f'r{i}': ' '.join(['w%d' % (i * 7 + j) for j in range(3 + i % 4)])
+             for i in range(12)}
+    spans = {r: model.free_run([{'ids': model.text_ids(t)}], [2 + i % 3])[0][0]
+             for i, (r, t) in enumerate(texts.items())}
+    leaves = KnowledgeBase.create(tmp_path / 'banks' / 'kb', name='kb', dataset='ds')
+    for r, span in spans.items():
+        items = produce_items(reader.stack, span)
+        for s, v in items.items():
+            leaves.append(s, [NewItem(v.detach(), reader.keys.item_key(s, v).detach(),
+                                      Provenance((r,), 'codec'), 1.0, 1)])
+    cfg = sp.SuperposeConfig(depth=2, field={'A': 4, 'B': 4, 'C': 4, 'D': 4}, overlap=2,
+                             cache_every=1, deep_grad=1.0)
+    rows_kb, _ = sp.build_rows(leaves, tmp_path / 'rows' / 'kb', cfg)
+    rows_kb.close()
+    leaves.close()
+    torch.manual_seed(0)
+    ops = sp.WriteOps(2, {'state': 16, 'hidden': 12, 'layers': 1})
+    fit = l2.StackFit(ops, reader.keys, cfg, tmp_path / 'banks', {'kbs': {'ds': {'dir': 'kb'}}},
+                      'cpu', 5)
+    fit.load(l2.load_row_targets(tmp_path / 'rows', {'ds': 'kb'}))
+    prod = Producers(Writer(model, reader.stack), resolve=fit.resolve,
+                     stored=fit.stored_value, texts=texts,
+                     caches={'ds': Cache(spans)}, level='s0', mode='teacher')
+    fit.producers = prod
+    codecs = list(reader.stack.codecs.parameters())
+    for p in codecs:
+        p.requires_grad_(True)
+    fit.begin()
+    picks = {s: [('ds', n) for n in range(len(rows))] for s, rows in
+             fit.targets['ds'].rows.items()}
+    loss, parts = fit.loss(picks, L2Weights())
+    loss.backward()
+    got = prod.backward()
+    # every leaf is recomputed from its record (teacher feed: the stored item exactly,
+    # up to the store's bf16), and the fit's gradient reaches the codecs through them
+    assert got['backward_sources'] == len(texts) and got['drift'] == 0.0
+    assert got['match_rel'] < 1e-2
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0 for p in codecs)
+    fit.close()
