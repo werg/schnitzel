@@ -587,3 +587,14 @@ log your decisions and changes of direction"), newest last.
   span (several vectors, as a write span) is the fallback if one vector per space
   proves too narrow in L1. `memory_write` keeps its text argument until writes
   become latent (B4). Transcripts regenerated without query text.
+- 28 Sep (WP3 v2, transcripts regenerated without query text, `memory-<name>-20260928v2`).
+  Agent searches are placed per record: standing records (protocol, general policy) at
+  the start, the rest just before the agent's first action that uses what the record
+  covers (a tool, a listed object or place, an example's most specific command, with one
+  re-read at its next command), plus a protocol re-read after an observation reporting a
+  failed action. The `action_*` placements use the agent's own next action, as the v1
+  tool-doc placement did; the call has no content, so no future text enters the prefix.
+  ScienceWorld episodes without examples draw three from the KB's held-out pool of the
+  same task type (never their own variation). Writes default to `reusable`: trajectories
+  and single-shot results that are reusable later (SQL, table answers, tool calls, short
+  code, multi-hop answers), not puzzle answers or facts a passage already holds.
