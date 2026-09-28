@@ -79,7 +79,8 @@ from schnitz.bgkit_span import MEMORY_PROMPT, SUMMARIZE_PROMPTS, span_targets
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.decoder import (ADAPTER_TARGETS, LEVELS, Model, TeacherCache, _batches,
                                 _heldout, _kl, _subset, length_factors)
-from schnitz.memory_transcripts import write_site_prefix
+from schnitz.kb.bank import SpanCache, kb_dir
+from schnitz.memory_transcripts import site_slots, splice_slots, write_site_prefix
 
 SPACES = LEVELS  # the writer's ratio levels (historical name in this stage)
 # B4b: the user turn asks for the answer through the soft output port, so the choice
@@ -419,7 +420,53 @@ def write_example(model: Model, row: dict, site: int, max_tokens: int, space: in
     factor = length_factors(int(text.shape[0]))[space]
     return {'prefix_ids': torch.tensor(ids), 'factor': factor, 'ratio_stated': True,
             'text': text, 'count': max(1, math.ceil(text.shape[0] / factor)),
-            'site': f"{row['episode_id']}#{site}"}
+            'site': f"{row['episode_id']}#{site}",
+            'slots': splice_slots(ids, site_slots(row, site))}
+
+
+class SlotSpans:
+    """Latent content of the memory slots in write-site prefixes: each slot holds its
+    records' spans from the per-dataset span caches (``schnitz.kb.bank.SpanCache``,
+    ``<root>/<kb>``), in slot order, at most ``cap`` reps per slot. A record missing
+    from the cache is left out and counted."""
+
+    def __init__(self, root: Path, cap: int):
+        self.root, self.cap = Path(root), cap
+        self.caches: dict[str, SpanCache | None] = {}
+        self.missing = 0
+
+    def cache(self, kb: str) -> SpanCache | None:
+        if kb not in self.caches:
+            path = self.root / kb_dir(kb)
+            self.caches[kb] = SpanCache(path) if (path / 'manifest.json').exists() else None
+        return self.caches[kb]
+
+    def slot(self, slot: dict) -> torch.Tensor | None:
+        cache, parts, used = self.cache(slot['kb']), [], 0
+        for record in slot['record_ids']:
+            if cache is None or record not in cache:
+                self.missing += 1
+                continue
+            span = cache.get(record)[:self.cap - used]
+            parts.append(span)
+            used += span.shape[0]
+            if used >= self.cap:
+                break
+        return torch.cat(parts) if parts else None
+
+    def fill(self, model: Model, ex: dict) -> dict:
+        """``ex['inputs']``: the prefix embedding with each slot's spans after its
+        ``<|mem|>`` token (``Model.write_inputs`` prefers ``inputs``)."""
+        embeds = model.decoder.embed_tokens(ex['prefix_ids'].to(model.device)).float()
+        pieces, last = [], 0
+        for position, slot in ex['slots']:
+            span = self.slot(slot)
+            if span is None:
+                continue
+            pieces += [embeds[last:position + 1], span.to(model.device).float()]
+            last = position + 1
+        pieces.append(embeds[last:])
+        return {**ex, 'inputs': torch.cat(pieces)}
 
 
 @torch.no_grad()
@@ -696,6 +743,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--write-space', type=int, default=0,
                         help='B4c: bank space whose length-scaled ratio the write spans use')
     parser.add_argument('--write-eval-items', type=int, default=64)
+    parser.add_argument('--slot-spans', type=Path,
+                        help='span caches (train.py bank) that fill the memory slots of '
+                             'write-site prefixes; without it the slots stay empty')
+    parser.add_argument('--slot-cap', type=int, default=64, help='reps per memory slot')
 
 
 def run(args) -> None:
@@ -723,6 +774,7 @@ def run(args) -> None:
         qa_eval = QAEpisodes(args.qa_eval_episodes, cache, args.neighbors)
         qa_eval_rows = sorted(qa_eval.rows, key=lambda row: row['episode_id'])[:args.qa_eval_items]
     write_train = write_eval = None
+    slot_spans = SlotSpans(args.slot_spans, args.slot_cap) if args.slot_spans else None
     if args.write_fraction > 0:
         write_train = WriteSites(args.write_transcripts, 'train')
         held = WriteSites(args.write_transcripts, 'validation')
@@ -738,6 +790,10 @@ def run(args) -> None:
             result.update(evaluate_qa(model, qa_eval, qa_eval_rows, args.qa_related))
         if write_eval:
             result['writes'] = evaluate_writes(model, write_eval, args.write_batch)
+            if slot_spans is not None:  # the same sites with their memory slots filled
+                result['writes_filled'] = evaluate_writes(
+                    model, [slot_spans.fill(model, ex) for ex in write_eval], args.write_batch)
+                result['writes_filled']['missing_records'] = slot_spans.missing
         return result
     out = Run(args.output)
     step = 0
@@ -785,6 +841,8 @@ def run(args) -> None:
         elif write_train is not None and draw >= 1 - args.qa_fraction - args.write_fraction:
             examples = [write_example(model, *write_train.sample(rng), args.write_max_tokens,
                                       args.write_space) for _ in range(args.write_batch)]
+            if slot_spans is not None:
+                examples = [slot_spans.fill(model, ex) for ex in examples]
             stream = 'write'
         elif draw < args.classical_fraction:
             samples, budget = [], args.batch_tokens
