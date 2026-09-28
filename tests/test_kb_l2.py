@@ -140,6 +140,25 @@ def test_teacher_and_self_feed_reproduce_the_span_with_gradients_into_the_heads(
     assert model.writer.rep.bias.grad.abs().sum() > 0
 
 
+def test_prefix_carries_gradients_only_when_the_write_inputs_do():
+    """``Model.prefix`` is a no-gradient cache; a replay whose write-site inputs carry
+    gradients (B9's chain through an earlier write's reads) computes it with gradients,
+    the same forward."""
+    from schnitz.kb.producer import prefix_for
+
+    class Cached:
+        @torch.no_grad()
+        def prefix(self, examples):
+            return [2 * ex['inputs'] for ex in examples]
+    model, x = Cached(), torch.randn(3, W)
+    assert not prefix_for(model, [{'inputs': x}])[0].requires_grad
+    x.requires_grad_()
+    got = prefix_for(model, [{'inputs': x}])[0]
+    assert got.requires_grad and torch.equal(got.detach(), model.prefix([{'inputs': x}])[0])
+    with torch.no_grad():
+        assert not prefix_for(model, [{'inputs': x}])[0].requires_grad
+
+
 def test_stage_losses_on_a_kb_of_produced_items(tmp_path):
     model, reader = FakeModel(), tiny_reader()
     kb, spans, _ = build(tmp_path, model, reader)

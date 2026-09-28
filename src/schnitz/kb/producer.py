@@ -88,13 +88,26 @@ def _scope(model):
 
 
 # -- the writer's forward -------------------------------------------------------------------
+def prefix_for(model, examples: Sequence[dict]):
+    """``Model.prefix`` (the write site's cached no-gradient prefix), or, when gradients
+    are enabled and an example's ``inputs`` carry them (B9's chain through an earlier
+    write's reads), the same computation with gradients (``Model.prefix`` is a
+    ``torch.no_grad`` method; its undecorated function computes the same forward)."""
+    wants = torch.is_grad_enabled() and any(
+        torch.is_tensor(ex.get('inputs')) and ex['inputs'].requires_grad for ex in examples)
+    plain = getattr(model.prefix, '__wrapped__', None)   # a bound method forwards it
+    if wants and plain is not None:
+        return plain(model, list(examples))
+    return model.prefix(list(examples))
+
+
 def free_run_grad(model, examples, lengths: list[int]) -> list[Tensor]:
     """``Model.free_run`` with gradients (the same operations, no stop decisions): each
     rep is the writer's rep head on the last state of the span so far, fed back."""
     heads = model.writer
     width = model.decoder.embed_tokens.weight.shape[1]
     reps = [torch.zeros(0, width, device=model.device) for _ in examples]
-    prefix = model.prefix(examples)
+    prefix = prefix_for(model, examples)
 
     def last(*fed):
         return tuple(h[-1:] for h in model.write(examples, list(fed), prefix))
@@ -135,7 +148,7 @@ def write_spans(model, examples: Sequence[dict], counts: Sequence[int], feed: st
             for t, n in zip(fed, counts):
                 if t.shape[0] != n:
                     raise ValueError(f'teacher span has {t.shape[0]} reps, expected {n}')
-        states = model.write(examples, fed, model.prefix(examples))
+        states = model.write(examples, fed, prefix_for(model, examples))
         return [model.writer.rep(h[:-1]).float() for h in states]
 
 

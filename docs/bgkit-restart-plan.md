@@ -798,5 +798,10 @@ log your decisions and changes of direction"), newest last.
   from batch-1 spans by 1.1% on average, up to 29%. At the 136,676 write-site records
   batch 1 would take about 18 h instead of 6-7 h, so the build keeps its batched
   default and `l1 build --help` and the stack doc state that L1b needs
-  `--span-batch-size 1`; `l1 train` keeps warning on other banks. Open: B9 backprop
-  not yet run on the GPU; the smoke banks and K1 stacks have the old space widths.
+  `--span-batch-size 1`; `l1 train` keeps warning on other banks. (5) The write
+  site's prefix cache (`Model.prefix`) is computed without gradients, which cut B9's
+  chain on the real decoder (the tiny test model had no such cache); a replay whose
+  site inputs carry gradients now computes the prefix with them
+  (`producer.prefix_for`, bit-identical forward). B9 GPU smoke (k = 2, 3 rounds):
+  depth-2 replays, exact, 18-26 s per step. Open: the smoke banks and K1 stacks have
+  the old space widths (B9 smoke used random-init codecs at the new ones).
