@@ -666,6 +666,57 @@ def knights(output: Path, examples: int, seed: int) -> dict:
     return writer.close({'domain': domain, 'worked_examples': len(worked)})
 
 
+# -- synthetic people world ---------------------------------------------------------
+def synth_people(output: Path, *, seed: int, people: int, redundancy: int, hops: int,
+                 validation: float, two_hop_rate: float, max_groups: int) -> dict:
+    """A fictional world (``schnitz.synth_world``) whose every asked fact is stated in
+    ``redundancy`` records (bios, rosters, registers, alumni lists); short-answer questions
+    split by person. Each question lists every copy: supports, one sufficient group per
+    copy (2-hop: sampled combinations) and ``alternatives`` per hop."""
+    from schnitz import synth_world
+    _, recs, episodes, summary = synth_world.build(
+        seed, people, redundancy, hops=hops, validation=validation,
+        two_hop_rate=two_hop_rate, max_groups=max_groups)
+    writer = Writer(output, synth_world.DOMAIN)
+    for split, rows in episodes.items():
+        for item in rows:
+            writer.add(split, item, recs if not writer.sources else [])
+    return writer.close({'domain': synth_world.DOMAIN, 'generator': 'schnitz.synth_world',
+                         **summary, 'max_groups': max_groups, 'two_hop_rate': two_hop_rate})
+
+
+# -- verbatim recall from overlapping windows ----------------------------------------
+BACKGROUND = RAW / 'background-20260927'
+
+
+def recall_text(output: Path, *, sources: list[Path], tokenizer: str | None, window: int,
+                redundancy: int, seed: int, validation: float, min_tokens: int,
+                max_tokens: int, continuations: int, middles: int) -> dict:
+    """Wikipedia articles cut into overlapping windows (each token in ``redundancy``
+    records) plus a title record; verbatim continuation, title and middle recall
+    (``schnitz.recall_text``), split by document."""
+    from schnitz import recall_text as rt
+    if window % redundancy:
+        raise ValueError('--window must be a multiple of --redundancy')
+    if tokenizer:
+        from transformers import AutoTokenizer
+        offsets = rt.hf_offsets(AutoTokenizer.from_pretrained(tokenizer))
+    else:
+        offsets = rt.regex_offsets
+    documents = rt.load_wikipedia(sources)
+    recs, episodes, summary = rt.build(
+        documents, offsets, window=window, stride=window // redundancy, seed=seed,
+        validation=validation, min_tokens=min_tokens, max_tokens=max_tokens,
+        continuations=continuations, middles=middles)
+    writer = Writer(output, rt.DOMAIN)
+    for split, rows in episodes.items():
+        for item in rows:
+            writer.add(split, item, recs if not writer.sources else [])
+    return writer.close({'domain': rt.DOMAIN, 'generator': 'schnitz.recall_text',
+                         'sources_files': [str(s) for s in sources],
+                         'tokens': tokenizer or 'regex words and punctuation', **summary})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='dataset', required=True)
@@ -711,6 +762,30 @@ def main() -> None:
     k = sub.add_parser('knights')
     k.add_argument('--examples', type=int, default=20)
     k.add_argument('--seed', type=int, default=0)
+    sp = sub.add_parser('synth-people', help='fictional people world, redundancy-controlled')
+    sp.add_argument('--seed', type=int, default=0)
+    sp.add_argument('--people', type=int, default=20000)
+    sp.add_argument('--redundancy', type=int, default=8, help='records stating each fact')
+    sp.add_argument('--hops', type=int, choices=(1, 2), default=1)
+    sp.add_argument('--two-hop-rate', type=float, default=0.3,
+                    help='with --hops 2: share of people with one 2-hop question')
+    sp.add_argument('--validation', type=float, default=0.1, help='share of people')
+    sp.add_argument('--max-groups', type=int, default=32,
+                    help='2-hop: sampled sufficient groups (one record per hop)')
+    rc = sub.add_parser('recall-text', help='verbatim recall from overlapping windows')
+    rc.add_argument('--sources', type=Path, nargs='+', default=[
+        BACKGROUND / f'wikipedia-{n}/passages.jsonl' for n in ('sql-domains', 'household', 'logic')])
+    rc.add_argument('--tokenizer', default='/runs/hf-models/LFM2.5-350M',
+                    help="tokenizer directory for token windows ('' = regex words)")
+    rc.add_argument('--window', type=int, default=96, help='tokens per window record')
+    rc.add_argument('--redundancy', type=int, default=8,
+                    help='records per token: stride = window / redundancy')
+    rc.add_argument('--seed', type=int, default=0)
+    rc.add_argument('--validation', type=float, default=0.1, help='share of documents')
+    rc.add_argument('--min-tokens', type=int, default=200)
+    rc.add_argument('--max-tokens', type=int, default=1500)
+    rc.add_argument('--continuations', type=int, default=2, help='per document')
+    rc.add_argument('--middles', type=int, default=1, help='per document')
     for s in sub.choices.values():
         s.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -730,6 +805,17 @@ def main() -> None:
         manifest = synlogic(args.output, args.pool, args.min_ascii)
     elif args.dataset == 'knights':
         manifest = knights(args.output, args.examples, args.seed)
+    elif args.dataset == 'synth-people':
+        manifest = synth_people(args.output, seed=args.seed, people=args.people,
+                                redundancy=args.redundancy, hops=args.hops,
+                                validation=args.validation, two_hop_rate=args.two_hop_rate,
+                                max_groups=args.max_groups)
+    elif args.dataset == 'recall-text':
+        manifest = recall_text(args.output, sources=args.sources, tokenizer=args.tokenizer,
+                               window=args.window, redundancy=args.redundancy, seed=args.seed,
+                               validation=args.validation, min_tokens=args.min_tokens,
+                               max_tokens=args.max_tokens, continuations=args.continuations,
+                               middles=args.middles)
     else:
         manifest = sql_corpus(args.output, args.dataset, full_rows=args.full_rows,
                               sample_rows=args.sample_rows, value_limit=args.value_limit,
