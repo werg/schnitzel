@@ -280,7 +280,7 @@ fraction above 50% at x4.
 gated combiner that merged the gold records of one ratio level into one span,
 distilled towards the S2 encoding of the joined gold texts, after a codec stage
 that mapped s0 spans to BGKit's coarser ratios (`scripts/train_bgkit_codecs.py`,
-`scripts/train_bgkit_combiner.py`, `scripts/cache_bgkit_teacher.py --episodes`;
+`scripts/train_bgkit_combiner.py`, removed 28 September, in git history; `scripts/cache_bgkit_teacher.py --episodes`;
 these remain as records of the experiment). What it showed, used by the new
 design:
 
