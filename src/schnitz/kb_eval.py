@@ -57,30 +57,41 @@ def source_composition(lineage: Mapping[str, Weights]) -> dict[str, dict[str, fl
     iterable means equal weights). A contributor that is itself a key of ``lineage``
     is an item (e.g. an input of a rewrite by S_s) and contributes its own
     composition; any other contributor is a source (record id). Shares of an item
-    sum to one; item and source ids must not collide. Cycles raise ``ValueError``."""
+    sum to one; item and source ids must not collide. Cycles raise ``ValueError``.
+    For a KB store, ``KnowledgeBase.lineage()`` gives this mapping with rewrite
+    responsibility shares times input masses as weights. Resolution is iterative, so
+    long supersede or rewrite chains do not hit the recursion limit."""
     done: dict[str, dict[str, float]] = {}
-    active: set[str] = set()
-
-    def resolve(item: str) -> dict[str, float]:
-        if item in done:
-            return done[item]
-        if item in active:
-            raise ValueError(f'Lineage cycle through {item!r}')
-        active.add(item)
-        weights = _weights(lineage[item])
-        total = sum(weights.values())
-        shares: dict[str, float] = {}
-        for contributor, weight in weights.items():
-            if total <= 0 or weight == 0:
+    for root in lineage:
+        active: set[str] = set()
+        stack = [(root, False)]
+        while stack:
+            item, expanded = stack.pop()
+            if item in done:
                 continue
-            parts = resolve(contributor) if contributor in lineage else {contributor: 1.0}
-            for source, share in parts.items():
-                shares[source] = shares.get(source, 0.0) + weight / total * share
-        active.discard(item)
-        done[item] = shares
-        return shares
-
-    return {item: resolve(item) for item in lineage}
+            weights = _weights(lineage[item])
+            if not expanded:
+                if item in active:
+                    raise ValueError(f'Lineage cycle through {item!r}')
+                active.add(item)
+                stack.append((item, True))
+                for contributor in weights:
+                    if contributor in lineage and contributor not in done:
+                        if contributor in active:
+                            raise ValueError(f'Lineage cycle through {contributor!r}')
+                        stack.append((contributor, False))
+                continue
+            total = sum(weights.values())
+            shares: dict[str, float] = {}
+            for contributor, weight in weights.items():
+                if total <= 0 or weight == 0:
+                    continue
+                parts = done[contributor] if contributor in lineage else {contributor: 1.0}
+                for source, share in parts.items():
+                    shares[source] = shares.get(source, 0.0) + weight / total * share
+            active.discard(item)
+            done[item] = shares
+    return {item: done[item] for item in lineage}
 
 
 def effective_count(weights: Iterable[float]) -> dict[str, float]:
