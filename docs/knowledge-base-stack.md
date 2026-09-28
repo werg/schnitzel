@@ -179,70 +179,79 @@ h_i ← h_i + FFN(LN(h_i))
   phase S_s sees no input keys (it must combine by content); afterwards the input
   items' keys are added as source features.
 
-## 5. Training stages
+## 5. Training plan (owner review, 28 September)
 
 Every stage keeps the controls: the same information as text, no memory,
 shuffled neighbourhoods or items, and an equal-byte baseline; content is
 measured in nats over the shuffled control, not only as captured fractions.
-The decoder that reads is the B3 decoder, frozen, unless stated.
 
-- **K1 - Autoencoding through the spaces.** Forward codecs F_s and recombiner R:
-  span → spaces → span. Losses: the frozen decoder reads R's output and
-  reconstructs the source text (NLL) with a KL to reading the original span, plus
-  a light cosine to the original span. Space dropout (each space removed with
-  some probability, at least one kept) forces every space to carry part of the
-  content and R to work with spaces missing. Inputs: first the cached S2 teacher
-  spans of the bank (B1, available now), then the B3 writer's own spans (offline
-  generation by the frozen writer; invariant 1). Gate: reconstruction through the
-  stack close to reading the span itself; each space's ablation costs something.
-- **K2 - Keys.** A key head per space, initialized by distillation from the R5d5
-  key table; query heads likewise from R5d5's routing addresses.
-- **K3a - Superposition operator warm-up, no keys, drop-one.** Neighbourhood of
-  items in space s (nearest neighbours by key), the target item removed; S_s,
-  conditioned on the target key only, produces an item from which R (with the
-  other spaces) reconstructs the target's span. Only needs to be roughly right.
-- **K3b - Rewrite, then recover (the superposition objective).** A neighbourhood
-  of N items is rewritten by S_s into M items (conditioned on target keys; M < N
-  is compaction, M = N pure superposition); then every one of the N originals
-  must be recovered from the rewritten items queried at its own key (S_s again),
-  through R and the decoder. Several records must share each stored item. Input
-  keys become available to S_s here.
-- **K4 - End-to-end reconstruction through retrieval.** Neighbourhoods retrieved
-  from the stored KB per space, S_s, R, decoder: reproduce the original.
-  *Routing through gates:* each space retrieves a generous candidate set and
-  every candidate's gate is derived from its query-key similarity; gates scale
-  mass exactly, so the task loss trains keys and query heads through the gates
-  (the routing half of a mixture of experts). The distilled R5d5 keys are only
-  the starting point.
-- **K5 - End-to-end tasks, decoder frozen.** Only the KB stack trains (codecs,
-  S_s, recombiner, key and query heads). Tasks: SFT on the existing trajectories
-  (B9 task corpora) with their documentation, schemas and background in the KB,
-  and held-out continuation of KB-domain text; QA as a check. Teacher
-  distillation (section 1.1) is a later capability phase, from LFM2.5-1.2B first,
-  then LFM2-24B-A2B.
-- **K6 - Rewriting levels.** Periodic recursive rewriting passes with S_s on
-  stored neighbourhoods, written back; the store is evaluated before and after.
+There is one stack (spaces, operators, key and query heads) and one KB per
+dataset (also the authorization boundary). KBs differ only in their content and
+in the tasks trained over them: the R6 passage corpora (reconstruction, QA,
+text continuation) and the task corpora (tool docs, schemas, background, worked
+examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
 
-### 5.1 Live items: a fast loop to superposition, then learn to reproduce it (owner, 28 September)
+### 5.1 Order
 
-Stored items can be trained directly: gradients from reads update the retrieved
-items in place (sparse updates, optimizer state per item), as in an embedding
-table. This gives a quick loop to real superposition, since items absorb what
-the task needs from many sources (and, in the later distillation phase, a larger
-model's knowledge directly). On their own, trained items would be
-static artifacts that a new corpus cannot produce, which defeats continual
-learning and modularity. So training is split:
-
-- **L1 - Items updated in place.** Starting from items produced by the forward
-  codecs (and the writer), training runs update the items directly (with K4's
-  routing and K5's tasks), with recursive applications of S_s between updates to
-  spread content across items. Items stay versioned with provenance
-  (invariants 1 and 2 hold: this is training, and inference reads stored items).
-- **L2 - Learn to reproduce the trained items.** The writer, forward codecs and
-  recursive applications of S_s are trained to produce the L1 items from the
-  sources alone: the in-place-trained items become distillation targets. The
-  producers then derive superposed items live from a new corpus.
-- Later, S_s can also be distilled on the rewriting trajectories of L1.
+1. **Writer, B3** (running): the decoder writes BGKit-style spans.
+2. **Decoder capabilities, B4 and the soft I/O port** (restart plan), while the
+   decoder still trains: general compression at all ratios, then the soft input
+   port and the soft output port ramped to half of the tasks.
+3. **K1 - Autoencoding through the spaces** (running, in parallel). Forward
+   codecs F_s and recombiner R: span → spaces → span. Losses: the frozen decoder
+   reads R's output and reconstructs the source text (NLL) with a KL to reading
+   the original span, plus a light cosine to the original span. Space dropout
+   forces every space to carry part of the content and R to work with spaces
+   missing. Inputs: first the cached S2 teacher spans (B1), then the writer's
+   own spans (offline generation by the frozen writer; invariant 1). Gate:
+   reconstruction through the stack close to reading the span itself; each
+   space's ablation costs something.
+4. **K2 - Keys.** A key head per space and query heads, initialized by
+   distillation from the R5d5 key table and routing addresses; only a starting
+   point, since L1 trains routing end to end.
+5. **K3a - Superposition operator warm-up** (no keys, drop-one). A neighbourhood
+   of items in space s, the target item removed; S_s, conditioned on the target
+   key only, produces an item from which R reconstructs the target's span. Only
+   needs to be roughly right, so that reads work in L1.
+6. **L1 - Live items, end to end** (the decoder frozen, so knowledge has to land
+   in the KB). Items start as the codecs' output and are then updated in place by
+   gradients from reads (sparse updates, optimizer state per item), a fast loop
+   to real superposition. Jointly trained: items, S_s (as the read-time
+   combiner), R, key and query heads.
+   - *Reads:* between tokens. The query is formed from a middle layer's state
+     at the read position, so retrieval overlaps the rest of that token's forward
+     pass; the result enters as a span after that position, and everything
+     earlier keeps its cache (causal). Reads every chunk of tokens; issuing a
+     query a few tokens before it is needed hides retrieval latency.
+   - *Routing through gates:* each space retrieves a generous candidate set and
+     every candidate's gate comes from its query-key similarity; gates scale mass
+     exactly, so the task loss trains keys and query heads (the routing half of
+     a mixture of experts).
+   - *Tasks:* reconstruction and QA over the R6 KBs, trajectory SFT over the task
+     KBs, continuation of KB-domain text.
+   - *Superposition pressure:* the storage budget and recursive rewriting passes
+     with S_s between updates (section 5.2).
+7. **L2 - Learn to reproduce the live items.** The writer, forward codecs and
+   *recursive* applications of S_s are trained to produce the L1 items from the
+   sources alone: the in-place-trained items are the targets. This is where the
+   rewrite-then-recover objective lives (a neighbourhood rewritten by S_s into M
+   items, M < N compaction, M = N pure superposition; every original recoverable
+   at its own key), with L1's items as targets instead of self-reconstruction.
+   Afterwards the producers derive superposed items live from a new corpus.
+   S_s can also be distilled on L1's rewriting trajectories.
+8. **Recurrence pilot.** The decoder converted to prelude / looped core / coda
+   (`recurrence.md`): the prelude runs uninformed, the query comes from
+   processed states, later core passes see the read results (multi-hop within a
+   step, depth without parameters). It costs core share × extra passes in
+   training FLOPs per token (6 of 16 layers looped: +37.5% for two passes, +75%
+   for three), plus a bridge from span format into the core's residual stream.
+   Compared with between-token reads at matched compute on multi-hop and agent
+   tasks; adopted if it wins.
+9. **B9 loops and continual learning.** Multi-round attempts written back into
+   the per-dataset KBs; new corpora enter through the producers; periodic
+   rewriting; the KB-dependence tests (section 5.2).
+10. **Later:** teacher distillation (section 1.1) and joint co-training of the
+    decoder with the stack under replay.
 
 ### 5.2 Standing requirements
 
@@ -255,25 +264,31 @@ learning and modularity. So training is split:
   the output must follow the KB, not the decoder's weights; removing a domain's
   items must remove the capability; inserting new knowledge must keep old
   knowledge.
-- **Frequent reads.** A parameter store is consulted throughout generation: reads
-  every chunk of tokens or at every loop boundary, queries from hidden states.
-  Reads enter as spliced spans for now (the BGKit scaffold); adding read results
-  into the hidden states, like expert outputs, is a later option.
-- **Routine:** K1 inputs switch to the B3 writer's own spans (offline generation);
-  per-space storage and exact-scan index first, ANN measured separately
-  (invariant 8); operator throughput per read.
+- **Context cost of spliced reads.** A 30-rep span every 64 tokens lengthens a
+  sequence by about 47%; injecting read results into the hidden states, like
+  expert outputs, is the later alternative.
+- **Gradients into producers.** In L1 items are detached from the writer; L2
+  reconnects producers by distillation. Where task gradients must reach a
+  producer directly (B9 across rounds), selective producer replay applies
+  (invariant 3).
+- **Store contracts.** Per-space variable-width items with masses, keys and
+  rewrite lineage extend the mutable-bank (v0.8) and scale-out (v0.9) contracts;
+  exact-scan index first, ANN measured separately (invariant 8).
+- **Writes during trajectories** (B9) need a defined trigger: at episode or
+  round ends first, learned write sites later.
 
 ## 6. Relation to other plan stages
 
-- B2/B3 (writer) feed K1. B4 (general compression) is unchanged.
-- B5 (keys, query diversity) becomes K2 and applies per space; the query
+- B2/B3 (writer) feed K1; B4 and the soft I/O port train the decoder before L1.
+- B5 (keys, query diversity) becomes K2 and L1's routing, per space; the query
   diversity measures (several queries per site, coverage discount, repulsion,
   exploration) carry over unchanged.
-- B6 (reads at loop boundaries) reads through this stack.
+- B6 (reads) is L1's read path; reads at loop boundaries return with the
+  recurrence pilot.
 - B9 (recursive improvement) stores its trajectories through the writer and this
-  stack; one persistent KB per dataset still holds. Rewriting only mixes items
-  within one authorization domain (one KB), and learned selection is never used
-  as authorization (invariant 6).
+  stack; one persistent KB per dataset. Rewriting only mixes items within one KB
+  (one authorization domain), and learned selection is never used as
+  authorization (invariant 6).
 
 ## 7. Costs
 
@@ -295,9 +310,9 @@ are the levers; the dense per-pair form is kept on purpose.
 | Part | State |
 |---|---|
 | Writer (B2/B3) | training (restart plan B3) |
+| B4 general compression, soft I/O port | next after B3 (restart plan) |
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
 | K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
-| K2 keys | not built (R5d5 key table exists) |
-| K3 superposition operator | not built |
-| K4-K6, L1-L2 | not built |
+| K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
+| L1, L2, recurrence pilot | not built |
 | Teacher distributions | later phase; cache script smoke-tested (LFM2.5-1.2B-Base, 300 records: mass sums to 1, true token in the top 32 for 84% of positions); models in `/home/werg/sdkb-runs/hf-models` |

@@ -1,5 +1,5 @@
 """Cache a teacher model's next-token distributions on corpus text
-(docs/knowledge-base-stack.md, section 1.1; K5 distillation target).
+(docs/knowledge-base-stack.md, section 1.1; the later distillation phase).
 
 For every record of a ``sources.jsonl`` corpus the text is tokenized exactly as
 the decoder reads it (``add_special_tokens=False``, at most ``--max-tokens``

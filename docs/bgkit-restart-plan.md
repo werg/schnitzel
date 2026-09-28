@@ -210,7 +210,7 @@ context cap is lifted to BGKit's full range. The stop decision stays the two-way
 head through B3 and becomes the `<|rep|>` / `<|/bg|>` output rows in B4.
 Evaluation adds the replay KL to S2 next to the captured fractions.
 
-**B4 — General compression capability.** Mix BGKit's autoencode and task data
+**B4 — General compression capability** (right after B3, with the soft I/O port). Mix BGKit's autoencode and task data
 with prompted compression ("compress at x16") and reading tasks over the model's
 own spans, so compressed output is a general skill, not only a memory write.
 
@@ -262,7 +262,8 @@ design:
 - A decoder-as-combiner mode (the writer merges retrieved spans under a merge
   prompt) exists (`--combiner decoder`) as a baseline.
 
-**Soft I/O port (owner side quest, 27 September).** For end-to-end
+**Soft I/O port (owner side quest, 27 September; scheduled with B4 right after
+B3, before the decoder freezes for the knowledge-base stack's L1).** For end-to-end
 differentiable subagents: the decoder reads task prompts and questions given as
 BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
 
@@ -288,7 +289,7 @@ BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
   tasks through the port.
 
 **B9 — Recursive improvement through memory (owner direction, 27 September).**
-After the knowledge-base stack reaches end-to-end reconstruction (K4) and the B3
+After the knowledge-base stack reaches end-to-end training on live items (L1) and the B3
 merge.
 On a hard, verifiable task with teacher trajectories, the model runs R = 3–4
 rounds per episode. Round t reads the KB: ground sources, related records, its
@@ -486,3 +487,14 @@ log your decisions and changes of direction"), newest last.
   to flat), for codecs and the recombiner; S_s over unordered neighbourhoods has
   none. K1 restarted from scratch (`kb-k1`); the first run is kept as
   `kb-k1-uniform`.
+- **28 Sep, training plan reviewed (owner).** Order in knowledge-base stack
+  section 5.1: B3 → B4 + soft I/O port (decoder still trains) → K1/K2/K3a in
+  parallel → L1 live items end to end (decoder frozen; items, S_s, recombiner,
+  keys trained together; tasks over all per-dataset KBs) → L2 producers learn to
+  reproduce the live items (absorbs rewrite-then-recover) → recurrence pilot →
+  B9 and continual learning → teacher distillation and joint co-training. Reads
+  first between tokens with the query from a middle layer (retrieval overlaps
+  the rest of the forward pass, caches stay valid); recurrence (reads between
+  looped core passes, owner's preference) follows as a pilot against it at
+  matched compute. One KB per dataset; "retrieval bank" and "agentic KB" are the
+  same kind of KB with different tasks.
