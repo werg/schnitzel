@@ -903,3 +903,13 @@ log your decisions and changes of direction"), newest last.
   real corpora serve. A synthetic fictional-people world (32 vs 4 records per fact)
   is being built as a controlled redundancy knob; high redundancy is expected to be
   key to learning content use.
+- 28 September: redundancy should come with diversity, not verbatim repeats.
+  Overlapping windows of one text are one version stored many times, so they are
+  kept only as a read-path sanity check (`recall-text`). The first diverse probe is
+  parallel-version recall: verse-aligned public-domain Bible translations, with the
+  target version never stored (agent building it). Queued next: scientific background
+  and methods text. Many papers describe the same method, and citation contexts
+  (PMC open-access citances, S2ORC inline citations) group many independent
+  descriptions per cited paper. Its target is the cited paper's abstract or a held-out
+  paper's background paragraph, with the other descriptions in the KB. It waits for
+  the first probes' results.
