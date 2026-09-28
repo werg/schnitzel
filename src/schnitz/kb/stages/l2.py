@@ -46,6 +46,7 @@ from collections import defaultdict
 import dataclasses
 import hashlib
 import json
+import math
 from pathlib import Path
 import random
 import shutil
@@ -58,6 +59,7 @@ from schnitz.kb.bank import SpanCache, Transcripts, kb_dir, read_sources, slots_
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.producer import (FEEDS, L2Weights, Producers, Writer, functional_loss,
                                  item_losses, key_loss, l2_loss, recombine, rewrite_item)
+from schnitz.kb.stack import SPACES
 from schnitz.kb_store import KnowledgeBase, NewItem, Provenance
 
 
@@ -384,7 +386,501 @@ def task_arms(args, model, reader, frozen_layer: int, kbs: dict[str, KnowledgeBa
     texts = {r: v['text'] for r, v in
              read_sources({ep.row['_dir'] for ep in episodes}, wanted).items()}
     reader.eval()
-    return l1.evaluate(ctx, episodes, texts, model.tok)
+    report = l1.evaluate(ctx, episodes, texts, model.tok)
+    report.pop('_per_episode', None)
+    return report
+
+
+# -- the write fit: the S_s stack reproduces the learned rows (``--producer stack``) ----------
+@dataclasses.dataclass
+class RowTargets:
+    """The learned rows of one KB: per space the row ids, values and keys (a frozen export
+    of the read phase's rows KB, or a snapshot of it)."""
+    kb: str                                   # dataset
+    dir: str                                  # KB directory name
+    rows: dict[str, list[str]]
+    values: dict[str, list[torch.Tensor]]
+    keys: dict[str, torch.Tensor]
+
+
+def load_row_targets(root: Path, dirs: dict[str, str]) -> dict[str, RowTargets]:
+    """Row targets of every dataset KB found under ``root`` (``dirs``: dataset -> dir)."""
+    from schnitz.kb.read import current_ids
+    out = {}
+    for name, sub in dirs.items():
+        path = root / sub
+        if not (path / 'manifest.json').exists():
+            continue
+        kb = KnowledgeBase(path)
+        try:
+            rows, values, keys = {}, {}, {}
+            for space in kb.spaces:
+                ids = current_ids(kb, space)
+                if not ids:
+                    continue
+                items = kb.read(space, ids)
+                rows[space] = ids
+                values[space] = [it.values.float() for it in items]
+                keys[space] = torch.stack([it.key.float() for it in items])
+            out[name] = RowTargets(kb.dataset, sub, rows, values, keys)
+        finally:
+            kb.close()
+    return out
+
+
+def latest_snapshot(root: Path) -> tuple[int, Path] | None:
+    """The newest row snapshot of a read phase (``l1 train --export-rows-every``)."""
+    path = root / 'latest.json'
+    if not path.exists():
+        return None
+    info = json.loads(path.read_text())
+    return int(info['step']), root / info['dir']
+
+
+class StackFit:
+    """The write fit over every KB: the leaves (the leaf banks' stored items, in memory),
+    the rows (targets) as anchors, one ``superpose.SuperposedKB`` per KB with the stack's
+    aggregators, and the fit loss (``superpose.fit_losses``) per space plus a balance
+    loss on the rows' loads. Leaf keys are ``head_leaf_key``: the reader's item-key heads
+    on the content plus a free per-leaf correction (``corrections``, zero at the start),
+    both trained. The read side is cut off at the rows' key/value pairs."""
+
+    def __init__(self, ops, heads, config, leaf_banks: Path, manifest: dict, device,
+                 heldout_mod: int):
+        self.ops, self.heads, self.config = ops, heads, config
+        self.device = torch.device(device)
+        self.heldout_mod = heldout_mod
+        self.leaves, self.stored = {}, {}
+        for name, info in manifest['kbs'].items():
+            path = leaf_banks / info['dir']
+            if not (path / 'manifest.json').exists():
+                continue
+            kb = KnowledgeBase(path)
+            self.leaves[name] = kb
+            self.stored[name] = {}
+            for space in kb.spaces:
+                ids = _current(kb, space)
+                self.stored[name][space] = {it.id: (it.values.float().to(self.device),
+                                                    it.key.float().to(self.device))
+                                            for it in kb.read(space, ids)}
+        self.corrections = torch.nn.ParameterDict({
+            f'{name}/{space}': torch.nn.Parameter(torch.zeros(
+                len(items), kb_width(self.leaves[name], space), device=self.device))
+            for name, spaces in self.stored.items() for space, items in spaces.items()})
+        self.index = {name: {space: {i: n for n, i in enumerate(items)}
+                             for space, items in spaces.items()}
+                      for name, spaces in self.stored.items()}
+        self.views: dict = {}
+        self.targets: dict[str, RowTargets] = {}
+        self.usage: dict = {}
+
+    def leaf_key(self, name: str):
+        from schnitz.kb.superpose import head_leaf_key
+
+        def correction(space, item_id, raw):
+            return self.corrections[f'{name}/{space}'][self.index[name][space][item_id]]
+        return head_leaf_key(self.heads, correction)
+
+    def values_fn(self, name: str):
+        def values(space, ids):
+            return [self.stored[name][space][i] for i in ids]
+        return values
+
+    def load(self, targets: dict[str, RowTargets], step: int = 0) -> dict:
+        """New row targets: views anchored at the rows, candidates from the leaves' keys."""
+        from schnitz.kb.superpose import SuperposedKB
+        self.targets = {k: t for k, t in targets.items() if k in self.leaves}
+        self.views, stats = {}, {}
+        for name, t in self.targets.items():
+            view = SuperposedKB(self.leaves[name], self.ops, self.config,
+                                {s: (t.rows[s], t.keys[s], [v.shape[0] for v in t.values[s]])
+                                 for s in t.rows},
+                                values_fn=self.values_fn(name), leaf_key=self.leaf_key(name),
+                                device=self.device, live=False)
+            stats[name] = view.rebuild(step, reanchor=False, rekey=False)
+            self.views[name] = view
+        return stats
+
+    def refield(self, fields: dict[str, float], step: int) -> None:
+        for view in self.views.values():
+            view.refield({s: f for s, f in fields.items() if s in view.graphs}, step)
+
+    def split(self, held: bool) -> dict[str, list[tuple[str, int]]]:
+        """(KB, row index) per space, the held-out rows (hash bucket 0) or the others."""
+        out: dict[str, list[tuple[str, int]]] = {}
+        for name, t in self.targets.items():
+            for space, ids in t.rows.items():
+                for n, row in enumerate(ids):
+                    if heldout(row, self.heldout_mod) == held:
+                        out.setdefault(space, []).append((name, n))
+        return out
+
+    def _leaf(self, name: str):
+        view, key = self.views[name], self.leaf_key(name)
+
+        def leaf(space, ids):
+            g = view.graphs[space]
+            out = []
+            for i in ids:
+                value, raw = self.stored[name][space][i]
+                out.append((value, key(space, i, value, raw),
+                            torch.tensor(float(g.mass[g.index[i]]), device=self.device)))
+            return out
+        return leaf
+
+    def loss(self, picks: dict[str, list[tuple[str, int]]], weights,
+             balance: float = 0.0) -> tuple[torch.Tensor, dict]:
+        from schnitz.kb.losses import UsageEMA, balance_loss
+        from schnitz.kb.superpose import fit_losses
+        total, logged = None, {}
+        count = sum(len(r) for r in picks.values())
+        for space, rows in picks.items():
+            for name in dict.fromkeys(n for n, _ in rows):
+                t, view = self.targets[name], self.views[name]
+                idx = [n for k, n in rows if k == name]
+                loss, parts, loads = fit_losses(view, space, [t.rows[space][n] for n in idx],
+                                                [t.values[space][n] for n in idx],
+                                                t.keys[space][idx], self._leaf(name),
+                                                (weights.cos, weights.mse, weights.key))
+                loss = loss * len(idx) / count
+                if balance:
+                    key = f'{name}/{space}'
+                    usage = self.usage.setdefault(key, UsageEMA(len(t.rows[space])))
+                    ids = torch.tensor(idx)
+                    b = balance_loss(ids, loads.cpu(), usage)
+                    usage.update(ids, loads.detach().cpu())
+                    loss = loss + balance * b * len(idx) / count
+                    logged.setdefault('balance', []).append(b.item())
+                total = loss if total is None else total + loss
+                for k, v in parts.items():
+                    logged.setdefault(f'{k}_{space}', []).append(v)
+        return total, {k: round(sum(v) / len(v), 5) for k, v in logged.items()}
+
+    @torch.no_grad()
+    def measure(self, picks: dict[str, list[tuple[str, int]]], views=None) -> dict:
+        """Reproduction per space (1 - cosine, relative MSE, key cosine) of the rows,
+        computed fresh."""
+        from schnitz.kb.producer import item_losses
+        views = views or self.views
+        out: dict[str, list[float]] = {}
+        for view in views.values():
+            view.clear()
+        for space, rows in picks.items():
+            for name, n in rows:
+                t, view = self.targets[name], views[name]
+                g = view.graphs[space]
+                row = t.rows[space][n]
+                if row not in g.top_index:
+                    continue
+                value, key, _ = view.item(space, g.depth, g.top_index[row])
+                got = item_losses({space: value}, {space: t.values[space][n]})
+                out.setdefault(f'cos_{space}', []).append(got[f'cos_{space}'].item())
+                out.setdefault(f'mse_{space}', []).append(got[f'mse_{space}'].item())
+                out.setdefault(f'keycos_{space}', []).append(float(F.cosine_similarity(
+                    key.cpu(), t.keys[space][n], dim=-1)))
+        return {k: round(sum(v) / len(v), 5) for k, v in sorted(out.items())} | \
+            {'rows': sum(len(r) for r in picks.values())}
+
+    def write_stats(self) -> dict:
+        """Per KB and space: share entropy, row load distribution, churn, tau."""
+        return {name: {s: view.write_stats(s) for s in view.graphs}
+                for name, view in self.views.items()}
+
+    def cost(self, picks, weights, fields: dict[str, float], step: int) -> dict:
+        """Time and peak memory of one fit forward and backward at the given field sizes
+        (no optimizer step; gradients are dropped)."""
+        self.refield(fields, step)
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
+        loss, _ = self.loss(picks, weights)
+        loss.backward()
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        out = {'step_s': round(time.time() - t0, 3),
+               'peak_gb': round(torch.cuda.max_memory_allocated() / 2**30, 3)
+               if self.device.type == 'cuda' else None}
+        for p in list(self.ops.parameters()) + list(self.heads.parameters()) + \
+                list(self.corrections.parameters()):
+            p.grad = None
+        return out
+
+    def density(self, fraction: float, picks, step: int) -> dict:
+        """The fit on KBs with only a ``fraction`` of the rows (every k-th row; the same
+        leaves), so every field is larger: robustness to KB density."""
+        from schnitz.kb.superpose import SuperposedKB
+        keep = max(1, round(1 / fraction))
+        views = {}
+        for name, t in self.targets.items():
+            rows = {s: ([r for n, r in enumerate(t.rows[s]) if n % keep == 0],
+                        t.keys[s][::keep], [v.shape[0] for v in t.values[s][::keep]])
+                    for s in t.rows}
+            view = SuperposedKB(self.leaves[name], self.ops, self.config, rows,
+                                values_fn=self.values_fn(name), leaf_key=self.leaf_key(name),
+                                device=self.device, live=False)
+            view.rebuild(step, reanchor=False, rekey=False)
+            views[name] = view
+        kept = {s: [(k, n) for k, n in rows if n % keep == 0] for s, rows in picks.items()}
+        return self.measure(kept, views)
+
+    def export(self, dest: Path, step: int) -> dict[str, KnowledgeBase]:
+        """The stack's rows as frozen KBs (``SuperposedKB.export``), one per dataset."""
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
+        out = {}
+        for name, view in self.views.items():
+            view.export(dest / self.targets[name].dir, step=step).close()
+            out[name] = KnowledgeBase(dest / self.targets[name].dir)
+        return out
+
+    def state(self) -> dict:
+        return {'heads': self.heads.state_dict(),
+                'corrections': {k: v.detach().cpu() for k, v in self.corrections.items()},
+                'correction_ids': {name: {s: list(items) for s, items in spaces.items()}
+                                   for name, spaces in self.stored.items()}}
+
+    def close(self) -> None:
+        for kb in self.leaves.values():
+            kb.close()
+
+
+def kb_width(kb: KnowledgeBase, space: str) -> int:
+    return kb.spaces[space].key_width
+
+
+def _open_kbs(root: Path, dirs: dict[str, str]) -> dict[str, KnowledgeBase]:
+    return {name: KnowledgeBase(root / sub) for name, sub in dirs.items()
+            if (root / sub / 'manifest.json').exists()}
+
+
+def stack_task_arms(args, model, reader, kbs: dict[str, KnowledgeBase], transcripts) -> dict:
+    report = task_arms(args, model, reader, args.query_layer, kbs, transcripts,
+                       args.eval_episodes)
+    report.pop('superposition_kbs', None)
+    return report
+
+
+def train_stack(args) -> None:
+    """``l2 train --producer stack``: the write fit (see ``StackFit``). Targets: the rows of
+    a read phase (``--l1-run`` exported at its checkpoint, or ``--targets``), or the newest
+    snapshot under ``--follow-snapshots`` (reloaded when a newer one appears). Each step
+    draws a level-1 field size per space log-uniformly from its ``--field`` range. The fit
+    needs no decoder; each evaluation reports the fit (held-out and training rows) at the
+    nominal field size, a sweep of field sizes (quality, time and peak memory per step),
+    KBs with half and a quarter of the rows, the write side's shares, loads and churn,
+    and with ``--eval-episodes`` L1's arms with the read phase's reader on the rows
+    (targets) and on the stack's rows; ``--stack-eval-banks`` builds rows for other banks
+    through the stack alone."""
+    from schnitz.kb.stack import KeyHeads
+    from schnitz.kb.stages.l1 import load_stack, superpose_config
+    from schnitz.kb.superpose import WriteOps
+    l1_config = _l1_config(args)
+    for name in ('checkpoint', 'reader_state', 'banks'):
+        if getattr(args, name) is None and l1_config.get(name):
+            setattr(args, name, Path(l1_config[name]))
+    if args.banks is None:
+        raise SystemExit('--banks (a rows banks dir, l1 rows) is needed (or --l1-run)')
+    if args.experiment is None:
+        args.experiment = l1_config.get('experiment', 'bgkit2_s2_showcase')
+    if args.query_layer is None:
+        args.query_layer = int(l1_config.get('query_layer', 8))
+    manifest = json.loads((args.banks / 'banks.json').read_text())
+    if 'rows' not in manifest:
+        raise SystemExit(f'{args.banks} is not a rows banks dir (train.py l1 rows)')
+    trained = set((args.train or 'operators,keys').split(','))
+    if trained - {'operators', 'keys'}:
+        raise SystemExit('the write fit trains the aggregators (operators) and the leaves\' '
+                         'key heads and corrections (keys); writer/codecs through the stack: '
+                         'not built')
+    out = Run(args.output)
+    dirs = {name: info['dir'] for name, info in manifest['kbs'].items()}
+    snapshot_step = -1
+    reader_pt = args.l1_run / 'reader.pt' if args.l1_run else args.l1_reader
+    if args.follow_snapshots:
+        found = latest_snapshot(args.follow_snapshots)
+        if found is None:
+            raise SystemExit(f'no snapshot under {args.follow_snapshots} yet')
+        snapshot_step, targets_dir = found
+        reader_pt = targets_dir / 'reader.pt'
+    else:
+        targets_dir = args.targets or args.output / 'targets'
+        if not (targets_dir / 'targets.json').exists() and args.targets is None:
+            if args.l1_run is None:
+                raise SystemExit('train needs --targets, --l1-run or --follow-snapshots')
+            print(json.dumps({'export': export_targets(args.l1_run, targets_dir,
+                                                       args.output / 'scratch')}), flush=True)
+    _, _, dims = load_stack(args.banks / 'stack.pt', 1.0, 'cpu', args.seed)
+    config = superpose_config(args, manifest['rows'].get('config'))
+    config.depth = args.stack_depth
+    device = 'cuda' if torch.cuda.is_available() and args.cuda_fraction > 0 else 'cpu'
+    if device == 'cuda':
+        torch.cuda.set_per_process_memory_fraction(args.cuda_fraction)
+    torch.manual_seed(args.seed)
+    ops = WriteOps(config.depth, dims, config.per_level, temperature=config.temperature)
+    if args.stack_init:
+        state = torch.load(args.stack_init, map_location='cpu', weights_only=False)
+        if 'stack' in state:
+            ops.load_state_dict(state['stack'])
+        else:
+            print(json.dumps({'stack_init_tensors': ops.load_init(state.get('state', state))}),
+                  flush=True)
+    # the leaves' key heads: the read phase's item-key heads (unused by its learned keys,
+    # so the heads the leaves' stored keys came from)
+    reader_state = torch.load(reader_pt, map_location='cpu', weights_only=False)
+    read_config = reader_state.get('config', {})
+    heads = KeyHeads(read_config.get('hidden', 1024), read_config.get('key_hidden', 512))
+    heads.load_state_dict({k[len('keys.'):]: v for k, v in reader_state['reader'].items()
+                           if k.startswith('keys.')})
+    ops.to(device)
+    heads.to(device)
+    fit = StackFit(ops, heads, config, Path(manifest['rows']['leaves']), manifest, device,
+                   args.heldout_mod)
+    rng = random.Random(args.seed)
+    step = 0
+    state = out.load('producers.pt', 'cpu')
+    if state is not None:
+        ops.load_state_dict(state['stack'])
+        heads.load_state_dict(state['heads'])
+        for k, v in state['corrections'].items():
+            fit.corrections[k].data.copy_(v)
+        step = state['step']
+        rng.setstate(state['rng'])
+        snapshot_step = state.get('targets_step', snapshot_step)
+    budgets = fit.load(load_row_targets(targets_dir, dirs), step)
+    params = list(ops.parameters())
+    if 'keys' in trained:
+        params += list(heads.item.parameters()) + list(fit.corrections.parameters())
+    else:
+        for p in list(heads.parameters()) + list(fit.corrections.parameters()):
+            p.requires_grad_(False)
+    optimizer, schedule = warmup_optimizer(params, args.warmup, step, lr=args.lr,
+                                           weight_decay=0.0)
+    if state is not None:
+        optimizer.load_state_dict(state['optimizer'])
+    weights = L2Weights.parse(args.weights)
+    out.write_config(dict(vars(args), producer='stack', superpose=dataclasses.asdict(config),
+                          targets_dir=str(targets_dir), rows_budget=budgets,
+                          trained=sorted(trained),
+                          trained_params=sum(p.numel() for p in params)))
+    train_split, held_split = fit.split(False), fit.split(True)
+    nominal = {s: config.field_size(s) for s in SPACES}
+    model = reader = None
+
+    def evaluate(tag: int) -> None:
+        nonlocal model, reader
+        sample = {s: random.Random(1).sample(rows, min(len(rows), args.eval_records))
+                  for s, rows in train_split.items()}
+        held = {s: rows[:args.eval_records] for s, rows in held_split.items()}
+        fit.refield(nominal, tag)
+        report = {'heldout': fit.measure(held), 'train_sample': fit.measure(sample),
+                  'write': fit.write_stats()}
+        sweep = {}
+        batch = {s: rows[:args.batch_size] for s, rows in train_split.items()}
+        for name, pick in (('min', 0), ('mid', 1), ('max', 2), ('beyond', 3)):
+            fields = {}
+            for s in SPACES:
+                lo, hi = config.field_range(s)
+                fields[s] = (lo, math.sqrt(lo * hi), hi, 2 * hi)[pick]
+            fit.refield(fields, tag)
+            sweep[name] = {'field': {s: round(f, 1) for s, f in fields.items()},
+                           'heldout': fit.measure(held),
+                           **fit.cost(batch, weights, fields, tag)}
+        report['field_sweep'] = sweep
+        fit.refield(nominal, tag)
+        report['density'] = {f'{int(100 * f)}%': fit.density(f, held, tag) for f in (0.5, 0.25)}
+        if args.eval_episodes:
+            if model is None:
+                from schnitz.kb.stages.l1 import load_model
+                model = load_model(args)
+            if reader is None:
+                reader, _ = load_reader(model, args.banks, reader_pt, args.seed)
+            transcripts = [Path(p) for p in manifest['transcripts']]
+            targets = _open_kbs(targets_dir, dirs)
+            produced = fit.export(args.output / 'produced', tag)
+            report['task_arms'] = {'rows': stack_task_arms(args, model, reader, targets,
+                                                           transcripts),
+                                   'stack': stack_task_arms(args, model, reader, produced,
+                                                            transcripts)}
+            for kbs in (targets, produced):
+                for kb in kbs.values():
+                    kb.close()
+            if args.stack_eval_banks:
+                report['new_banks'] = stack_new_banks(args, model, reader, fit, config, tag)
+        out.log({'step': tag, 'targets_step': snapshot_step, 'eval': report})
+
+    if step == 0 and args.eval_every:
+        evaluate(0)
+    window = Window()
+    started = time.time()
+    while step < args.steps:
+        picks = {s: [rows[rng.randrange(len(rows))] for _ in range(args.batch_size)]
+                 for s, rows in train_split.items() if rows}
+        fields = {s: config.sample_field(s, rng) for s in SPACES}
+        fit.refield(fields, step)
+        if device == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
+        optimizer.zero_grad(set_to_none=True)
+        loss, parts = fit.loss(picks, weights, args.balance_weight)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, args.clip)
+        optimizer.step()
+        schedule.step()
+        step += 1
+        window.add({'loss': loss.item(), **parts, 'step_s': time.time() - t0,
+                    **{f'field_{s}': f for s, f in fields.items()},
+                    **({'peak_gb': torch.cuda.max_memory_allocated() / 2**30}
+                       if device == 'cuda' else {})})
+        if step % args.log_every == 0:
+            out.log({'step': step, **window.means(), 'elapsed_s': round(time.time() - started)})
+        if args.follow_snapshots and step % max(1, args.follow_every) == 0:
+            found = latest_snapshot(args.follow_snapshots)
+            if found is not None and found[0] > snapshot_step:
+                snapshot_step, targets_dir = found
+                reader_pt, reader = targets_dir / 'reader.pt', None
+                fit.load(load_row_targets(targets_dir, dirs), step)
+                train_split, held_split = fit.split(False), fit.split(True)
+                out.log({'step': step, 'targets_step': snapshot_step, 'reloaded': str(targets_dir)})
+        if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
+            out.save('producers.pt', {'stack': ops.state_dict(), **fit.state(),
+                                      'optimizer': optimizer.state_dict(), 'step': step,
+                                      'rng': rng.getstate(), 'targets_step': snapshot_step,
+                                      'superpose': dataclasses.asdict(config)})
+            evaluate(step)
+    fit.close()
+
+
+def stack_new_banks(args, model, reader, fit: StackFit, config, step: int) -> dict:
+    """Rows for other banks through the stack alone (no L1): per KB a rows KB placed and
+    initialized by ``build_rows`` (the untrained field mean), then the stack's rows at
+    those anchors (leaf keys from the fit's heads, no corrections: the items are new);
+    L1's arms on the mean-initialized rows, the stack's rows and the leaves themselves."""
+    from schnitz.kb.superpose import SuperposedKB, build_rows, head_leaf_key, rows_of
+    banks = args.stack_eval_banks
+    manifest = json.loads((banks / 'banks.json').read_text())
+    work = args.output / 'new_banks'
+    shutil.rmtree(work, ignore_errors=True)
+    arms = {'leaves': {}, 'mean_rows': {}, 'stack_rows': {}}
+    key = head_leaf_key(fit.heads, lambda space, item_id, raw: torch.zeros_like(raw))
+    for name, info in manifest['kbs'].items():
+        leaves = KnowledgeBase(banks / info['dir'])
+        rows_kb, _ = build_rows(leaves, work / 'mean' / info['dir'], config)
+        view = SuperposedKB(leaves, fit.ops, config, rows_of(rows_kb), leaf_key=key,
+                            device=fit.device, live=False)
+        view.rebuild(step, reanchor=False, rekey=False)
+        rows_kb.close()
+        view.export(work / 'stack' / info['dir'], step=step).close()
+        arms['leaves'][name] = leaves
+        arms['mean_rows'][name] = KnowledgeBase(work / 'mean' / info['dir'])
+        arms['stack_rows'][name] = KnowledgeBase(work / 'stack' / info['dir'])
+    transcripts = [Path(p) for p in manifest['transcripts']]
+    report = {arm: stack_task_arms(args, model, reader, kbs, transcripts)
+              for arm, kbs in arms.items()}
+    for kbs in arms.values():
+        for kb in kbs.values():
+            kb.close()
+    return report
 
 
 # -- stage -------------------------------------------------------------------------------
@@ -424,6 +920,9 @@ def load_reader(model, banks: Path, reader_state: Path | None, seed: int):
 
 
 def train(args) -> None:
+    if args.producer == 'stack':
+        train_stack(args)
+        return
     from schnitz.kb.stages.l1 import load_model
     l1_config = _l1_config(args)
     for name in ('checkpoint', 'reader_state', 'banks'):
@@ -450,7 +949,7 @@ def train(args) -> None:
     model = load_model(args)
     reader_pt = args.l1_run / 'reader.pt' if args.l1_run else args.l1_reader
     reader, config = load_reader(model, args.banks, reader_pt, args.seed)
-    trained = set(args.train.split(','))
+    trained = set((args.train or 'writer').split(','))
     params = []
     for name in ('rep', 'ratio'):
         if 'writer' in trained:
@@ -587,8 +1086,32 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                              "span (teacher), one gradient pass on its own free run (self), or "
                              "the free run replayed with gradients through every step (free, "
                              "L1b's replay)")
-    parser.add_argument('--train', default='writer',
-                        help='comma list of writer (span heads), codecs, operators (S_s)')
+    parser.add_argument('--train', default=None,
+                        help='comma list of writer (span heads), codecs, operators (S_s); '
+                             'default writer (--producer record), operators (stack)')
+    parser.add_argument('--producer', choices=('record', 'stack'), default='record',
+                        help='record: each record\'s producer path reproduces its L1a items; '
+                             'stack: the write fit, S_s levels over the leaves regress the read '
+                             'phase\'s rows (values and keys; no decoder in the loop)')
+    parser.add_argument('--stack-depth', type=int, default=2, help='stack: aggregator levels L')
+    parser.add_argument('--stack-init', type=Path,
+                        help='stack: initial aggregators (a stack producers.pt, or per-space '
+                             'operator weights such as K3\'s)')
+    parser.add_argument('--field', help='stack: level-1 field size per space, a number or a '
+                                     'range sampled log-uniformly per step, e.g. '
+                                     'A=4:16,B=8:32,C=8:32,D=8:32 (default: the rows KB\'s)')
+    parser.add_argument('--overlap', type=int, help='stack: fields each input joins (3)')
+    parser.add_argument('--temperature', type=float, help='stack: share temperature (0.1)')
+    parser.add_argument('--follow-snapshots', type=Path,
+                        help='stack: fit the newest row snapshot under this dir (l1 train '
+                             '--export-rows-every) and reload when a newer one appears')
+    parser.add_argument('--follow-every', type=int, default=50,
+                        help='stack: steps between checks for a newer snapshot')
+    parser.add_argument('--balance-weight', type=float, default=0.01,
+                        help='stack: balance loss on the rows\' loads (against collapse)')
+    parser.add_argument('--stack-eval-banks', type=Path,
+                        help='stack: other banks (l1 build) to build rows for through the stack '
+                             'alone and evaluate (with --eval-episodes)')
     parser.add_argument('--neighbour-keys', action='store_true', help='S_s with input keys (K3b)')
     parser.add_argument('--weights', default='cos=1,mse=1,key=1,kl=1')
     parser.add_argument('--steps', type=int, default=2000)

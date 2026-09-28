@@ -101,8 +101,9 @@ from schnitz.kb.bank import (SpanCache, Transcripts, build_caches, kb_dir, read_
                              record_sources, slots_of)
 from schnitz.kb.decoder import LEVELS, length_factors
 from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, producer_params
-from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, L1Reader,
-                             ReadConfig, producer_index, source_index, splice)
+from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
+                             L1Reader, ReadConfig, current_ids, producer_index, source_index,
+                             splice)
 from schnitz.kb.stack import KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
@@ -309,9 +310,13 @@ class Context:
     """What a pass needs: the frozen decoder, the reader, the KBs and their item index."""
 
     def __init__(self, frozen: Frozen, reader: L1Reader, kbs: dict[str, KnowledgeBase],
-                 autocast=None):
+                 autocast=None, views: dict | None = None):
         self.frozen, self.reader, self.kbs = frozen, reader, kbs
         self.autocast = autocast or frozen.autocast
+        # --rows-from-stack: per dataset a ``superpose.SuperposedKB`` whose rows (combiner
+        # outputs over this KB's items, the leaves) are what reads see
+        self.views = views or {}
+        self.key_optimizer = None      # learned keys (``read.KeyOptimizer``), set by train
         # item id -> (producer, sources) of the current items, per KB and space
         self.origin = {name: {s: producer_index(kb, s) for s in kb.spaces}
                        for name, kb in kbs.items()}
@@ -322,14 +327,26 @@ class Context:
                         for name, spaces in self.origin.items()}
         self._rows: dict[tuple[str, str], tuple[int, dict[str, int]]] = {}
 
+    def new_cache(self, train: bool, step: int = 0, producer=None):
+        """The step's item cache: an ``ItemCache``, or with views a ``SuperposedCache``."""
+        if self.views:
+            from schnitz.kb.superpose import SuperposedCache
+            return SuperposedCache(self.views, self.frozen.device, train=train, step=step,
+                                   producer=producer)
+        return ItemCache(self.frozen.device, train=train)
+
     def added(self, dataset: str, space: str, ids: list[str], producer: str,
               sources: list[tuple[str, ...]]) -> None:
-        """Items committed during training (writes): origin, written set, row cache."""
+        """Items committed during training (writes): origin, written set, row cache; with
+        views the new leaves are placed into the fields of their nearest rows."""
         for item_id, src in zip(ids, sources):
             self.origin[dataset][space][item_id] = (producer, src)
             if producer == 'write':
                 self.written[dataset][space].add(item_id)
         self._rows.pop((dataset, space), None)
+        view = self.views.get(dataset)
+        if view is not None and space in view.graphs and ids:
+            view.insert(space, ids)
 
     def own_writes(self, ep: Episode) -> dict[str, set[tuple[str, str]]]:
         """An episode's own write items per space: never retrieved by its own reads (a
@@ -403,7 +420,8 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            gold=mode == 'gold', negatives=negatives,
                                            exclude=exclude,
-                                           producer=None if mode == 'gold' else producer,
+                                           producer=None if mode == 'gold'
+                                           or getattr(cache, 'superposed', False) else producer,
                                            weights=weights)
                 reads.append(read)
                 spans.append(read.span.float().detach() if retrieval_only
@@ -681,11 +699,13 @@ def open_live(banks: Path, output: Path, device=None,
     return kbs
 
 
-def _read_stats(reads, sink: dict, written: dict | None = None) -> None:
+def _read_stats(reads, sink: dict, written: dict | None = None, cache=None) -> None:
     """Per-read statistics; with ``written`` (dataset -> space -> ids of written items)
     also how often a read retrieves items written by earlier episodes (``written_s``:
     share of reads with a written item among those read; ``written_mass_s``: share of
-    the read's gate mass on written items). Own writes are excluded from reads."""
+    the read's gate mass on written items). Own writes are excluded from reads. With a
+    superposed ``cache`` a row counts by the share of its mass from written leaves."""
+    shared = getattr(cache, 'superposed', False)
     for read in reads:
         sink.setdefault('n', []).append(read.n)
         for key, value in read.recall_at.items():
@@ -700,11 +720,15 @@ def _read_stats(reads, sink: dict, written: dict | None = None) -> None:
                 if info.recomputed:
                     sink.setdefault(f'recomputed_{s}', []).append(info.recomputed / len(info.refs))
             if written is not None and info.refs:
-                hit = [i in written.get(d, {}).get(s, ()) for d, i in info.refs]
+                if shared:
+                    share = [cache.share_of(d, s, i, set(written.get(d, {}).get(s, ())))
+                             for d, i in info.refs]
+                else:
+                    share = [float(i in written.get(d, {}).get(s, ())) for d, i in info.refs]
                 gates = info.gates.float()
-                sink.setdefault(f'written_{s}', []).append(float(any(hit)))
+                sink.setdefault(f'written_{s}', []).append(float(any(x > 0 for x in share)))
                 sink.setdefault(f'written_mass_{s}', []).append(
-                    float(gates[torch.tensor(hit)].sum() / gates.sum().clamp_min(1e-12)))
+                    float((gates * torch.tensor(share)).sum() / gates.sum().clamp_min(1e-12)))
 
 
 def _mean(sink: dict) -> dict:
@@ -720,26 +744,27 @@ def retrieval_weight(args, step: int) -> float:
     return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
 
 
-def _balance(ctx: Context, reads, usage: dict) -> torch.Tensor | None:
+def _balance(ctx: Context, reads, usage: dict, cache=None) -> torch.Tensor | None:
     """Spread-out use (stack doc 5.2): ``balance_loss`` per (KB, space) over every
     scored (read, candidate) pair of the episode's reads, averaged; updates the
     usage averages with the read mass. Indexed by store row (superseded rows keep
-    their slot)."""
+    their slot), or with a superposed cache by the view's row slots."""
     from schnitz.kb.losses import UsageEMA, balance_loss
+    shared = getattr(cache, 'superposed', False)
     pairs: dict[tuple[str, str], tuple[list[int], list[torch.Tensor]]] = {}
     for read in reads:
         for s, info in read.spaces.items():
             if info.scored_gates is None:
                 continue
             for (dataset, item_id), gate in zip(info.scored, info.scored_gates):
-                rows = ctx.rows(dataset, s)
+                rows = cache.rows(dataset, s) if shared else ctx.rows(dataset, s)
                 entry = pairs.setdefault((dataset, s), ([], []))
                 entry[0].append(rows[item_id])
                 entry[1].append(gate)
     losses = []
     for (dataset, s), (ids, gates) in pairs.items():
         key = f'{dataset}/{s}'
-        size = len(ctx.kbs[dataset]._row_ids[s])
+        size = len(cache.rows(dataset, s)) if shared else len(ctx.kbs[dataset]._row_ids[s])
         if key not in usage:
             usage[key] = UsageEMA(size)
         usage[key].grow(size)
@@ -768,28 +793,54 @@ def batch_negatives(ctx: Context, episodes: list[Episode], limit: int,
     return out
 
 
-# which parameter sets train in each phase (``--l1b-train`` chooses L1b's)
-PHASE_SETS = ('keys', 'operators', 'recombiner', 'codecs', 'writer')
+# which parameter sets train in each phase (``--l1b-train`` chooses L1b's). ``write``: the
+# aggregators of ``--rows-from-stack`` (empty otherwise)
+PHASE_SETS = ('keys', 'operators', 'recombiner', 'codecs', 'writer', 'write')
 L1A_SET = ('keys', 'operators', 'recombiner')
+READ_SET = ('keys', 'operators', 'recombiner')
+WRITE_SET = ('write',)
+PHASES = {'a': 'l1a', 'b': 'l1b', 'r': 'r', 'w': 'w'}
 
 
-def parameter_sets(reader: L1Reader, writer_model=None) -> dict[str, list]:
-    """The trainable parameter sets: key heads and gate offsets, S_s, R, the codecs
-    and the writer's span heads (marker, ratio code, rep head)."""
+def parameter_sets(reader: L1Reader, writer_model=None, write_ops=None) -> dict[str, list]:
+    """The trainable parameter sets: key heads and gate offsets, S_s (read-time combine,
+    ``--read-combine s_s``), R (the read's), the codecs, the writer's span heads (marker,
+    ratio code, rep head) and the aggregators (``--rows-from-stack``)."""
     return {'keys': list(reader.keys.parameters()) + list(reader.gate_offset.parameters()),
             'operators': list(reader.operators.parameters()),
-            'recombiner': list(reader.stack.recombiner.parameters()),
-            **producer_params(writer_model, reader.stack)}
+            'recombiner': list(reader.recombiner.parameters()),
+            **producer_params(writer_model, reader.stack),
+            'write': [] if write_ops is None else list(write_ops.parameters())}
+
+
+def phase_set(phase: str, args, l1b_set=()) -> tuple[str, ...]:
+    """The sets a phase trains: ``l1a`` the read side, with ``--rows-from-stack`` also the
+    aggregators (only on consolidation steps when ``--consolidate-every``); ``r`` the read
+    side; ``w`` the aggregators (the leaves or rows move by their live update); ``l1b``
+    ``--l1b-train``."""
+    if phase == 'l1b':
+        return tuple(l1b_set)
+    if phase == 'r':
+        return READ_SET
+    if phase == 'w':
+        return WRITE_SET
+    joint = getattr(args, 'rows_from_stack', None) and not getattr(args, 'consolidate_every', 0)
+    return L1A_SET + (WRITE_SET if joint else ())
 
 
 def optimizer_groups(sets: dict[str, list], args) -> list[dict]:
     """AdamW groups: the reader (keys, S_s, R) at ``--lr``; the producers at their own
     L1b rates (``--l1b-codec-lr``, ``--l1b-writer-lr``), since one step at the reader's
-    rate moved the recomputed items by 25-45%."""
-    return [{'params': [p for name in ('keys', 'operators', 'recombiner') for p in sets[name]],
-             'lr': args.lr, 'weight_decay': 0.01},
-            {'params': sets['codecs'], 'lr': args.l1b_codec_lr, 'weight_decay': 0.01},
-            {'params': sets['writer'], 'lr': args.l1b_writer_lr, 'weight_decay': 0.0}]
+    rate moved the recomputed items by 25-45%; the aggregators (``--rows-from-stack``)
+    at ``--write-lr``."""
+    groups = [{'params': [p for name in ('keys', 'operators', 'recombiner') for p in sets[name]],
+               'lr': args.lr, 'weight_decay': 0.01},
+              {'params': sets['codecs'], 'lr': args.l1b_codec_lr, 'weight_decay': 0.01},
+              {'params': sets['writer'], 'lr': args.l1b_writer_lr, 'weight_decay': 0.0}]
+    if sets.get('write'):
+        groups.append({'params': sets['write'], 'lr': getattr(args, 'write_lr', None) or args.lr,
+                       'weight_decay': 0.01})
+    return groups
 
 
 def set_phase(sets: dict[str, list], names) -> list:
@@ -804,23 +855,27 @@ def set_phase(sets: dict[str, list], names) -> list:
 
 
 def parse_schedule(text: str | None, phase: str) -> list[tuple[str, int]]:
-    """``a:2000,b:500`` -> [('l1a', 2000), ('l1b', 500)] (cycled); without a schedule
-    the single ``phase``."""
+    """``a:2000,b:500`` -> [('l1a', 2000), ('l1b', 500)] (cycled); ``r`` (read side
+    only) and ``w`` (aggregators and leaves) alternate the two sides; without a
+    schedule the single ``phase``."""
     if not text:
         return [(phase, 1)]
     out = []
     for part in text.split(','):
         name, _, count = part.partition(':')
-        name = {'a': 'l1a', 'b': 'l1b'}.get(name.strip(), name.strip())
-        if name not in ('l1a', 'l1b') or not count.strip().isdigit() or int(count) < 1:
-            raise ValueError(f'bad phase schedule entry {part!r} (e.g. a:2000,b:500)')
+        name = PHASES.get(name.strip(), name.strip())
+        if name not in PHASES.values() or not count.strip().isdigit() or int(count) < 1:
+            raise ValueError(f'bad phase schedule entry {part!r} (e.g. a:2000,b:500, r:100,w:100)')
         out.append((name, int(count)))
     return out
 
 
-def phase_at(schedule: list[tuple[str, int]], step: int) -> str:
-    """The phase of 0-based ``step`` under a cycled schedule."""
-    at = step % sum(n for _, n in schedule)
+def phase_at(schedule: list[tuple[str, int]], step: int, read_warmup: int = 0) -> str:
+    """The phase of 0-based ``step`` under a cycled schedule (the first ``read_warmup``
+    steps are read-side only)."""
+    if step < read_warmup:
+        return 'r'
+    at = (step - read_warmup) % sum(n for _, n in schedule)
     for name, n in schedule:
         if at < n:
             return name
@@ -832,23 +887,31 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
                usage: dict | None = None, *, phase: str | None = None,
                trainable: list | None = None, writer: Writer | None = None,
                producers: Producers | None = None, log: WriteLog | None = None,
-               rng: random.Random | None = None, text_ids=None) -> dict:
+               rng: random.Random | None = None, text_ids=None, anchor=None) -> dict:
     """One step: gradients of all episodes accumulate, then one optimizer step and (L1a)
     one sparse live update per touched (KB, space) for the item values.
 
     L1a: items in place, writer detached. L1b: read items recomputed from their
     sources (``producers``), their accumulated gradients backpropagated into the
     producers before the optimizer step; live item values are not updated. K2 is
-    L1a with ``--retrieval-only``. With a ``writer`` and episodes with write sites,
-    the sites' spans are generated at the end of the step (after every read of the
-    step: the batch's episodes never see each other's writes) and committed to the
-    episodes' KBs, so reads of later steps can retrieve them."""
+    L1a with ``--retrieval-only``. ``r``: the read side only (no live update; with
+    ``--rows-from-stack`` the rows' gradients are not propagated into the fields);
+    ``w``: the aggregators and the leaves. With ``--rows-from-stack`` the rows are
+    recomputed with their graphs before the optimizer step (``SuperposedCache.backward``);
+    on a consolidation step (``--consolidate-every``) the aggregators step and the leaves
+    are re-fitted so the touched rows return to their values before it, instead of the
+    leaves' own update. ``anchor`` (``--read-anchor``) adds the probe-set KL. With a
+    ``writer`` and episodes with write sites, the sites' spans are generated at the end
+    of the step (after every read of the step: the batch's episodes never see each
+    other's writes) and committed to the episodes' KBs, so reads of later steps can
+    retrieve them."""
     phase = phase or args.phase
     if phase == 'l1b' and producers is None:
         raise ValueError('L1b needs the producers (gradients through the sources)')
     usage = {} if usage is None else usage
     started = time.time()
-    cache = ItemCache(ctx.frozen.device, train=True)
+    producer = producers if phase == 'l1b' else None
+    cache = ctx.new_cache(train=True, step=step, producer=producer)
     optimizer.zero_grad(set_to_none=True)
     tokens = sum(int(ep.targets.numel()) for ep in episodes)
     weight = retrieval_weight(args, step)
@@ -856,7 +919,6 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     nll_total, aux_total, balance_total = 0.0, 0.0, 0.0
     negatives = batch_negatives(ctx, episodes, args.inbatch_negatives,
                                 rng or random.Random(step)) if args.inbatch_negatives else {}
-    producer = producers if phase == 'l1b' else None
     if producer is not None:
         producer.begin()
     requests: list[WriteRequest] = []
@@ -871,7 +933,7 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             terms.append(weight * aux_mean / len(episodes))
             aux_total += aux_mean.item() / len(episodes)
         if args.balance_weight and not args.retrieval_only:
-            balance = _balance(ctx, reads, usage)
+            balance = _balance(ctx, reads, usage, cache)
             if balance is not None:
                 terms.append(args.balance_weight * balance / len(episodes))
                 balance_total += balance.item() / len(episodes)
@@ -880,10 +942,26 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             loss.backward()
         if nll is not None:
             nll_total += nll.item()
-        _read_stats(reads, stats, ctx.written)
+        _read_stats(reads, stats, ctx.written, cache)
         if writer is not None and ep.writes:
             requests += write_requests(ep, spans, text_ids, args.write_level_index)
     out: dict = {}
+    if anchor is not None and getattr(args, 'read_anchor', 0) > 0 and anchor.probes:
+        a_loss, a_stats = anchor.loss(rng or random.Random(step))
+        (args.read_anchor * a_loss).backward()
+        out['anchor'] = a_stats
+    consolidating = bool(getattr(args, 'consolidate_every', 0) and ctx.views
+                         and phase in ('l1a', 'w')
+                         and (step + 1) % args.consolidate_every == 0)
+    before = {}
+    if getattr(cache, 'superposed', False):
+        touched = cache.touched_tops()
+        if consolidating:
+            before = {ref: cache.tops[ref].detach().clone() for ref in touched}
+        if phase != 'r':
+            t0 = time.time()
+            out['superpose'] = cache.backward()
+            out['superpose']['backward_s'] = round(time.time() - t0, 3)
     if producer is not None:
         t0 = time.time()
         out['l1b'] = producer.backward()
@@ -897,8 +975,18 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         t0 = time.time()
         out['l1b'].update(producer.change(change_units))
         out['l1b_change_s'] = round(time.time() - t0, 3)
-    item_lr = 0.0 if args.retrieval_only or phase == 'l1b' else args.item_lr
-    counts = cache.apply(item_lr)
+    item_lr = 0.0 if args.retrieval_only or phase in ('l1b', 'r') else args.item_lr
+    if consolidating:
+        from schnitz.kb.superpose import consolidate
+        t0 = time.time()
+        out['consolidate'] = consolidate(ctx.views, list(before), before,
+                                         steps=args.consolidate_steps, item_lr=args.item_lr,
+                                         device=ctx.frozen.device)
+        out['consolidate']['s'] = round(time.time() - t0, 3)
+        counts = {'items': 0}
+    else:
+        keys = getattr(ctx, 'key_optimizer', None) if item_lr > 0 else None
+        counts = cache.apply(item_lr, key_optimizer=keys)
     if requests:
         t0 = time.time()
         spans = generate_writes(writer, requests)
@@ -915,21 +1003,175 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     return out
 
 
+# -- superposition metrics, drift and the read anchor -------------------------------------
+def superposition_metrics(ctx: Context, reads_by: dict) -> dict:
+    """Per KB and space: sources per row, rows per source (items per source), effective
+    items per read (from the evaluation reads' gates). With views from the fields
+    (``SuperposedKB.metrics``); otherwise from the KB's rewrite lineage (a rows KB), or
+    one source per item for a plain KB."""
+    from schnitz.kb.read import current_ids
+    from schnitz.kb_eval import superposition_report
+    out = {}
+    for name, kb in ctx.kbs.items():
+        reads = reads_by.get(name, {})
+        if name in ctx.views:
+            out[name] = ctx.views[name].metrics(reads)
+            continue
+        comp = kb.source_composition()
+        out[name] = {}
+        for s in kb.spaces:
+            ids = current_ids(kb, s)
+            rep = superposition_report({i: comp[i] for i in ids}, reads.get(s, ()))
+            out[name][s] = {'items': rep['items'], 'sources': rep['sources'],
+                            'sources_per_item': rep['sources_per_item'],
+                            'items_per_source': rep['items_per_source'],
+                            'effective_items_per_read': rep['effective_items_per_read']['entropy']}
+    return out
+
+
+def summarize_metrics(metrics: dict) -> dict:
+    """Per space, the means over KBs of the main superposition numbers."""
+    out: dict[str, dict] = {}
+    for spaces in metrics.values():
+        for s, m in spaces.items():
+            row = out.setdefault(s, {})
+            for key in ('sources_per_item', 'items_per_source', 'effective_items_per_read'):
+                value = m.get(key, {})
+                if isinstance(value, dict) and value.get('n'):
+                    row.setdefault(key, []).append(value['mean'])
+            if 'leaves_per_row' in m:
+                row.setdefault('leaves_per_row', []).append(m['leaves_per_row']['mean'])
+    return {s: {k: round(sum(v) / len(v), 3) for k, v in row.items() if v}
+            for s, row in out.items()}
+
+
 @torch.no_grad()
-def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) -> dict:
-    cache = ItemCache(ctx.frozen.device, train=False)
+def item_drift(ctx: Context, sample: int = 256) -> dict:
+    """Per space: mean relative distance of the (live) items from their stored payloads
+    (for a rows KB: the rows' drift from their codec-derived initialization), and
+    ``key_<s>`` the keys' drift (1 - cosine of the live to the stored key), over up to
+    ``sample`` items per KB."""
+    from schnitz.kb.read import current_ids
+    rel: dict[str, list[float]] = {}
+    for kb in ctx.kbs.values():
+        for s in kb.spaces:
+            if not (kb.writable and kb.is_live(s)):
+                continue
+            ids = current_ids(kb, s)[:sample]
+            if not ids:
+                continue
+            for live, stored in zip(kb.read(s, ids, live=True), kb.read(s, ids)):
+                a, b = live.values.float(), stored.values.float()
+                rel.setdefault(s, []).append(float((a - b).norm() / b.norm().clamp_min(1e-12)))
+                rel.setdefault(f'key_{s}', []).append(1 - float(F.cosine_similarity(
+                    live.key.float(), stored.key.float(), dim=-1)))
+    return {s: round(sum(v) / len(v), 5) for s, v in rel.items()}
+
+
+class ReadAnchor:
+    """``--read-anchor``: KL of the read side's reads on a fixed probe set of held-out
+    episodes of every KB (the first read of each) against their outputs at the last
+    refresh (every ``--anchor-every`` steps). A probe keeps the query-layer state and the
+    items it read (values and scales, detached); its read is recomputed by
+    ``L1Reader.reread`` (gradients into the key/query heads and R), then the frozen
+    decoder reads ``<|mem|> span <|/mem|>`` followed by the first ``tokens`` tokens of the
+    slot's first record text; the loss is KL(anchored || current) on those tokens."""
+
+    def __init__(self, ctx: Context, episodes: list[Episode], texts: dict[str, str], text_ids,
+                 tokens: int = 32, batch: int = 4):
+        self.ctx, self.episodes, self.batch = ctx, episodes, batch
+        self.texts = {}
+        for ep in episodes:
+            r = ep.slots[0]['record_ids'][0]
+            if r in texts:
+                self.texts[ep.episode_id] = text_ids(texts[r])[:tokens]
+        self.probes: list[dict] = []
+
+    @torch.no_grad()
+    def refresh(self, step: int) -> int:
+        ctx = self.ctx
+        cache = ctx.new_cache(train=False, step=step)
+        self.probes = []
+        for ep in self.episodes:
+            if ep.episode_id not in self.texts or not ep.calls:
+                continue
+            embeds = ctx.frozen.embed(ep.ids[:ep.calls[0] + 1])
+            h = ctx.frozen.mid(embeds[None])[0][ep.calls[0]]
+            with ctx.autocast():
+                read = ctx.reader.read(h, [ctx.kbs[ep.kb]], [ep.kb], ep.query_time, cache)
+            kb = ctx.kbs[ep.kb]
+            values = {s: [v.detach().clone() for v, _ in cache.get(kb, s, [i for _, i in info.refs])]
+                      for s, info in read.spaces.items() if info.refs}
+            keys = {s: [k.detach().clone() for k in cache.keys(kb, s, [i for _, i in
+                                                                    read.spaces[s].refs])]
+                    for s in values} if ctx.reader.config.learned_keys else None
+            scales = {s: list(read.spaces[s].scales) for s in values}
+            if not values:
+                continue
+            probe = {'state': h, 'values': values, 'scales': scales, 'keys': keys,
+                     'ids': self.texts[ep.episode_id]}
+            probe['anchored'] = self._logits(probe, read.span.detach().float())
+            self.probes.append(probe)
+        return len(self.probes)
+
+    def _logits(self, probe: dict, span: torch.Tensor) -> torch.Tensor:
+        ids = torch.cat([torch.tensor([MEM_ID, SPAN_TOKENS['mem_end'][1]]), probe['ids']])
+        x, index = splice(self.ctx.frozen.embed(ids), [0], [span])
+        hidden = self.ctx.frozen.final(x[None])[0]
+        return self.ctx.frozen.logits(hidden[index[2:] - 1])
+
+    def span(self, probe: dict) -> torch.Tensor:
+        with self.ctx.autocast():
+            return self.ctx.reader.reread(probe['state'], probe['values'], probe['scales'],
+                                          probe['keys']).float()
+
+    def loss(self, rng: random.Random) -> tuple[torch.Tensor, dict]:
+        from schnitz.kb.losses import kl
+        picked = rng.sample(self.probes, min(self.batch, len(self.probes)))
+        terms = [kl(self._logits(p, self.span(p)), p['anchored']) for p in picked]
+        loss = torch.stack(terms).mean()
+        return loss, {'kl': round(loss.item(), 6), 'probes': len(picked)}
+
+    @torch.no_grad()
+    def drift(self) -> dict:
+        """The probe set's KL to the anchored reads now (read-output drift)."""
+        if not self.probes:
+            return {}
+        from schnitz.kb.losses import kl
+        values = [float(kl(self._logits(p, self.span(p)), p['anchored'])) for p in self.probes]
+        return {'kl': round(sum(values) / len(values), 6), 'probes': len(values)}
+
+
+@torch.no_grad()
+def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
+             previous: dict | None = None) -> dict:
+    """The evaluation arms, read statistics, superposition metrics per KB and space, the
+    items' drift from their stored payloads and, given ``previous`` (the last evaluation's
+    per-episode retrieved NLL), retention per KB (``kb_eval.retention``, lower NLL is
+    better). ``report['_per_episode']`` carries this evaluation's per-episode NLL."""
+    from schnitz.kb_eval import retention
+    cache = ctx.new_cache(train=False)
     sums = {a: 0.0 for a in ('noctx', 'full', 'retrieved', 'shuffled', 'gold', 'gold_shuffled')}
     tokens = 0
     stats: dict[str, list] = {}
     gold_stats: dict[str, list] = {}
     got = {'retrieved': [], 'gold': []}
+    per_episode: dict[str, tuple[str, float]] = {}
+    gates_by: dict[str, dict[str, list]] = {}
     for ep in episodes:
         for mode, name in (('retrieve', 'retrieved'), ('gold', 'gold')):
             nll, n, reads, spans = run_episode(ctx, ep, cache, mode)
             sums[name] += nll.item()
             got[name].append(spans)
             _read_stats(reads, stats if name == 'retrieved' else gold_stats,
-                        ctx.written if name == 'retrieved' else None)
+                        ctx.written if name == 'retrieved' else None, cache)
+            if name == 'retrieved':
+                per_episode[ep.episode_id] = (ep.kb, nll.item() / max(n, 1))
+                for read in reads:
+                    for s, info in read.spaces.items():
+                        if len(info.gates):
+                            gates_by.setdefault(ep.kb, {}).setdefault(s, []).append(
+                                info.gates.tolist())
         tokens += n
         empty = [torch.zeros(0, ctx.reader.config.span_width) for _ in ep.mems]
         sums['noctx'] += run_episode(ctx, ep, cache, 'fixed', empty)[0].item()
@@ -951,6 +1193,19 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) 
     report['span_reps'] = distribution(stats.get('n', []))
     report['written_items'] = {name: len(spaces.get('D', ())) for name, spaces in ctx.written.items()
                                if spaces.get('D')}
+    metrics = superposition_metrics(ctx, gates_by)
+    report['superposition'] = summarize_metrics(metrics)
+    report['superposition_kbs'] = metrics
+    report['item_drift'] = item_drift(ctx)
+    if previous:
+        by_kb: dict[str, tuple[dict, dict]] = {}
+        for eid, (kb, value) in per_episode.items():
+            if eid in previous:
+                pair = by_kb.setdefault(kb, ({}, {}))
+                pair[0][eid], pair[1][eid] = previous[eid][1], value
+        report['retention'] = {kb: retention(b, a, higher_is_better=False)
+                               for kb, (b, a) in by_kb.items()}
+    report['_per_episode'] = per_episode
     return report
 
 
@@ -958,12 +1213,15 @@ def _pairs(text: str) -> dict[str, int]:
     return {k: int(v) for k, v in (p.split('=') for p in text.split(',') if p)}
 
 
-def load_init_reader(reader: L1Reader, path: Path) -> list[str]:
+def load_init_reader(reader: L1Reader, path: Path, full: bool = False) -> list[str]:
     """K2 -> L1a: the key heads (query and item heads, scales) and gate offsets of a
-    K2 run's ``reader.pt`` (or a bare state dict). Returns the loaded names."""
+    K2 run's ``reader.pt`` (or a bare state dict); with ``full`` every read-side tensor
+    of a matching reader (R, S_s too). Returns the loaded names."""
     state = torch.load(path, map_location='cpu', weights_only=False)
     state = state.get('reader', state)
-    wanted = {k: v for k, v in state.items() if k.startswith(('keys.', 'gate_offset.'))}
+    prefixes = ('keys.', 'gate_offset.') + (('read_r.', 'operators.', 'stack.recombiner.')
+                                            if full else ())
+    wanted = {k: v for k, v in state.items() if k.startswith(prefixes)}
     own = reader.state_dict()
     missing = [k for k in own if k.startswith('keys.') and k not in wanted]
     if missing:
@@ -1012,6 +1270,99 @@ def load_producers(args, ctx: Context, writer: Writer, log: WriteLog, model) -> 
                      stored=lambda d, s, i: ctx.kbs[d].read(s, [i])[0].values)
 
 
+def superpose_config(args, base: dict | None = None):
+    """The ``SuperposeConfig`` of this run: a stack run's (``base``), with the flags
+    given here overriding it."""
+    from schnitz.kb.superpose import SuperposeConfig, parse_fields, parse_pairs
+    config = SuperposeConfig.from_dict(base or {})
+    field = parse_fields(getattr(args, 'field', None))
+    budget = parse_pairs(getattr(args, 'budget', None), float)
+    if field:
+        config.field = {**config.field, **field}
+    if budget:
+        config.budget = budget
+    for name in ('overlap', 'temperature', 'deep_grad', 'cache_every', 'graph_every',
+                 'max_positives'):
+        value = getattr(args, name, None)
+        if value is not None:
+            setattr(config, name, value)
+    config.seed = getattr(args, 'seed', config.seed)
+    return config
+
+
+@torch.no_grad()
+def rows(args) -> None:
+    """``l1 rows``: a rows KB per dataset from the banks (``superpose.build_rows``): the
+    storage budget of learnable records, placed by farthest-point sampling over the
+    leaves' keys, initialized as the share-weighted mean of their fields (values and
+    keys); lineage and shares from the leaves by
+    ``kb_store.rewrite``. Written as a banks directory (``banks.json`` naming the leaf
+    banks under ``rows``, ``stack.pt`` and ``key_heads_init.pt`` copied), so ``l1 train
+    --banks <rows>`` trains the rows in place (the read phase)."""
+    from schnitz.kb.superpose import build_rows
+    config = superpose_config(args)
+    config.depth = 1
+    manifest = json.loads((args.banks / 'banks.json').read_text())
+    args.output.mkdir(parents=True, exist_ok=True)
+    report = {}
+    for name, info in manifest['kbs'].items():
+        dest = args.output / info['dir']
+        if (dest / 'manifest.json').exists():
+            report[name] = 'exists'
+            continue
+        leaves = KnowledgeBase(args.banks / info['dir'])
+        try:
+            kb, stats = build_rows(leaves, dest, config)
+            kb.close()
+        finally:
+            leaves.close()
+        report[name] = {'rows': {s: v['rows'] for s, v in stats.items()},
+                        'leaves': {s: v['leaves'] for s, v in stats.items()},
+                        'field_fill': {s: v['levels'][0]['field_fill'] for s, v in stats.items()}}
+        print(json.dumps({'kb': name, **report[name]}), flush=True)
+    for file in ('stack.pt', 'key_heads_init.pt'):
+        shutil.copy2(args.banks / file, args.output / file)
+    out = dict(manifest, rows={'leaves': str(args.banks), 'config': dataclasses.asdict(config),
+                               'kbs': report})
+    (args.output / 'banks.json').write_text(json.dumps(out, indent=2) + '\n')
+
+
+def export_snapshot(ctx: Context, reader: L1Reader, dest: Path, step: int) -> dict:
+    """The rows as they are now: every KB exported frozen (the free rows' live values and
+    keys, or with views the stack's rows through ``SuperposedKB.export``), plus the
+    reader's state, as ``<dest>/step<N>``; ``<dest>/latest.json`` names the newest (the
+    write fit's ``--follow-snapshots``)."""
+    tag = dest / f'step{step:08d}'
+    pending = tag.with_name(tag.name + '.pending')
+    shutil.rmtree(pending, ignore_errors=True)
+    pending.mkdir(parents=True)
+    for name, kb in ctx.kbs.items():
+        if name in ctx.views:
+            ctx.views[name].export(pending / kb.root.name, step=step).close()
+        else:
+            kb.export_live(pending / kb.root.name).close()
+    torch.save({'reader': reader.state_dict(), 'config': dataclasses.asdict(reader.config),
+                'step': step}, pending / 'reader.pt')
+    (pending / 'targets.json').write_text(json.dumps({'step': step, 'kbs': {
+        k: kb.root.name for k, kb in ctx.kbs.items()}}) + '\n')
+    shutil.rmtree(tag, ignore_errors=True)
+    pending.rename(tag)
+    (dest / 'latest.json').write_text(json.dumps({'step': step, 'dir': tag.name}) + '\n')
+    return {'snapshot': str(tag)}
+
+
+def load_write_stack(path: Path, dims: dict, args):
+    """``--rows-from-stack``: the write fit's aggregators (``producers.pt`` 'stack') and
+    its superposition config (``config.json`` 'superpose'), with this run's overrides."""
+    from schnitz.kb.superpose import WriteOps
+    run_config = json.loads((path / 'config.json').read_text())
+    config = superpose_config(args, run_config.get('superpose'))
+    ops = WriteOps(config.depth, dims, config.per_level, temperature=config.temperature)
+    state = torch.load(path / 'producers.pt', map_location='cpu', weights_only=False)
+    ops.load_state_dict(state['stack'])
+    return ops, config, run_config, state
+
+
 def train(args) -> None:
     model = load_model(args)
     lm = model.decoder.base_lm
@@ -1036,21 +1387,40 @@ def train(args) -> None:
                         target_norm=model.target_norm, state=dims['state'],
                         op_hidden=dims['hidden'], layers=dims['layers'],
                         key_hidden=args.key_hidden, gate_offset=args.gate_offset,
-                        max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint)
+                        max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
+                        read_combine=args.read_combine)
+    banks_manifest = json.loads((args.banks / 'banks.json').read_text())
+    config.learned_keys = args.keys == 'learned' or (args.keys == 'auto'
+                                                     and 'rows' in banks_manifest)
+    # learned keys are unit keys; with --rows-from-stack the live keys are the leaves' key
+    # corrections (unconstrained vectors)
+    key_optimizer = KeyOptimizer(args.key_lr, normalize=not args.rows_from_stack) \
+        if config.learned_keys or args.rows_from_stack else None
     torch.manual_seed(args.seed)
     reader = L1Reader(config, stack)
     reader.keys.load_state_dict(torch.load(args.banks / 'key_heads_init.pt', map_location='cpu'))
     reader.to(model.device)
-    sets = parameter_sets(reader, model)
+    # --rows-from-stack: reads see the write stack's rows over the leaves (the leaf banks
+    # the rows banks were built from), anchored at the fitted rows
+    write_ops = superpose = None
+    leaf_banks = args.banks
+    if args.rows_from_stack:
+        if 'rows' not in banks_manifest:
+            raise ValueError('--rows-from-stack needs --banks to be a rows banks dir (l1 rows)')
+        leaf_banks = Path(banks_manifest['rows']['leaves'])
+        write_ops, superpose, stack_run, fit_state = load_write_stack(args.rows_from_stack,
+                                                                      dims, args)
+        write_ops.to(model.device)
+    sets = parameter_sets(reader, model, write_ops)
     groups = optimizer_groups(sets, args)
-    for p in sets['writer'] + sets['codecs']:     # AdamW takes them; phases enable them
+    for p in sets['writer'] + sets['codecs'] + sets['write']:   # AdamW takes them
         p.requires_grad_(True)
     optimizer = torch.optim.AdamW(groups, lr=args.lr)
     set_phase(sets, L1A_SET)
     usage: dict = {}
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'reader.pt'
-    kbs = open_live(args.banks, args.output, args.live_device, args.sync_every)
+    kbs = open_live(leaf_banks, args.output, args.live_device, args.sync_every)
     if not state_path.exists():
         for kb in kbs.values():         # a crash before the first save restarts from the banks
             written = any(p == 'write' for s in kb.spaces
@@ -1071,6 +1441,10 @@ def train(args) -> None:
         optimizer.load_state_dict(state['optimizer'])
         if 'writer' in state:
             model.writer.load_state_dict(state['writer'])
+        if write_ops is not None:
+            write_ops.load_state_dict(state['write_ops'])
+        if key_optimizer is not None:
+            key_optimizer.load_state_dict(state.get('key_optimizer', {}))
         step = state['step']
         rng.setstate(state['rng'])
         torch.set_rng_state(state['torch_rng'].cpu())
@@ -1086,18 +1460,56 @@ def train(args) -> None:
                 raise ValueError(f'{name}: restored live state does not match the checkpoint')
         if log is not None:
             log.truncate(step)
-    ctx = Context(frozen, reader, kbs)
+    # before the write fit's item-key heads are installed (they take precedence)
+    if args.init_reader and step == 0:
+        loaded = load_init_reader(reader, args.init_reader, full=args.init_reader_full)
+        for kb in kbs.values():      # the search keys from the loaded item-key heads
+            reader.rekey(kb)
+        print(json.dumps({'init_reader': str(args.init_reader), 'loaded': len(loaded)}),
+              flush=True)
+    views = {}
+    if write_ops is not None:
+        from schnitz.kb.superpose import SuperposedKB, head_leaf_key, rows_of
+        # leaf keys are the item-key heads on the content plus a per-leaf correction held
+        # in the leaf's live key; both start where the write fit left them
+        if not state_path.exists():
+            heads = {k[len('item.'):]: v for k, v in fit_state.get('heads', {}).items()
+                     if k.startswith('item.')}
+            if heads:
+                reader.keys.item.load_state_dict(heads)
+            ids_of = fit_state.get('correction_ids', {})
+            for name, kb in kbs.items():
+                for space in kb.spaces:
+                    ids = ids_of.get(name, {}).get(space)
+                    corr = fit_state.get('corrections', {}).get(f'{name}/{space}')
+                    current = current_ids(kb, space)
+                    if ids is None or corr is None:
+                        ids, corr = current, torch.zeros(len(current),
+                                                          kb.spaces[space].key_width)
+                    if ids:
+                        kb.set_live_keys(space, list(ids), corr.float())
+        targets_root = Path(stack_run.get('targets_dir') or args.rows_from_stack / 'targets')
+        for name, kb in kbs.items():
+            anchor_root = targets_root / kb.root.name
+            anchor_kb = KnowledgeBase(anchor_root if (anchor_root / 'manifest.json').exists()
+                                      else args.banks / kb.root.name)
+            views[name] = SuperposedKB(kb, write_ops, superpose, rows_of(anchor_kb),
+                                       leaf_key=head_leaf_key(reader.keys),
+                                       device=model.device, autocast=model.core.autocast)
+            anchor_kb.close()
+    ctx = Context(frozen, reader, kbs, views=views)
+    ctx.key_optimizer = key_optimizer
     tok = model.tok
     writer = Writer(model, stack, frozen.embed, batch=args.write_batch) \
         if args.writes or 'l1b' in phases else None
     producers = load_producers(args, ctx, writer, log, model) if 'l1b' in phases else None
     args.write_level_index = LEVELS.index(args.write_level)
-    if args.init_reader and step == 0:
-        loaded = load_init_reader(reader, args.init_reader)
-        for kb in kbs.values():      # the search keys from the loaded item-key heads
-            reader.rekey(kb)
-        print(json.dumps({'init_reader': str(args.init_reader), 'loaded': len(loaded)}),
-              flush=True)
+
+    def rebuild() -> dict:
+        """Fields from the leaves' and rows' current keys (``--rows-from-stack``)."""
+        return {name: view.rebuild(step) for name, view in views.items()}
+
+    budgets = rebuild() if views else None
 
     skipped: dict[str, int] = {}
 
@@ -1125,8 +1537,13 @@ def train(args) -> None:
     wanted = {r for ep in eval_eps for slot in ep.slots for r in slot['record_ids']}
     texts = {r: v['text'] for r, v in
              read_sources({ep.row['_dir'] for ep in eval_eps}, wanted).items()}
+    storage = {name: {s: {'items': st['current'], 'positions': st['positions']}
+                      for s, st in kb.stats().items()} for name, kb in kbs.items()}
     (args.output / 'config.json').write_text(json.dumps(dict(
         vars(args), read_config=dataclasses.asdict(config),
+        superpose=None if superpose is None else dataclasses.asdict(superpose),
+        rows_budget=budgets, storage=storage, rows=banks_manifest.get('rows'),
+        read_budget={'candidates': candidates, 'keep': keep, 'max_reps': args.max_reps},
         params=sum(p.numel() for p in reader.parameters()), train_transcripts=len(train_rows),
         eval_episodes=len(eval_eps), eval_skipped=eval_skip,
         kbs={k: kb.stats() for k, kb in kbs.items()}), indent=2, default=str) + '\n')
@@ -1151,15 +1568,39 @@ def train(args) -> None:
                     'live_tag': tag,
                     'usage': {k: (u.share, u.touched) for k, u in usage.items()},
                     'live_updates': {k: kb.live_updates for k, kb in kbs.items()},
-                    'config': dataclasses.asdict(config)}, pending)
+                    'config': dataclasses.asdict(config),
+                    **({'key_optimizer': key_optimizer.state_dict()}
+                       if key_optimizer is not None else {}),
+                    **({'write_ops': write_ops.state_dict(),
+                        'superpose': dataclasses.asdict(superpose)} if write_ops is not None
+                       else {})}, pending)
         pending.replace(state_path)
         for kb in kbs.values():
             for old in kb.live_checkpoints():
                 if old != tag:
                     kb.drop_live_checkpoint(old)
 
+    anchor = None
+    if args.read_anchor > 0:
+        per_kb: dict[str, list[Episode]] = {}
+        for ep in eval_eps:
+            if len(per_kb.setdefault(ep.kb, [])) < args.anchor_probes:
+                per_kb[ep.kb].append(ep)
+        anchor = ReadAnchor(ctx, [ep for eps in per_kb.values() for ep in eps], texts,
+                            model.text_ids, args.anchor_tokens, args.anchor_batch)
+        anchor.refresh(step)
+    previous: dict | None = None
+
+    def run_eval() -> dict:
+        nonlocal previous
+        report = evaluate(ctx, eval_eps, texts, tok, previous)
+        previous = report.pop('_per_episode')
+        if anchor is not None:
+            report['read_anchor'] = anchor.drift()
+        return report
+
     if step == 0 and args.eval_every:
-        log_record({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+        log_record({'step': 0, 'eval': run_eval()})
     order: list[int] = []
     window: dict[str, list] = {}
     started = time.time()
@@ -1167,6 +1608,8 @@ def train(args) -> None:
     def rekey() -> None:     # the search's key cache from the current item-key heads
         for kb in kbs.values():
             reader.rekey(kb)
+        for view in views.values():
+            view.rekey()
     while step < args.steps:
         batch = []
         while len(batch) < args.batch_size:
@@ -1176,12 +1619,17 @@ def train(args) -> None:
             ep = episode(train_rows[order.pop()])
             if ep is not None:
                 batch.append(ep)
-        phase = phase_at(schedule, step)
-        trainable = set_phase(sets, L1A_SET if phase == 'l1a' else l1b_set)
+        phase = phase_at(schedule, step, args.read_warmup)
+        names = phase_set(phase, args, l1b_set)
+        if args.consolidate_every and views and phase in ('l1a', 'w') \
+                and (step + 1) % args.consolidate_every == 0:
+            names = tuple(dict.fromkeys(names + WRITE_SET))
+        trainable = set_phase(sets, names)
         reader.train()
         result = train_step(ctx, batch, optimizer, args, step, usage, phase=phase,
                             trainable=trainable, writer=writer if args.writes else None,
-                            producers=producers, log=log, rng=rng, text_ids=model.text_ids)
+                            producers=producers, log=log, rng=rng, text_ids=model.text_ids,
+                            anchor=anchor)
         step += 1
         for key, value in result.items():
             if isinstance(value, dict):
@@ -1193,27 +1641,35 @@ def train(args) -> None:
         window.setdefault(f'steps_{phase}', []).append(1)
         if args.rekey_every and step % args.rekey_every == 0:
             rekey()
+        if views and superpose.graph_every and step % superpose.graph_every == 0:
+            rebuild()
+        if anchor is not None and args.anchor_every and step % args.anchor_every == 0:
+            anchor.refresh(step)
         if step % args.log_every == 0:
             log_record({'step': step, 'phase': phase, **_mean(window), 'skipped': dict(skipped),
                         'usage': {k: u.stats() for k, u in usage.items()} if args.log_usage
                         else None, 'elapsed_s': round(time.time() - started)})
             window = {}
+        if args.export_rows_every and step % args.export_rows_every == 0:
+            log_record({'step': step, **export_snapshot(ctx, reader, args.output / 'snapshots',
+                                                        step)})
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
             rekey()
+            if views:
+                rebuild()
             save()
             reader.eval()
-            log_record({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+            log_record({'step': step, 'eval': run_eval()})
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    """Arguments of both actions (``build`` and ``train``) on one parser."""
-    parser.add_argument('action', choices=('build', 'train'))
-    parser.add_argument('--transcripts', type=Path, nargs='+', required=True,
-                        help='memory transcript directories (v1 or v2)')
-    parser.add_argument('--checkpoint', type=Path, required=True)
+    """Arguments of all actions (``build``, ``rows``, ``train``) on one parser."""
+    parser.add_argument('action', choices=('build', 'rows', 'train'))
+    parser.add_argument('--transcripts', type=Path, nargs='+',
+                        help='memory transcript directories (v1 or v2; build and train)')
+    parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--experiment', default='bgkit2_s2_showcase')
-    parser.add_argument('--reader-state', type=Path, required=True,
-                        help='B3 writer.pt (merged decoder); later B4')
+    parser.add_argument('--reader-state', type=Path, help='B3 writer.pt (merged decoder); later B4')
     parser.add_argument('--codecs', type=Path, help='K1 stack.pt; random init when omitted')
     parser.add_argument('--limit', type=int, help='train transcripts per directory')
     parser.add_argument('--eval-limit', type=int, default=256,
@@ -1242,8 +1698,25 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                                  'builds that no L1b phase replays')
     build_args.add_argument('--distractors', type=int, default=0,
                             help='extra records per KB beyond those the transcripts name')
+    sup = parser.add_argument_group('superposed KB (rows; --rows-from-stack)')
+    sup.add_argument('--field', help='field size per space for the row count, e.g. '
+                                     'A=8,B=16,C=16,D=16 (rows = ceil(overlap / field x leaves))')
+    sup.add_argument('--overlap', type=int, help='fields (rows) each input joins (default 3)')
+    sup.add_argument('--budget', help='rows as a fraction of the leaves (overrides --field), '
+                                      'e.g. 0.25 or A=0.5,D=0.2')
+    sup.add_argument('--temperature', type=float, help='share softmax temperature (0.1)')
+    sup.add_argument('--deep-grad', type=float,
+                     help='--rows-from-stack: share of a row\'s inputs recomputed one level '
+                          'down with gradients per step (0.25)')
+    sup.add_argument('--cache-every', type=int,
+                     help='--rows-from-stack: level-(L-1) cache lifetime in steps (10)')
+    sup.add_argument('--graph-every', type=int,
+                     help='--rows-from-stack: field reassignment period in steps (100; also at '
+                          'every checkpoint)')
+    sup.add_argument('--max-positives', type=int,
+                     help='--rows-from-stack: covering rows kept as retrieval positives (8)')
     t = parser.add_argument_group('train')
-    t.add_argument('--banks', type=Path, help='output of build')
+    t.add_argument('--banks', type=Path, help='output of build (or of rows)')
     t.add_argument('--steps', type=int, default=20000)
     t.add_argument('--lr', type=float, default=3e-4)
     t.add_argument('--item-lr', type=float, default=3e-3)
@@ -1253,6 +1726,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--keep', default='', help='read per space (nonzero gates), e.g. A=2,D=4')
     t.add_argument('--gate-offset', type=float, default=0.5,
                    help='initial gate offset b_s in cosine units')
+    t.add_argument('--keys', choices=('auto', 'learned', 'derived'), default='auto',
+                   help='learned: every item\'s live key is a free parameter moved by the '
+                        'retrieval and gate gradients (scores and search use it); derived: '
+                        'keys are the item-key heads of the values (refreshed by --rekey-every); '
+                        'auto: learned on rows banks (l1 rows), else derived')
+    t.add_argument('--key-lr', type=float, default=1e-3,
+                   help='learned keys: per-key Adam learning rate (keys renormalized)')
+    t.add_argument('--read-combine', choices=('r', 's_s'), default='r',
+                   help='r: R reads every space\'s retrieved items directly, conditioned on the '
+                        'query keys (owner, 28 Sep); s_s: per-space S_s then R (the earlier '
+                        'smokes\' path, kept as an ablation)')
     t.add_argument('--balance-weight', type=float, default=0.01,
                    help='spread-out use (balance loss over scored candidates)')
     t.add_argument('--log-usage', action='store_true')
@@ -1269,10 +1753,42 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         'scored as negatives in the retrieval loss (0: off)')
     t.add_argument('--init-reader', type=Path,
                    help='K2 reader.pt: start from its key heads and gate offsets (K2 -> L1a)')
-    t.add_argument('--phase', choices=('l1a', 'l1b'), default='l1a',
+    t.add_argument('--init-reader-full', action='store_true',
+                   help='with --init-reader: the whole read side (key heads, gate offsets, R, '
+                        'S_s), e.g. the read phase\'s reader for --rows-from-stack')
+    t.add_argument('--phase', choices=('l1a', 'l1b', 'r', 'w'), default='l1a',
                    help='the phase when there is no --phase-schedule')
     t.add_argument('--phase-schedule',
-                   help='alternating phases, cycled, e.g. a:2000,b:500 (L1a then L1b steps)')
+                   help='alternating phases, cycled, e.g. a:2000,b:500 (L1a then L1b steps); '
+                        'r (read side: R and heads) and w (aggregators and leaves/rows) '
+                        'alternate the two sides, e.g. r:100,w:100 (off by default)')
+    t.add_argument('--read-warmup', type=int, default=0,
+                   help='first N steps read side only (R and heads; rows, leaves and '
+                        'aggregators frozen)')
+    t.add_argument('--rows-from-stack', type=Path,
+                   help='an L2 stack run (--producer stack): reads see its rows, recomputed '
+                        'from the leaf banks of the rows banks (--banks) by its aggregators, '
+                        'anchored at its targets; leaves, aggregators, R and heads train '
+                        'jointly (not the default schedule)')
+    t.add_argument('--write-lr', type=float,
+                   help='--rows-from-stack: the aggregators\' learning rate (default --lr)')
+    t.add_argument('--consolidate-every', type=int, default=0,
+                   help='--rows-from-stack: aggregators step only every N steps, after which '
+                        'the leaves are re-fitted so the touched rows return to their values '
+                        '(item-preserving; 0: off, the aggregators train every step)')
+    t.add_argument('--consolidate-steps', type=int, default=3,
+                   help='re-fit steps of a consolidation')
+    t.add_argument('--read-anchor', type=float, default=0.0,
+                   help='weight of the KL of reads of held-out probe episodes of every KB '
+                        'against their reads at the last refresh (key/query heads and R; 0: off)')
+    t.add_argument('--anchor-every', type=int, default=200, help='probe refresh period')
+    t.add_argument('--anchor-probes', type=int, default=2, help='probe episodes per KB')
+    t.add_argument('--anchor-batch', type=int, default=4, help='probes per step')
+    t.add_argument('--anchor-tokens', type=int, default=32,
+                   help='record text tokens the probe KL is measured on')
+    t.add_argument('--export-rows-every', type=int, default=0,
+                   help='export the rows (frozen KBs and the reader) to <output>/snapshots '
+                        'every N steps for a write fit that follows them (0: off)')
     t.add_argument('--l1b-train', default='writer,codecs,keys,operators,recombiner',
                    help=f'parameter sets trained in L1b, from {",".join(PHASE_SETS)}')
     t.add_argument('--l1b-replay', choices=('free', 'teacher', 'self'), default='free',
@@ -1315,6 +1831,14 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args) -> None:
+    if args.action == 'rows':
+        if args.banks is None:
+            raise SystemExit('rows needs --banks')
+        rows(args)
+        return
+    for name in ('transcripts', 'checkpoint', 'reader_state'):
+        if getattr(args, name) is None:
+            raise SystemExit(f'{args.action} needs --{name.replace("_", "-")}')
     if args.action == 'build':
         args.batch_size = args.batch_size or 32
         build(args)
