@@ -90,6 +90,28 @@ BGKit encodings), appear as one span:
   scalar head at the marker predicts log2(rho), so the model can choose.
 - Reps are ordered as the teacher's survivors (document order).
 
+**Autoregressive boundaries (review, 28 September).** Writing a span is already
+autoregressive: each rep's input is the writer's previous output, with prefix and
+convolution caches, and the free-running evaluation is exactly inference. What is
+not yet in place, and lands in B4 (before L1, whose mid-sequence reads need it):
+
+| Token | Input side | Output side (LM-head row) |
+|---|---|---|
+| `<|bg|>` | marker + ratio code | the model opens a compression or KB-write span itself (ratio from the prompt, else a ratio head at this position) |
+| `<|rep|>` | none (the rep is the input) | emit another rep |
+| `<|/bg|>` | end-of-span embedding, appended after the last rep | close the span (replaces the two-way stop head) |
+| `<|read|>` | none | request a KB read (fixed schedule first) |
+| `<|mem|>` … `<|/mem|>` | open and close a read span inserted from the KB | none (inserted by the harness) |
+| `<|port|>` … `<|/port|>` | open and close a soft I/O port span | port output |
+
+All are taken from the 379 unused `<|reserved_N|>` tokens (`<|reserved_6|>` is
+BGKit's splice sentinel and stays as it is). Read spans are marked apart from the
+model's own writes. Training adds interleaved sequences (text, span, text) so the
+model learns to resume after `<|/bg|>` and `<|/mem|>`, with next-token loss on
+`<|/bg|>` at the right count. Until B4, writes end their sequence (nothing is
+trained after a span) and reads use BGKit's prompt template, which only fits reads
+at the start of a prompt.
+
 ### 3.3 Dense, size-scaled compression (owner decision, 27 September)
 General compression capability is trained at all ratios x1–x128 (x1 and x4
 included). Knowledge-base compression scales with record length, so short
@@ -508,3 +530,11 @@ log your decisions and changes of direction"), newest last.
   a matched gain. Between-token reads with a mid-layer query keep the overlap of
   retrieval with computation at no extra cost; multi-hop happens across read
   sites. The recurrence pilot is removed from the plan.
+- **28 Sep, autoregressive span boundaries (owner question).** Checked the code:
+  writing is autoregressive and cache-friendly, but the boundaries are not: the
+  start marker is placed by the harness (no output token), the end is a separate
+  stop head with no end marker fed back and no training on text after a span,
+  and reads only exist in BGKit's prompt template. B4 adds real tokens with
+  LM-head rows (`<|bg|>`, `<|rep|>`, `<|/bg|>`, `<|read|>`, `<|mem|>`/`<|/mem|>`,
+  `<|port|>`/`<|/port|>`, from unused reserved tokens) and interleaved
+  text-span-text training (restart plan 3.2).

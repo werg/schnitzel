@@ -220,8 +220,9 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
    combiner), R, key and query heads.
    - *Reads:* between tokens. The query is formed from a middle layer's state
      at the read position, so retrieval overlaps the rest of that token's forward
-     pass; the result enters as a span after that position, and everything
-     earlier keeps its cache (causal). Reads every chunk of tokens; issuing a
+     pass; the result enters as a `<|mem|>` … `<|/mem|>` span after that position
+     (restart plan 3.2), the next token is predicted from `<|/mem|>`, and
+     everything earlier keeps its cache (causal). Reads every chunk of tokens; issuing a
      query a few tokens before it is needed hides retrieval latency.
    - *Routing through gates:* each space retrieves a generous candidate set and
      every candidate's gate comes from its query-key similarity; gates scale mass
