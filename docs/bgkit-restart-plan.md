@@ -1020,3 +1020,14 @@ log your decisions and changes of direction"), newest last.
   (nearest stored version: median word-sequence similarity 0.97 for WEB, whose
   derivative NHEB is stored, 0.60 for BBE, which has no close relative). Split by chapter.
   4000/300 episodes, one `memory_search()` per covering translation.
+- 28 September: r6 QA read phase (`kb-read-qa`, frozen decoder, no contrast) at step 250
+  measured on 32 validation episodes: retrieved 1.622 against shuffled 1.716 nats
+  (content 0.095 nats, 10x the SQL run's), with no context 2.125 and text context
+  1.535. Rows drifted 6-9% and keys 0.2-1.8%. Most of the gain is still
+  content-free (shuffled captures 0.69). A slot's `alternatives` (redundant copies)
+  are now retrieval positives, never negatives. The first contrast run
+  (`kb-read-recall`, recall-text-r8, contrast weight 1 at margin 0.5, null prefix 4,
+  K1 codecs of step 2500) is started. The SQL-hardening, synthetic/recall and
+  parallel-recall branches are merged. Parallel-recall transcripts are being rebuilt
+  with 1-2 reads per episode and every other version as alternatives, instead of one
+  read per version.
