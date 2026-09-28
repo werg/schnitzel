@@ -440,3 +440,23 @@ log your decisions and changes of direction"), newest last.
   hashed the moved `src/sdkb/data.py`. The shim now aliases `sdkb.X` to the same
   `schnitz.X` module object, and the script falls back to `src/schnitz/data.py`.
   Historical result records are unchanged.
+- **28 Sep, combiner evaluation and objective (owner: "do that").** The combiner's
+  output length is 0.71 of its inputs' total (median over 192 validation
+  episodes, range 0.45-1.0, about 2 gold records per episode), so `gold_spans`
+  (the concatenated inputs) was never a fair comparison. New arm `gold_pooled`:
+  the concatenated gold spans mean-pooled in equal chunks to the output length,
+  with its own shuffled control (and one for `gold_spans`). The cosine term to
+  the teacher's exact reps is dropped in stage 2 (`cos=0`): many rep sequences
+  decode to the same text, and stage 2's inputs come from another encoder (the B3
+  writer) than the target (S2). Stage 2 restarted at its step-1000 save.
+- **28 Sep, decoder as combiner.** `--combiner decoder`: the B3 writer reads the
+  retrieved spans under a merge prompt and writes the combined span (rollout
+  passes in training, free-running at evaluation); reads go through a frozen copy
+  of the decoder so both modes share one reader. First smoke (8 episodes, s1, 6
+  steps), content nats over shuffled controls, reconstruction / QA: untrained
+  mean pooling to the same length 1.65 / 2.22, the trained mixer (stage 2, step
+  0, 192 episodes) 0.57 / 1.21, the decoder merge after 6 steps 0.74 / 1.80, the
+  S2 teacher 1.80 / 1.44. The trained mixer is below a training-free pooling
+  baseline; the decoder merge beats it on QA almost untrained. Next: a matched
+  run of both modes on the same episodes once B3 finishes (the decoder mode needs
+  a trainable decoder next to a frozen reader copy).

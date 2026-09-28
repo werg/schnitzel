@@ -174,3 +174,28 @@ def test_sdkb_alias_is_the_schnitz_module():
 
     assert sdkb.data is schnitz.data
     assert schnitz.data.__spec__.name == 'schnitz.data'
+
+
+def test_release_checkpointing_makes_a_copy_use_its_own_weights():
+    import copy
+
+    import torch
+    from torch import nn
+
+    from schnitz.bgkit_span import checkpoint_layers, release_checkpointing
+
+    layers = nn.ModuleList([nn.Linear(4, 4)])
+    checkpoint_layers(layers)
+    clone = copy.deepcopy(layers)
+    release_checkpointing(clone)
+    with torch.no_grad():
+        clone[0].weight.zero_()
+        clone[0].bias.zero_()
+    x = torch.randn(2, 4)
+    assert torch.equal(clone[0](x), torch.zeros(2, 4))  # not the original's weights
+    assert not torch.equal(layers[0](x), torch.zeros(2, 4))
+    stale = copy.deepcopy(layers)  # without release the copy still runs the original
+    with torch.no_grad():
+        stale[0].weight.zero_()
+        stale[0].bias.zero_()
+    assert torch.equal(stale[0](x), layers[0](x))

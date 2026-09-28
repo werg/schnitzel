@@ -60,7 +60,7 @@ import time
 import torch
 import torch.nn.functional as F
 
-from schnitz.bgkit_span import (MEMORY_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
+from schnitz.bgkit_span import (MEMORY_PROMPT, MERGE_PROMPT, SUMMARIZE_PROMPTS, SpanWriter,
                              attach_write_adapter, checkpoint_layers, span_mask,
                              span_targets)
 
@@ -128,7 +128,7 @@ class Model:
         self.encoder_prompts = Templates.compression_prompt_ids(self.tok)
         sent_str, sent_id = decoder_sentinel(self.tok)
         self.prompts = {}
-        named = [('memory', MEMORY_PROMPT)] + [(f'summarize-{task}', text)
+        named = [('memory', MEMORY_PROMPT), ('merge', MERGE_PROMPT)] + [(f'summarize-{task}', text)
                                                for task, text in SUMMARIZE_PROMPTS.items()]
         for name, text in named:
             ids = self.tok.apply_chat_template([{'role': 'user', 'content': text + sent_str}],
@@ -197,8 +197,9 @@ class Model:
     def load_trained(self, state: dict) -> None:
         self.writer.load_state_dict(state['writer'])
         if state.get('merged'):
-            self.gate_value = 1.0
-            self.merge()
+            if not self.merged:  # a resumed merged state is loaded into place
+                self.gate_value = 1.0
+                self.merge()
             self.decoder.base_lm.load_state_dict(state['decoder'])
         elif 'adapter' in state and self.adapter is not None:
             self.adapter.load_state_dict(state['adapter'])
@@ -241,18 +242,29 @@ class Model:
         weight outside spans, so it is exact for no-gradient passes; a gradient pass
         uses it only while nothing trainable acts on the prefix (``_rollout``)."""
         inner = self.decoder.base_lm.model
-        ids = []
-        for ex in examples:
-            pre, post = self.prompts[ex['prompt']]
-            ids.append(torch.cat([pre, ex['ids'], post]))
-        lengths = torch.tensor([x.shape[0] for x in ids], device=self.device)
-        batch = torch.full((len(ids), int(lengths.max())), self.tpl.pad_id, dtype=torch.long)
-        mask = torch.zeros(batch.shape, dtype=torch.long)
-        for i, x in enumerate(ids):
-            batch[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
-        batch, mask = batch.to(self.device), mask.to(self.device)
+        if any('source_embeds' in ex for ex in examples):
+            seqs = [self.write_inputs(ex) for ex in examples]
+            lengths = torch.tensor([x.shape[0] for x in seqs], device=self.device)
+            embeds = torch.zeros(len(seqs), int(lengths.max()), seqs[0].shape[1],
+                                 device=self.device)
+            mask = torch.zeros(embeds.shape[:2], dtype=torch.long, device=self.device)
+            for i, x in enumerate(seqs):
+                embeds[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
+            batch = mask
+        else:
+            embeds = None
+            ids = []
+            for ex in examples:
+                pre, post = self.prompts[ex['prompt']]
+                ids.append(torch.cat([pre, ex['ids'], post]))
+            lengths = torch.tensor([x.shape[0] for x in ids], device=self.device)
+            batch = torch.full((len(ids), int(lengths.max())), self.tpl.pad_id, dtype=torch.long)
+            mask = torch.zeros(batch.shape, dtype=torch.long)
+            for i, x in enumerate(ids):
+                batch[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
+            batch, mask = batch.to(self.device), mask.to(self.device)
         conv, hooks = {}, []
-        rows = torch.arange(len(ids), device=self.device)
+        rows = torch.arange(len(examples), device=self.device)
         for index, layer in enumerate(inner.layers):
             if layer.is_attention_layer:
                 continue
@@ -270,8 +282,8 @@ class Model:
                                                 device=self.device))
         try:
             with self.core.autocast(), scope:
-                out = inner(inputs_embeds=self.decoder.embed(batch), attention_mask=mask,
-                            use_cache=True)
+                out = inner(inputs_embeds=self.decoder.embed(batch) if embeds is None else embeds,
+                            attention_mask=mask, use_cache=True)
         finally:
             for hook in hooks:
                 hook.remove()
@@ -341,12 +353,11 @@ class Model:
         embed = self.decoder.embed_tokens
         seqs, starts = [], []
         for ex, fed in zip(examples, feed):
-            pre, post = self.prompts[ex['prompt']]
-            ids = torch.cat([pre, ex['ids'], post]).to(self.device)
+            source = self.write_inputs(ex)
             marker = self.writer.marker_embedding(
                 torch.tensor(ex['factor'], device=self.device)).unsqueeze(0)
-            seqs.append(torch.cat([embed(ids).float(), marker, fed.to(self.device).float()]))
-            starts.append(ids.shape[0])
+            seqs.append(torch.cat([source, marker, fed.to(self.device).float()]))
+            starts.append(source.shape[0])
         width = max(s.shape[0] for s in seqs)
         dim = seqs[0].shape[1]
         inputs = torch.zeros(len(seqs), width, dim, device=self.device, dtype=embed.weight.dtype)
@@ -357,6 +368,18 @@ class Model:
         spans = span_mask(starts, [1 + fed.shape[0] for fed in feed], width, self.device)
         hidden = self.hidden(self.decoder, inputs, mask, spans)
         return [hidden[i, starts[i]:starts[i] + 1 + feed[i].shape[0]] for i in range(len(seqs))]
+
+    def write_inputs(self, ex: dict) -> torch.Tensor:
+        """The writer's prompt and source as input embeddings. The source is text
+        (``ids``) or, for a merge, stored spans in the decoder's input space
+        (``source_embeds``, records separated by a blank line)."""
+        pre, post = self.prompts[ex['prompt']]
+        embed = self.decoder.embed_tokens
+        if 'source_embeds' not in ex:
+            return embed(torch.cat([pre, ex['ids'], post]).to(self.device)).float()
+        return torch.cat([embed(pre.to(self.device)).float(),
+                          ex['source_embeds'].to(self.device).float(),
+                          embed(post.to(self.device)).float()])
 
     def free_run(self, examples, lengths: list[int]):
         """Self-fed generation of ``lengths[i]`` reps; also the first predicted stop."""

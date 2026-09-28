@@ -25,6 +25,8 @@ from torch import nn
 # compressed output a general, prompted skill.
 MEMORY_PROMPT = ('Compact the following passage with BGKit into a memory record, so that '
                  'its content can later be recalled and reproduced verbatim.\n\n')
+MERGE_PROMPT = ('Merge the following memory records with BGKit into one memory record, so that '
+                'their combined content can later be recalled and reproduced verbatim.\n\n')
 SUMMARIZE_PROMPTS = {
     'reconstruct': 'Summarize this text with BGKit so that it can be reproduced verbatim.\n\n',
     'continue': 'Summarize this text with BGKit so that it can be continued.\n\n',
@@ -173,6 +175,13 @@ def checkpoint_layers(layers: nn.ModuleList) -> None:
             return _forward(*args, **kwargs)
 
         layer.forward = wrapped
+
+
+def release_checkpointing(layers: nn.ModuleList) -> None:
+    """Undo ``checkpoint_layers`` (e.g. on a deep copy, whose wrapped ``forward``
+    would otherwise still call the original layers)."""
+    for layer in layers:
+        layer.__dict__.pop('forward', None)
 
 
 def attach_write_adapter(layers: nn.ModuleList, targets: tuple[str, ...], rank: int,

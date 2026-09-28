@@ -38,17 +38,27 @@ teacher reps of every input record by the writer's own free-running spans
 writer trains too, so gradients run writer -> combiner -> reader in one graph,
 the writer keeping its cosine and stop losses as an anchor (``writer`` weight).
 
+``--combiner decoder`` (decision log, 28 September) replaces the mixer by the
+decoder itself: the writer reads the included records' spans (gate >= 0.5, in
+order, separated by a blank line) under a merge prompt and writes a new span of
+the target's length (rollout passes as in B3; free-running at evaluation). The
+writer (heads and decoder) trains; reads go through a frozen copy of the decoder
+taken at load, so the reader of both modes is the same.
+
 Evaluation on validation episodes (gates at the current policy, no feedback
 record): answer and reconstruction NLL for no context, full gold text, teacher
 span, the gold records' teacher spans concatenated, the combiner over golds, over
 golds + related, and over related only (gold removed), as captured fractions of
-the full-text gain; and matched controls built from the next episode
+the full-text gain; a length-matched control (``gold_pooled``: the concatenated
+gold spans mean-pooled in equal chunks to the combiner's output length, since
+``gold_spans`` reads about 1.4x as many reps); and matched controls built from the next episode
 (``teacher_shuffled``, ``comb_shuffled``). A trained span can lower NLL by format
 alone, so ``content_nats`` (shuffled minus actual) is the measure of content. Training-only; runs in ``schnitz-bgkit``.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 import random
@@ -63,7 +73,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_bgkit_reps import (SPACES, Model, TeacherCache, _example, _kl,  # noqa: E402
                               _rollout)
 
-from schnitz.bgkit_span import SpaceCodec  # noqa: E402
+from schnitz.bgkit_span import SpaceCodec, interface_rms, release_checkpointing  # noqa: E402
 
 
 class GateHead(nn.Module):
@@ -110,13 +120,51 @@ class Combiner:
                 if unexpected or any(not k.startswith('key_record') for k in missing):
                     raise ValueError(f'codec init mismatch: {missing} {unexpected}')
         self.gate_head = GateHead(1024)
+        self.mode = args.combiner
+        self.reader = model.decoder
+        if self.mode == 'decoder':
+            self.reader = copy.deepcopy(model.decoder)
+            release_checkpointing(self.reader.base_lm.model.layers)
+            for param in self.reader.parameters():
+                param.requires_grad_(False)
+        self.separator = model.text_ids('\n\n')
         self.combiners.to(model.device)
         self.gate_head.to(model.device)
         from bgkit2.data.templates import decoder_sentinel
         self.sentinel = decoder_sentinel(model.tok)
 
     def parameters(self):
-        return list(self.combiners.parameters()) + list(self.gate_head.parameters())
+        mixer = list(self.combiners.parameters()) if self.mode == 'mixer' else []
+        return mixer + list(self.gate_head.parameters())
+
+    def read(self, views, reps, full: bool = False):
+        return self.model.read(views, reps, full, decoder=self.reader)
+
+    def merge_writes(self, examples, gates) -> list[dict]:
+        """Writer inputs for a decoder merge: the included records' spans in order."""
+        embed = self.model.decoder.embed_tokens
+        sep = embed(self.separator.to(self.model.device)).float()
+        writes = []
+        for ex, g in zip(examples, gates):
+            parts = []
+            for record, gate in zip(ex['records'], g.tolist()):
+                if gate >= 0.5:
+                    parts += ([sep] if parts else []) + [record.float()]
+            source = torch.cat(parts) if parts else sep[:0]
+            writes.append({'prompt': 'merge', 'source_embeds': source,
+                           'teacher': ex['target_reps'], 'factor': ex['factor']})
+        return writes
+
+    def combine_batch(self, examples, gates, train: bool = False):
+        """Combined spans for a batch; with ``train`` in decoder mode also the stop loss."""
+        if self.mode == 'mixer':
+            return [self.combine(ex, g) for ex, g in zip(examples, gates)], None
+        writes = self.merge_writes(examples, gates)
+        if train:
+            _, preds, _, stop = _rollout(self.model, writes, self.args.merge_passes, 1.0)
+            return preds, stop
+        spans, _ = self.model.free_run(writes, [ex['target_reps'].shape[0] for ex in examples])
+        return spans, None
 
     def question_instr(self, query: str) -> torch.Tensor:
         sent_str, sent_id = self.sentinel
@@ -168,6 +216,7 @@ class Combiner:
         return {'tag': tag, 'kinds': [kind for kind, _ in entries], 'records': records,
                 'record_ids': record_ids,
                 'target_reps': target, 'feedback': feedback, 'query': row['query'],
+                'factor': episodes.cache.factor(shard, erow, tag),
                 'recon': {'ids': ids, 'target': ids, 'task': 'reconstruct'},
                 'qa': {'ids': ids, 'target': answer, 'task': 'reconstruct',
                        'instr': self.question_instr(row['query'])}}
@@ -225,11 +274,12 @@ class Combiner:
                               for j, k in enumerate(ex['kinds']) if k == 'related']
             for v in variants:
                 views.append(ex['qa'])
-                spans.append(self.combine(ex, v))
+                spans.append((ex, v))
             owners.append((i, len(variants)))
         if not views:
             return labels
-        logits, targets = model.read(views, spans)
+        spans, _ = self.combine_batch([ex for ex, _ in spans], [v for _, v in spans])
+        logits, targets = self.read(views, spans)
         nll = F.cross_entropy(logits, targets, reduction='none')
         lengths = [int(v['target'].numel()) + 1 for v in views]  # answer tokens + eos
         if sum(lengths) != nll.numel():
@@ -289,7 +339,7 @@ def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_g
     with model.core.autocast():
         anchor = comb.own_spans(examples, comb.args.writer_train)
         gates, scores = comb.gates(examples, learned, related_gate, trusted)
-        outs = [comb.combine(ex, g) for ex, g in zip(examples, gates)]
+        outs, merge_stop = comb.combine_batch(examples, gates, train=True)
         bce = None
         if learned:
             labels = comb.utility_labels(examples, gates, comb.args.utility_examples)
@@ -299,15 +349,18 @@ def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_g
         result, loss = {'cos': cos.item()}, distill * weights['cos'] * cos
         for part in ('recon', 'qa'):
             views = [ex[part] for ex in examples]
-            logits, targets = model.read(views, outs)
+            logits, targets = comb.read(views, outs)
             with torch.no_grad():
-                t_logits, _ = model.read(views, teacher)
+                t_logits, _ = comb.read(views, teacher)
             nll, kl = F.cross_entropy(logits, targets), _kl(logits, t_logits)
             loss = loss + weights[f'{part}_nll'] * nll + distill * weights[f'{part}_kl'] * kl
             result[f'{part}_nll'], result[f'{part}_kl'] = nll.item(), kl.item()
         if bce is not None:
             loss = loss + weights['gate'] * bce
             result['gate_bce'] = bce.item()
+        if merge_stop is not None:
+            loss = loss + weights.get('stop', 0.2) * merge_stop
+            result['merge_stop'] = merge_stop.item()
         if anchor is not None:
             loss = loss + weights.get('writer', 0.5) * anchor
             result['writer_anchor'] = anchor.item()
@@ -347,21 +400,32 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool,
                 spans = {
                     'teacher': [ex['target_reps'] for ex in full],
                     'gold_spans': [torch.cat(ex['records']) for ex in only],
-                    'comb_gold': [comb.combine(ex, torch.ones(len(ex['records']),
-                                                              device=model.device)) for ex in only],
-                    'comb_gold_related': [comb.combine(ex, g) for ex, g in zip(full, g_full)],
-                    # related records at full weight: their content, not the gate policy
-                    'comb_related_only': [comb.combine(ex, torch.ones(len(ex['records']),
-                                                                      device=model.device))
-                                          if ex['records'] else ex['target_reps'][:0]
-                                          for ex in rel]}
+                    # length-matched control: the concatenated gold spans pooled in
+                    # equal chunks to the combiner's output length m
+                    'gold_pooled': [interface_rms(torch.stack([
+                        c.mean(0) for c in torch.tensor_split(torch.cat(ex['records']).float(),
+                                                              ex['target_reps'].shape[0])]),
+                        model.target_norm) for ex in only],
+                    'comb_gold': comb.combine_batch(
+                        only, [torch.ones(len(ex['records']), device=model.device)
+                               for ex in only])[0],
+                    'comb_gold_related': comb.combine_batch(full, g_full)[0]}
+                # related records at full weight: their content, not the gate policy
+                with_rel = [ex for ex in rel if ex['records']]
+                made = iter(comb.combine_batch(
+                    with_rel, [torch.ones(len(ex['records']), device=model.device)
+                               for ex in with_rel])[0] if with_rel else [])
+                spans['comb_related_only'] = [next(made) if ex['records'] else
+                                              ex['target_reps'][:0] for ex in rel]
                 # matched controls: the same kind of span built from the next episode
                 spans['teacher_shuffled'] = spans['teacher'][1:] + spans['teacher'][:1]
                 spans['comb_shuffled'] = spans['comb_gold'][1:] + spans['comb_gold'][:1]
+                spans['spans_shuffled'] = spans['gold_spans'][1:] + spans['gold_spans'][:1]
+                spans['pooled_shuffled'] = spans['gold_pooled'][1:] + spans['gold_pooled'][:1]
                 for part in ('recon', 'qa'):
                     views = [ex[part] for ex in full]
-                    arms = {'noctx': model.read(views, None), 'full': model.read(views, None, True)}
-                    arms.update({name: model.read(views, reps) for name, reps in spans.items()})
+                    arms = {'noctx': comb.read(views, None), 'full': comb.read(views, None, True)}
+                    arms.update({name: comb.read(views, reps) for name, reps in spans.items()})
                     for name, (logits, targets) in arms.items():
                         sums[part, name] = sums.get((part, name), 0.0) + F.cross_entropy(
                             logits, targets, reduction='sum').item()
@@ -375,6 +439,8 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool,
                                          for k, v in nll.items() if k not in ('noctx', 'full')},
                             'content_nats': {
                                 'teacher': round(nll['teacher_shuffled'] - nll['teacher'], 4),
+                                'gold_spans': round(nll['spans_shuffled'] - nll['gold_spans'], 4),
+                                'gold_pooled': round(nll['pooled_shuffled'] - nll['gold_pooled'], 4),
                                 'comb_gold': round(nll['comb_shuffled'] - nll['comb_gold'], 4),
                                 'comb_gold_related': round(nll['comb_shuffled']
                                                            - nll['comb_gold_related'], 4)}}
@@ -407,6 +473,10 @@ def main() -> None:
     parser.add_argument('--eval-episodes', type=Path, required=True)
     parser.add_argument('--eval-cache', type=Path, required=True)
     parser.add_argument('--init-codecs', type=Path)
+    parser.add_argument('--combiner', choices=['mixer', 'decoder'], default='mixer',
+                        help='mixer: the SpaceCodec operator; decoder: the writer merges spans')
+    parser.add_argument('--merge-passes', type=int, default=4,
+                        help='decoder mode: rollout passes of the merge writes')
     parser.add_argument('--init-combiner', type=Path,
                         help='start from a finished combiner.pt (combiners and gate head)')
     parser.add_argument('--writer-state', type=Path,
@@ -457,18 +527,20 @@ def main() -> None:
         gate_open_start=-1, merge_at=-1, merge_checkpoint=True))
     if args.writer_state:
         model.load_trained(torch.load(args.writer_state, map_location=model.device))
-        if not args.writer_train:  # loading a merged writer unfreezes the decoder
+        if not args.writer_train and args.combiner == 'mixer':  # a merged writer unfreezes the decoder
             for param in list(model.decoder.parameters()) + list(model.writer.parameters()):
                 param.requires_grad_(False)
     comb = Combiner(args, model, bank)
     groups = [{'params': comb.parameters(), 'lr': args.lr}]
-    if args.writer_train:
+    if args.writer_train or args.combiner == 'decoder':
         writer_args = argparse.Namespace(lr=args.writer_lr, adapter_lr=args.writer_lr,
                                          decoder_lr=args.writer_lr / 10)
         groups += model.param_groups(writer_args)
     optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
     args.output.mkdir(parents=True, exist_ok=True)
     state_path, step, trusted = args.output / 'combiner.pt', 0, False
+    if args.combiner == 'decoder' and not args.writer_state:
+        raise ValueError('--combiner decoder needs --writer-state (a B3 writer)')
     if not state_path.exists() and args.init_combiner:
         state = torch.load(args.init_combiner, map_location=model.device)
         comb.combiners.load_state_dict(state['combiners'])
@@ -530,7 +602,8 @@ def main() -> None:
                 log({'step': step, 'event': 'gate head beats the base rate; learned gates on'})
             torch.save({'combiners': comb.combiners.state_dict(),
                         'gate_head': comb.gate_head.state_dict(),
-                        **({'writer': model.trained_state()} if args.writer_train else {}),
+                        **({'writer': model.trained_state()}
+                           if args.writer_train or args.combiner == 'decoder' else {}),
                         'optimizer': optimizer.state_dict(), 'step': step,
                         'gates_trusted': trusted},
                        state_path.with_suffix('.pending'))
