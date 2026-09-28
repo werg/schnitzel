@@ -758,6 +758,75 @@ def parallel_recall(output: Path, *, versions: list[str] | None, targets: list[s
         'episode_rejects': result['rejected'], 'summary': pr.summary(result)})
 
 
+# -- citation contexts grouped by cited paper ------------------------------------------
+def _token_counter(name: str | None):
+    """Token counts with ``name``'s tokenizer (local files only), else the word estimate."""
+    from schnitz import citances
+    if not name:
+        return citances.approx_tokens, 'approx_words_x1.35'
+    try:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(name, local_files_only=True)
+    except Exception as error:  # noqa: BLE001 - optional tokenizer
+        print(f'tokenizer {name} unavailable ({error}); using the word estimate', file=sys.stderr)
+        return citances.approx_tokens, 'approx_words_x1.35'
+    return (lambda text: len(tok.encode(text, add_special_tokens=False))), name
+
+
+def citance_recall(output: Path, *, raw: Path, min_citances: int, max_citances: int,
+                   validation: int, train: int | None, heldout_rate: float,
+                   descriptions: bool, tokenizer: str | None, seed: int) -> dict:
+    """Citation contexts from unarXive (``schnitz.citances``): per cited arXiv paper its
+    citances from distinct citing papers in the KB; episodes recall the cited abstract
+    (never stored) or a held-out citing paper's citance. Needs
+    ``scripts/fetch_citance_metadata.py`` to have filled ``raw/metadata``."""
+    from schnitz import citances
+    meta = raw / 'metadata'
+    cited = {r['cited']: r for r in map(json.loads, (meta / 'cited-works.jsonl').open())
+             if r.get('abstract') and r.get('title')}
+    # an OpenAlex id whose current record names another work than its arXiv location
+    mismatched = [c for c, r in cited.items()
+                  if not citances.titles_agree(r['title'], r.get('openalex_title'))]
+    for c in mismatched:
+        del cited[c]
+    citing = {r['arxiv_id']: r for r in map(json.loads, (meta / 'citing-papers.jsonl').open())
+              if r.get('title')}
+    wanted = {}
+    for row in map(json.loads, (meta / 'cited-candidates.jsonl').open()):
+        if row['cited'] in cited:
+            wanted[row['cited']] = {c for c in row['citers'] if c in citing}
+    sample = {}
+    with (raw / 'unarxive-citrec/license_info.jsonl').open() as handle:
+        for line in handle:
+            row = json.loads(line)
+            if row['paper_arxiv_id'] in citing:
+                for s in row['sample_ids']:
+                    sample[s] = row['paper_arxiv_id']
+
+    def rows():
+        for name in ('train', 'dev', 'test'):
+            with (raw / 'unarxive-citrec/data' / f'{name}.jsonl').open() as handle:
+                yield from map(json.loads, handle)
+
+    contexts, pass_counts = citances.collect(rows(), sample, wanted, seed)
+    del sample
+    count, counter = _token_counter(tokenizer)
+    recs, episodes, summary = citances.build(
+        contexts, cited, citing, min_citances=min_citances, max_citances=max_citances,
+        validation=validation, train=train, heldout_rate=heldout_rate,
+        description_episodes=descriptions, count=count, seed=seed)
+    writer = Writer(output, citances.DOMAIN)
+    for split, items in episodes.items():
+        for item in items:
+            writer.add(split, item, recs if not writer.sources else [])
+    return writer.close({'domain': citances.DOMAIN, 'generator': 'schnitz.citances',
+                         'source': 'saier/unarXive_citrec@df769ff (CC BY-SA 4.0) + arXiv '
+                                   'metadata (CC0) via OpenAlex ids',
+                         'raw': str(raw), 'token_counter': counter,
+                         'cited_title_mismatch_dropped': len(mismatched),
+                         'context_pass': dict(pass_counts), **summary})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='dataset', required=True)
@@ -839,6 +908,19 @@ def main() -> None:
     pr_.add_argument('--seed', type=int, default=0)
     pr_.add_argument('--tokenizer', help='tokenizer directory for the 64-200 token target '
                      'window (default: characters / 4)')
+    cr = sub.add_parser('citance-recall', help='unarXive citances grouped by cited paper')
+    cr.add_argument('--raw', type=Path, default=RAW / 'citances-20260928')
+    cr.add_argument('--min-citances', type=int, default=8,
+                    help='stored citances (distinct citing papers) per cited paper')
+    cr.add_argument('--max-citances', type=int, default=32)
+    cr.add_argument('--validation', type=int, default=300, help='validation cited papers')
+    cr.add_argument('--train', type=int, help='training cited papers (default: all)')
+    cr.add_argument('--heldout-rate', type=float, default=0.1,
+                    help='share of citing papers held out of the KB (description targets)')
+    cr.add_argument('--no-descriptions', dest='descriptions', action='store_false')
+    cr.add_argument('--tokenizer', default='LiquidAI/LFM2.5-350M',
+                    help='tokenizer for the 128-256-token abstract target (local files)')
+    cr.add_argument('--seed', type=int, default=0)
     for s in sub.choices.values():
         s.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -856,6 +938,12 @@ def main() -> None:
         manifest = reasoning_gym(args.output, args.pool)
     elif args.dataset == 'synlogic':
         manifest = synlogic(args.output, args.pool, args.min_ascii)
+    elif args.dataset == 'citance-recall':
+        manifest = citance_recall(args.output, raw=args.raw, min_citances=args.min_citances,
+                                  max_citances=args.max_citances, validation=args.validation,
+                                  train=args.train, heldout_rate=args.heldout_rate,
+                                  descriptions=args.descriptions, tokenizer=args.tokenizer,
+                                  seed=args.seed)
     elif args.dataset == 'knights':
         manifest = knights(args.output, args.examples, args.seed)
     elif args.dataset == 'synth-people':
