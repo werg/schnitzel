@@ -343,15 +343,21 @@ class L1Reader(nn.Module):
              exclude: Mapping[str, Collection[Ref]] | None = None,
              producer: Producer | None = None,
              weights: Mapping[str, float] | None = None,
-             alternatives: Mapping[str, Sequence[Ref]] | None = None) -> Read:
+             alternatives: Mapping[str, Sequence[Ref]] | None = None,
+             neutral: Mapping[str, Sequence[Ref]] | None = None) -> Read:
         """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
         they are the read). ``alternatives`` (per space): other items that alone hold
         the slot's content (redundant copies); they are extra positives of the
         retrieval loss and never its negatives, recall then counts a read as a hit
         when any positive is among the items (``any``), and the gold read stays
-        ``targets``. Every KB must be authorized, and so must every target,
-        alternative and negative item.
+        ``targets``. ``neutral`` (per space): items that are neither positives nor
+        negatives of the retrieval loss (near-duplicates of the positives that do not
+        hold the slot's content, e.g. overlapping windows of the same document): they
+        leave the loss's list (scored candidates and ``negatives``) but may still be
+        retrieved and read; a positive named neutral stays positive, and recall is
+        unchanged. Every KB must be authorized, and so must every target, alternative,
+        negative and neutral item.
 
         ``negatives`` (per space): extra items scored as negatives in the retrieval
         loss (in-batch negatives; the caller passes only items of the read's own KBs).
@@ -367,7 +373,8 @@ class L1Reader(nn.Module):
         A superposed cache (``schnitz.kb.superpose.SuperposedCache``) serves rows computed
         from the KB's items: the search runs over the rows, targets, negatives and
         exclusions name the KB's items and are mapped to the rows covering them (positives
-        weighted by their share of the row's mass), and ``producer`` is the cache's."""
+        weighted by their share of the row's mass; a row covering a neutral item is
+        neutral unless it covers a positive), and ``producer`` is the cache's."""
         c = self.config
         allowed = set(allowed)
         denied = [kb.dataset for kb in kbs if kb.dataset not in allowed]
@@ -375,7 +382,7 @@ class L1Reader(nn.Module):
             raise PermissionError(f'not authorized to read {denied}')
         by_dataset = {kb.dataset: kb for kb in kbs}
         for what, named in (('target', targets), ('alternative', alternatives),
-                            ('negative', negatives)):
+                            ('negative', negatives), ('neutral', neutral)):
             for dataset, _ in (r for rs in (named or {}).values() for r in rs):
                 if dataset not in allowed or dataset not in by_dataset:
                     raise PermissionError(f'{what} item of {dataset!r} is not readable here')
@@ -425,8 +432,13 @@ class L1Reader(nn.Module):
                     others = [r for r in (negatives or {}).get(s, ()) if r not in banned]
                     if superposed and others:
                         others = cache.gold(s, others, banned)
+                    # neutral items (rows covering them) leave the list; positives stay
+                    idle = list(dict.fromkeys((neutral or {}).get(s, ())))
+                    if superposed and idle:
+                        idle = cache.gold(s, idle, banned)
+                    idle = {r for r in idle if r not in positive}
                     loss, at = self._retrieval_loss(s, q, refs, scores, positive, by_dataset,
-                                                    cache, query_time, others)
+                                                    cache, query_time, others, idle)
                     if loss is not None:
                         aux.append(loss)
                         recall_at.update({f'{k}_{s}': v for k, v in at.items()})
@@ -618,11 +630,20 @@ class L1Reader(nn.Module):
         return Read(span, info, None, n, {}, state.detach())
 
     def _retrieval_loss(self, space, q, refs, scores, wanted: Mapping[Ref, float], by_dataset,
-                        cache, query_time, negatives: Sequence[Ref] = ()):
+                        cache, query_time, negatives: Sequence[Ref] = (),
+                        neutral: Collection[Ref] = frozenset()):
         """Over the scored candidates, plus the positives the search missed and
         ``negatives`` not already among them (in-batch negatives), each scored from its
         current values; items later than the query time are left out. ``wanted`` maps each
-        positive to its weight (1 for the slot's own items; a covering row's share)."""
+        positive to its weight (1 for the slot's own items; a covering row's share).
+        ``neutral`` items (never positives) are neither: scored candidates among them
+        leave the list and negatives among them are not added."""
+        if neutral:
+            keep = [k for k, r in enumerate(refs) if r not in neutral or r in wanted]
+            if len(keep) < len(refs):
+                refs = [refs[k] for k in keep]
+                scores = scores[torch.tensor(keep, dtype=torch.long, device=scores.device)]
+            negatives = [r for r in negatives if r not in neutral]
         seen = set(refs)
         extra = [r for r in wanted if r not in seen]
         extra += [r for r in dict.fromkeys(negatives) if r not in seen and r not in wanted]

@@ -191,6 +191,87 @@ def test_alternatives_are_positives_never_negatives_and_gold_reads_targets(tmp_p
     assert all(info.refs == targets[s] for s, info in gold.spaces.items())
 
 
+def _loss_over(r, kb, cache, state, pool, positives):
+    """The retrieval loss per space over ``pool`` (scored from current values)."""
+    want = []
+    for s in SPACES:
+        q = r.keys.query_key(s, state)
+        keys = torch.stack([r.keys.item_key(s, cache.get(kb, s, [i])[0][0]) for _, i in pool[s]])
+        positive = torch.tensor([p in set(positives[s]) for p in pool[s]])
+        want.append(retrieval_loss(r.keys.scores(s, q[None], keys), positive[None])[0])
+    return torch.stack(want).mean()
+
+
+def test_neutral_items_leave_the_retrieval_loss(tmp_path):
+    """Neutral items are neither positives nor negatives: scored candidates and in-batch
+    negatives that are neutral leave the loss's list; a neutral positive stays positive;
+    they may still be read."""
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(8)))
+    every = {'A': 8, 'B': 8, 'C': 8, 'D': 8}
+    r = reader(candidates=every, keep=every)
+    state = torch.randn(HIDDEN)
+    targets, copies = targets_of(kb, ['r0']), targets_of(kb, ['r1'])
+    neutral = targets_of(kb, ['r1', 'r2', 'r3'])      # r1 is also a positive: stays one
+    cache = ItemCache(train=True)
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets, alternatives=copies,
+                  neutral=neutral)
+    pool, positives = {}, {}
+    for s, info in read.spaces.items():
+        assert set(neutral[s]) <= set(info.scored) and set(neutral[s]) <= set(info.refs)
+        positives[s] = targets[s] + copies[s]
+        pool[s] = [p for p in info.scored if p not in set(neutral[s]) or p in positives[s]]
+        assert len(pool[s]) == 6
+    torch.testing.assert_close(read.aux, _loss_over(r, kb, cache, state, pool, positives))
+    read.aux.backward()
+    for s in SPACES:       # a neutral item gets no retrieval gradient (the read is detached
+        for _, i in targets_of(kb, ['r2', 'r3'])[s]:    # from aux here: no task loss)
+            assert cache.values[('ds', s, i)].grad is None or \
+                cache.values[('ds', s, i)].grad.abs().sum() == 0
+
+    # a neutral item offered as an in-batch negative is dropped; the others stay
+    one = {'A': 1, 'B': 1, 'C': 1, 'D': 1}
+    r = reader(candidates=one, keep=one)
+    cache = ItemCache(train=True)
+    negs = targets_of(kb, ['r2', 'r3', 'r4', 'r5'])
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets, negatives=negs,
+                  neutral=targets_of(kb, ['r2', 'r3']))
+    only = r.read(state, [kb], ['ds'], 3, ItemCache(train=True), targets=targets,
+                  negatives=targets_of(kb, ['r4', 'r5']), neutral=targets_of(kb, ['r2', 'r3']))
+    assert torch.equal(read.aux, only.aux)
+    with_neutral_negatives = r.read(state, [kb], ['ds'], 3, ItemCache(train=True),
+                                    targets=targets, negatives=negs)
+    assert not torch.equal(read.aux, with_neutral_negatives.aux)
+
+
+def test_absent_neutral_leaves_the_loss_unchanged_bit_for_bit(tmp_path):
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(8)) + (('r9', 5),))
+    r = reader(candidates={'A': 3, 'B': 3, 'C': 3, 'D': 3})
+    state = torch.randn(HIDDEN)
+    targets, copies = targets_of(kb, ['r0']), targets_of(kb, ['r5'])
+    negs = targets_of(kb, ['r2', 'r3', 'r4'])
+
+    def aux(**kw):
+        return r.read(state, [kb], ['ds'], 3, ItemCache(train=True), targets=targets,
+                      alternatives=copies, negatives=negs, **kw)
+    base = aux()
+    for neutral in (None, {}, {s: [] for s in SPACES},
+                    targets_of(kb, ['r9'])):   # only later than the query: never scored
+        got = aux(neutral=neutral)
+        assert torch.equal(got.aux, base.aux)
+        assert got.recall_at == base.recall_at
+        for s in SPACES:
+            assert got.spaces[s].refs == base.spaces[s].refs
+            assert got.spaces[s].recall == base.spaces[s].recall
+
+
+def test_neutral_items_are_authorized_like_the_other_named_items(tmp_path):
+    kb = make_kb(tmp_path, 'kb', 'ds')
+    other = make_kb(tmp_path, 'other', 'secret')
+    with pytest.raises(PermissionError):
+        reader().read(torch.randn(HIDDEN), [kb], ['ds'], 3, ItemCache(train=False),
+                      targets=targets_of(kb, ['r1']), neutral=targets_of(other, ['r2']))
+
+
 def test_read_count_is_mass_weighted_length_in_reps_capped(tmp_path):
     kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1)))   # items 2 and 3 positions long
     targets = targets_of(kb, ['r1', 'r2'])
@@ -527,6 +608,32 @@ def test_inbatch_negatives_stay_in_their_kb(tmp_path):
                 assert value is None or value.grad is None
             elif (d, i) not in read.spaces[s].scored:
                 assert value.grad.abs().sum() > 0
+
+
+def test_context_neutral_and_batch_negatives_skip_a_slots_neutral(tmp_path):
+    import random
+    ctx, _ = context(tmp_path)
+    a = episode(IDS, [3, 10], [6, 13], records=(['r1'], ['r2']))
+    a.slots[0]['alternatives'] = ['r1', 'r3']
+    a.slots[0]['neutral'] = ['r1', 'r2', 'r3', 'r4']   # positives never neutral
+    b = episode(IDS, [3, 10], [6, 13], records=(['r3'], ['r1']))
+    kb = ctx.kbs['ds']
+    assert ctx.neutral(a, 0) == targets_of(kb, ['r2', 'r4'])
+    assert ctx.neutral(a, 1) is None and ctx.neutral(b, 0) is None
+    # the batch pool offers r2 (a's slot 1, b's slots) to a's slot 0, which drops it
+    pool = l1.batch_negatives(ctx, [a, b], 16, random.Random(0))
+    assert all(set(targets_of(kb, ['r2'])[s]) <= set(pool['ds'][s]) for s in SPACES)
+    one = {'A': 1, 'B': 1, 'C': 1, 'D': 1}
+    ctx.reader = reader(candidates=one, keep=one)
+    state = torch.randn(HIDDEN)
+    kw = dict(targets=ctx.targets(a, 0), alternatives=ctx.alternatives(a, 0))
+    got = ctx.reader.read(state, [kb], ['ds'], 3, ItemCache(train=False),
+                          negatives=pool['ds'], neutral=ctx.neutral(a, 0), **kw)
+    kept = {s: [p for p in refs if p not in set(targets_of(kb, ['r2', 'r4'])[s])]
+            for s, refs in pool['ds'].items()}
+    want = ctx.reader.read(state, [kb], ['ds'], 3, ItemCache(train=False),
+                           negatives=kept, neutral=ctx.neutral(a, 0), **kw)
+    assert torch.equal(got.aux, want.aux)
 
 
 def write_context(tmp_path, live=True):

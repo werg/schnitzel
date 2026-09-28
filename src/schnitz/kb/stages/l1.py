@@ -36,7 +36,8 @@ reader's own copies of its layers below N, the writer keeping the parent's weigh
 with a KL to the parent on the no-read context). An auxiliary retrieval loss (listwise, over
 the scored candidates, the targets the search missed and in-batch negatives: the
 target items of the batch's other slots in the same KB, never another KB's) supervises
-routing; recall@k per space is logged. ``--init-reader`` starts from a K2 run's key
+routing; a slot's ``neutral`` records (near-duplicates of its positives) are neither
+positives nor negatives of it. recall@k per space is logged. ``--init-reader`` starts from a K2 run's key
 heads and gate offsets (K2 -> L1a; the search keys are refreshed from them).
 
 Content dependence (all off by default): ``--contrast-weight`` adds per episode
@@ -472,6 +473,19 @@ class Context:
         index = self.index[ep.kb]
         return {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())] for s in index}
 
+    def neutral(self, ep: Episode, j: int) -> dict[str, list[tuple[str, str]]] | None:
+        """The slot's neutral items (``neutral``: records that are neither positives nor
+        negatives of its retrieval loss, e.g. the other windows of the target's document)
+        per space; the slot's own records and alternatives are never neutral. None
+        without any."""
+        slot = ep.slots[j]
+        positive = {*slot['record_ids'], *(slot.get('alternatives') or ())}
+        names = [r for r in dict.fromkeys(slot.get('neutral') or ()) if r not in positive]
+        if not names:
+            return None
+        index = self.index[ep.kb]
+        return {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())] for s in index}
+
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
                 spans: list[torch.Tensor] | None = None, retrieval_only: bool = False,
@@ -531,6 +545,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                     read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            alternatives=ctx.alternatives(ep, j),
+                                           neutral=ctx.neutral(ep, j),
                                            gold=mode == 'gold', negatives=negatives,
                                            exclude=exclude,
                                            producer=None if mode == 'gold'
@@ -903,7 +918,9 @@ def batch_negatives(ctx: Context, episodes: list[Episode], limit: int,
                     rng: random.Random) -> dict[str, dict[str, list]]:
     """In-batch negatives per KB and space: the target items of every slot of the
     batch's episodes, grouped by the episode's own KB (never across KBs: a KB is an
-    authorization domain), at most ``limit`` per (KB, space), sampled."""
+    authorization domain), at most ``limit`` per (KB, space), sampled. The pool is
+    shared by the batch; each read drops its own slot's positives and neutral items
+    from it (``L1Reader.read``)."""
     pool: dict[str, dict[str, list]] = {}
     for ep in episodes:
         for j in range(len(ep.slots)):

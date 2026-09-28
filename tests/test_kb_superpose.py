@@ -140,6 +140,40 @@ def test_no_mixing_across_kbs_and_authorization(tmp_path):
         r.read(torch.randn(HIDDEN), [a, b], ['ds'], 5, cache)
 
 
+def test_neutral_leaves_map_to_rows_and_a_positive_row_stays_positive(tmp_path, monkeypatch):
+    from schnitz.kb import read as read_module
+    kb = leaf_kb(tmp_path, n=24)
+    view, _ = view_of(kb, config(), tmp_path)
+    cache = sp.SuperposedCache({'ds': view}, train=False)
+    many = {s: 64 for s in SPACES}
+    r = reader(read_combine='r', learned_keys=True, candidates=many, keep=many)
+    seen = []
+    real = read_module.retrieval_loss
+    monkeypatch.setattr(read_module, 'retrieval_loss',
+                        lambda scores, positive: seen.append(positive[0].clone()) or
+                        real(scores, positive))
+    state = torch.randn(HIDDEN)
+    leaves = {s: current_ids(kb, s) for s in SPACES}
+    targets = {s: [('ds', leaves[s][0])] for s in SPACES}
+    neutral = {s: [('ds', i) for i in leaves[s][:8]] for s in SPACES}   # includes the target
+    base = r.read(state, [kb], ['ds'], 3, cache, targets=targets)
+    plain = list(seen)
+    seen.clear()
+    got = r.read(state, [kb], ['ds'], 3, cache, targets=targets, neutral=neutral)
+    dropped = kept_positive = 0
+    for k, s in enumerate(SPACES):
+        positive = cache.positives(s, targets[s])
+        rows = {ref for ref in cache.gold(s, neutral[s])} - set(positive)
+        scored = base.spaces[s].scored
+        assert got.spaces[s].scored == scored          # the search itself is unchanged
+        # the covering rows stay positive with their shares; neutral rows leave the list
+        assert sorted(plain[k][plain[k] > 0].tolist()) == sorted(seen[k][seen[k] > 0].tolist())
+        assert len(plain[k]) - len(seen[k]) == len(rows & set(scored))
+        dropped += len(rows & set(scored))
+        kept_positive += bool(set(cache.gold(s, neutral[s])) & set(positive))
+    assert dropped and kept_positive
+
+
 # -- lazy evaluation, gradients, keys ------------------------------------------------------------
 def test_lazy_rows_equal_the_full_stack_when_caches_are_fresh(tmp_path):
     kb = leaf_kb(tmp_path)
