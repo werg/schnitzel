@@ -388,6 +388,39 @@ so later episodes sharing rules or entities can use them.
   a worked-example pool in its KB, disjoint from its episodes. `-bg` variants
   add BM25-selected background passages (`add_background.py`: Wikipedia dump,
   ConceptNet, WorldTree, Python docs) as KB records and supports.
+- *Schema aliasing for Spider and BIRD (28 September;
+  `prepare_task_corpora.py spider|bird`, `schnitz.sql_alias`):* on the plain
+  corpora table and column names are mostly guessable from the question, so the
+  read carried no content. `--alias-variants N` (default 0 = the plain corpus,
+  identical up to the old hash-random record order) gives every database, train
+  and dev, N variants that rename the database id, every table and every column
+  (one namespace per database; a name shared by tables keeps one alias).
+  `--alias-style semantic` (default) keeps names meaningful but not guessable
+  (hand synonym table, abbreviations, camelCase/PascalCase, `tbl_`/`t_` prefixes,
+  plural changes, reordered compounds; one convention per variant), `random` uses
+  unrelated word pairs. Fresh names are unique in the database, never equal to an
+  original (also modulo case and separators) and never SQL keywords. The rename
+  covers the CREATE TABLE text (positionally), column notes and evidence
+  (identifier-like names at word boundaries, plain words only in identifier
+  syntax), value and row headers, the query's database name and the gold SQL
+  (tokenizer: literals and comments kept, quoted and bare identifiers,
+  `alias.column`). Episodes are dropped (`filtered`: `alias_<reason>`) when a
+  query alias collides with a schema name, a double-quoted schema name stands
+  where SQLite may read it as a string, or the inverse rename does not give the
+  gold back. Each episode uses one variant (seeded by its id); the KB holds every
+  variant, so retrieval has to find the right one. `verify.alias.inverse` maps an
+  answer back to the original names, which run on the original database; an
+  answer using an original name fails. `--db-handle name|opaque|none` (default
+  `name`, the variant's aliased database id; `opaque` a code `db_xxxxxx`, a pure
+  exact-string key; `none` only for unaliased corpora); `--no-handle-fraction f`
+  puts a share f of the episodes on the original database with no database named
+  in the query (retrieval from the question's meaning; the original records join
+  the KB). Provenance keeps `original_db_id`/`original_db`, `original_table`,
+  `original_column` and `alias_variant`; for `-bg` corpora `add_background.py`
+  takes `--topic-field original_db_id`. `--alias-seed` draws new aliases; the
+  plan regenerates the aliased corpora with a new seed between long runs so that
+  names are not memorized. The option exists, but no aliased corpora were
+  generated (owner, 28 September: SQL hardening deprioritized).
 - *Single-pass S2 baselines (greedy, docs/schema in context; S2 vs base):*
   Spider 13% vs 21%, BIRD ≈0–5% both, KodCode easy 2% vs 7%, xLAM 41% vs 59%.
   Knights & Knaves S2 (plain / with worked examples): 3 people 17%/12%, 4 people
@@ -887,3 +920,22 @@ log your decisions and changes of direction"), newest last.
   steps moved the rows only about 1%. It uses 300 transcripts per corpus, 2000 read
   steps and item lr 3e-2 (10x the smoke's), with row and key drift evaluated every 250
   steps. The write fit then runs on the drifted rows.
+- 28 September: text-to-SQL tasks hardened by schema aliasing, because reads carried
+  no content on plain SQL (L1a read phase on bird/spider v3: captured 1.22 with the
+  right items vs 1.19 shuffled, content 0.01 nats; table and column names are mostly
+  guessable from the question, so R learned a content-free task-format prompt).
+  `prepare_task_corpora.py --alias-variants N` gives every database N renamed
+  variants; the owner chose *semantic* aliases (`--alias-style semantic`, default:
+  synonyms, abbreviations, naming conventions, reordered compounds; the variant's
+  database name is renamed the same way) over opaque codes, because exact-string
+  recall of random identifiers is a needle-in-a-haystack task the latent, superposed
+  KB is poorly suited to (`--db-handle opaque` and `--alias-style random` stay as
+  options). `--no-handle-fraction` keeps a share of episodes on the original schema
+  without a database name in the query (retrieval by the question's semantics).
+  Aliases are regenerated between long runs (`--alias-seed`). L1 gains a content
+  contrast (`--contrast-weight`, `--contrast-margin`: retrieved against another
+  same-KB episode's items at the same gates, the shuffled payloads detached), a
+  learned per-KB null prefix (`--null-prefix`) and, by owner direction, training of
+  the reader decoder's lower layers (`--decoder-train-below`, suggested 8 of 16, at
+  `--decoder-lr` 3e-5, KL to the parent `--decoder-replay-kl` 0.1; the writer keeps
+  its own weights). All default off.

@@ -145,7 +145,8 @@ def build_prompt(task: str, episode: dict, condition: str, budget: int) -> tuple
     found = STORED.match(query)
     question = (query[found.end():] if found else query) + TASKS[task].suffix
     if condition == 'closed_book':
-        db = episode['provenance'].get('db_id')
+        db = episode['provenance'].get('db_id') \
+            if episode['provenance'].get('db_handle') != 'none' else None
         return (f'Database: {db}\n' if db else '') + question, False
     texts, truncated = context_records(episode, budget)
     notes = '\n\n'.join(f'[{i}] {text}' for i, text in enumerate(texts, 1))
