@@ -42,7 +42,10 @@ Placement (single-shot tasks): all searches precede the answer, grouped into sta
 (rules/protocol, schema, values, evidence, tool docs, know-how, examples, background);
 multi-hop passages are searched one hop per site, ordered so that a hop's title is
 grounded in the question or in passages read before it; parallel-recall passages (other
-translations of the requested verses) are searched with one call per translation.
+translations of the requested verses) are searched once per verse chunk of one seeded
+translation, with every other translation's covering records as the slot's
+``alternatives`` (``--parallel-reads shared``), or with one call per translation
+(``per-version``).
 
 Placement (trajectories), per record; a site sits right before the agent turn
 ``step`` (0 = before the first turn):
@@ -500,6 +503,33 @@ def staged(records: list[dict], rng, counts, **placement) -> list[list[Lookup]]:
     return stages
 
 
+def parallel_shared(records: list[dict], prov: dict, rng: random.Random,
+                    counts: Counter) -> list[Lookup]:
+    """Parallel recall, shared reads: one call per covering record of one translation
+    (seeded per episode), whose slot names as ``alternatives`` that record and every
+    other translation's records overlapping the same target verses."""
+    spans = {}
+    for rec in records:
+        info = fields_of('parallel_passage', rec['text'])
+        found = re.search(r':(\d+)(?:-(\d+))?$', info.get('ref', ''))
+        if not found:
+            raise ValueError(f'Unparsable parallel passage header: {rec["text"][:80]!r}')
+        first = int(found.group(1))
+        spans[rec['record_id']] = (info['version'], first, int(found.group(2) or first))
+    by_id = {r['record_id']: r for r in records}
+    versions = sorted({v for v, _, _ in spans.values()})
+    primary = versions[rng.randrange(len(versions))]
+    lo, hi = int(prov['verse_start']), int(prov['verse_end'])
+    lookups = []
+    for rid in sorted((r for r, s in spans.items() if s[0] == primary), key=lambda r: spans[r][1]):
+        a, b = max(spans[rid][1], lo), min(spans[rid][2], hi)
+        alts = [rid] + [r for r, (v, x, y) in spans.items() if v != primary and x <= b and y >= a]
+        lookups.append(Lookup('parallel_passage', [by_id[rid]], flags={'alternatives': alts}))
+        counts['alternative_records'] += len(alts)
+    counts['parallel_primary_' + primary] += 1
+    return lookups
+
+
 def hop_order(need: str, records: list[dict]) -> list[dict]:
     """Passages in an order where each title is grounded in the question or in passages
     read before it where possible (multi-hop); ungrounded ones keep their order."""
@@ -577,11 +607,12 @@ def place_records(records: list[dict], steps: list[Step], family: str, command_d
 class Options:
     def __init__(self, seed=0, distractor_rate=0.0, gold_slots=False, writes='reusable',
                  sequential_rate=0.3, ngram=NGRAM, pool_examples=True, failure_rereads=True,
-                 example_reads=2):
+                 example_reads=2, parallel_reads='shared'):
         self.seed, self.distractor_rate, self.gold_slots = seed, distractor_rate, gold_slots
         self.writes, self.sequential_rate, self.ngram = writes, sequential_rate, ngram
         self.pool_examples, self.failure_rereads = pool_examples, failure_rereads
         self.example_reads = example_reads
+        self.parallel_reads = parallel_reads
 
 
 def episode_rng(seed: int, episode_id: str) -> random.Random:
@@ -847,6 +878,8 @@ class Builder:
                 for lk in lookups:
                     lk.trigger = '+'.join(sorted({triggers[r['record_id']] for r in lk.records}))
         stages += by_step.pop(0, [])
+        if family == 'parallel_recall' and self.opt.parallel_reads == 'shared':
+            stages = [parallel_shared(wanted, prov, rng, counts)]
         # redundant copies (``alternatives``, per hop: every record that alone states that
         # hop's fact): a slot names its hop's copies too, so the bank build stores them all
         hops = [[r for r in hop if r in supports and self._valid(supports[r], qt, Counter())
@@ -1140,7 +1173,8 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
                             'sequential_rate': options.sequential_rate, 'ngram': options.ngram,
                             'pool_examples': options.pool_examples,
                             'failure_rereads': options.failure_rereads,
-                            'example_reads': options.example_reads, 'limit': limit},
+                            'example_reads': options.example_reads,
+                            'parallel_reads': options.parallel_reads, 'limit': limit},
                 'memory_tools': [t['name'] for t in MEMORY_TOOLS],
                 'memory_search_arguments': 'none (query = hidden state at the call)',
                 'memory_write_arguments': 'none (the model generates a <|bg|> span in the '
@@ -1183,6 +1217,10 @@ def main() -> None:
     parser.add_argument('--example-reads', type=int, default=2,
                         help='trajectories: reads of a worked example, before the first use of '
                              'each of its most specific commands (distinct steps)')
+    parser.add_argument('--parallel-reads', choices=('shared', 'per-version'), default='shared',
+                        help='parallel recall: one search per verse chunk of one seeded '
+                             'translation, the other translations as alternatives (shared), '
+                             'or one search per covering translation (per-version)')
     parser.add_argument('--ngram', type=int, default=NGRAM)
     parser.add_argument('--limit', type=int, help='episodes per split (smoke runs)')
     parser.add_argument('--overwrite', action='store_true')
@@ -1196,7 +1234,7 @@ def main() -> None:
                       gold_slots=args.gold_slots, writes=args.writes,
                       sequential_rate=args.sequential_rate, ngram=args.ngram,
                       pool_examples=args.pool_examples, failure_rereads=args.failure_rereads,
-                      example_reads=args.example_reads)
+                      example_reads=args.example_reads, parallel_reads=args.parallel_reads)
     jobs = [(c, args.output_root / f'memory-{corpus_name(c)}-{args.tag}') for c in args.corpora]
 
     def report(corpus, manifest):

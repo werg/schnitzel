@@ -158,15 +158,24 @@ def test_verbatim_copy_of_target_is_rejected(tmp_path):
     assert sum(r.get('target_in_kb', 0) for r in result['rejected'].values()) > 0
 
 
-def test_memory_transcript_one_search_per_version(fixture):
+def transcript_module():
     script = Path(__file__).resolve().parents[1] / 'scripts' / 'prepare_memory_transcripts.py'
     spec = importlib.util.spec_from_file_location('prepare_memory_transcripts_pr', script)
     mt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mt)
-    result = build(fixture)
+    return mt
+
+
+def transcript_builder(mt, result, **options):
     index = {r['record_id']: (r['created_at'], r['kind'], pr.DOMAIN) for r in result['records']}
-    builder = mt.Builder('parallel-recall', index, mt.Options(sequential_rate=0.0),
-                         per_domain=False)
+    return mt.Builder('parallel-recall', index, mt.Options(sequential_rate=0.0, **options),
+                      per_domain=False)
+
+
+def test_memory_transcript_one_search_per_version(fixture):
+    mt = transcript_module()
+    result = build(fixture)
+    builder = transcript_builder(mt, result, parallel_reads='per-version')
     ep = result['episodes']['train'][0]
     row, reason, _ = builder.build(ep, 'train')
     assert reason is None
@@ -176,3 +185,36 @@ def test_memory_transcript_one_search_per_version(fixture):
     assert row['messages'][-1] == {'role': 'assistant', 'content': ep['answer']}
     assert not row['write_sites']
     assert 'translations' in row['messages'][0]['content']
+
+
+def test_memory_transcript_shared_reads_with_alternatives(fixture):
+    mt = transcript_module()
+    result = build(fixture)
+    by_id = {r['record_id']: r['provenance'] for r in result['records']}
+    builder = transcript_builder(mt, result)          # default: shared
+    primaries = set()
+    for ep in all_episodes(result):
+        p = ep['provenance']
+        row, reason, _ = builder.build(ep, p['split'])
+        assert reason is None
+        sites = row['search_sites']
+        slots = [m['content']['slot'] for m in row['messages'] if m['role'] == 'tool']
+        assert len(sites) == len(slots) <= 3
+        versions = {by_id[s['record_ids'][0]]['version'] for s in sites}
+        assert len(versions) == 1 and all(len(s['record_ids']) == 1 for s in sites)
+        primaries |= versions
+        covered = set()
+        for slot in slots:
+            rid = slot['record_ids'][0]
+            q = by_id[rid]
+            lo, hi = max(q['verse_start'], p['verse_start']), min(q['verse_end'], p['verse_end'])
+            covered |= set(range(lo, hi + 1))
+            alts = slot['alternatives']
+            assert alts[0] == rid and len(set(alts)) == len(alts)
+            assert set(alts) <= set(ep['required_ids'])
+            # every other covering version is an alternative for this chunk
+            assert {by_id[a]['version'] for a in alts} == set(p['covering_versions'])
+            for a in alts[1:]:
+                assert by_id[a]['verse_start'] <= hi and by_id[a]['verse_end'] >= lo
+        assert covered == set(range(p['verse_start'], p['verse_end'] + 1))
+    assert len(primaries) > 1                          # the read version varies
