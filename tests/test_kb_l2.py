@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from schnitz.kb.producer import (L2Weights, functional_loss, item_losses, key_loss, l2_loss,
-                                 produce_items, recombine, rewrite_item, write_spans)
+from schnitz.kb.producer import (L2Weights, free_run_grad, functional_loss, item_losses,
+                                 key_loss, l2_loss, produce_items, recombine, rewrite_item,
+                                 write_spans)
 from schnitz.kb.stack import SPACES, KeyHeads, Stack, SuperpositionOperator
 from schnitz.kb.stages import l2
 from schnitz.kb_store import KnowledgeBase, NewItem, Provenance
@@ -30,6 +31,7 @@ class FakeModel:
         torch.manual_seed(0)
         self.writer = SimpleNamespace(rep=nn.Identity())
         self.head = nn.Linear(W, V)
+        self.decoder = SimpleNamespace(embed_tokens=nn.Embedding(V, W))
 
     def text_ids(self, text):
         return torch.tensor([ord(c) % V for c in text])
@@ -114,7 +116,7 @@ def test_losses_are_zero_when_the_producer_reproduces_the_item():
     assert float(l2_loss(item_losses(items, other), L2Weights(key=0, kl=0))) > 0.01
 
 
-def test_teacher_and_free_feed_reproduce_the_span_with_gradients_into_the_heads():
+def test_teacher_and_self_feed_reproduce_the_span_with_gradients_into_the_heads():
     model, _ = FakeModel(), None
     model.writer.rep = nn.Linear(W, W)
     with torch.no_grad():
@@ -122,12 +124,20 @@ def test_teacher_and_free_feed_reproduce_the_span_with_gradients_into_the_heads(
         model.writer.rep.bias.zero_()
     ex = [{'ids': model.text_ids('hello'), 'prompt': 'memory', 'factor': 4.0}]
     teacher = model.free_run(ex, [5])[0]
-    for feed in ('teacher', 'free'):
+    for feed in ('teacher', 'self'):
         out = write_spans(model, ex, [5], feed, teacher if feed == 'teacher' else None)
         torch.testing.assert_close(out[0], teacher[0])
         out[0].sum().backward()
         assert model.writer.rep.weight.grad.abs().sum() > 0
         model.writer.rep.zero_grad()
+    # 'free': the free run itself replayed with gradients (each rep fed back), the
+    # same values as without gradients
+    with torch.no_grad():
+        own = free_run_grad(model, ex, [5])[0]
+    out = write_spans(model, ex, [5], 'free')
+    torch.testing.assert_close(out[0], own)
+    out[0].sum().backward()
+    assert model.writer.rep.bias.grad.abs().sum() > 0
 
 
 def test_stage_losses_on_a_kb_of_produced_items(tmp_path):
@@ -135,15 +145,15 @@ def test_stage_losses_on_a_kb_of_produced_items(tmp_path):
     kb, spans, _ = build(tmp_path, model, reader)
     records, derived, skipped = l2.collect_targets(kb)
     assert {r.record_id for r in records} == set(TEXTS) and not derived and not skipped
-    prod = l2.Producers(model, reader, 's0', 'teacher', {'ds': Cache(spans)}, TEXTS)
-    loss, parts = l2.record_losses(prod, records, L2Weights())
+    prod = l2.producers(model, reader, 's0', 'teacher', {'ds': Cache(spans)}, TEXTS)
+    loss, parts = l2.record_losses(prod, reader, records, L2Weights())
     # zero up to the store's bf16 rounding of the item values (keys are stored in fp32)
     assert float(loss) < 1e-4 and parts['key'] < 1e-6
-    report = l2.evaluate_records(prod, records, 2)
+    report = l2.evaluate_records(prod, reader, records, 2)
     assert report['functional_gap'] < 1e-3 and report['cos_A'] < 1e-4
     # a perturbed target is not reproduced
     records[0].target['A'] = records[0].target['A'] + 1.0
-    assert float(l2.record_losses(prod, records, L2Weights())[0]) > 0.01
+    assert float(l2.record_losses(prod, reader, records, L2Weights())[0]) > 0.01
     kb.close()
 
 
@@ -161,9 +171,9 @@ def test_rewrite_outputs_are_produced_through_their_lineage(tmp_path):
     assert len(derived) == 1 and derived[0].space == 'A' and not skipped
     assert sorted(derived[0].inputs) == [('r1', 1.0), ('r2', 1.0)]
     assert all('A' not in r.items for r in records)     # the inputs are no longer current
-    prod = l2.Producers(model, reader, 's0', 'teacher', {'ds': Cache(spans)}, TEXTS)
+    prod = l2.producers(model, reader, 's0', 'teacher', {'ds': Cache(spans)}, TEXTS)
     # the stored key here is the rewrite's condition, not the key heads' key of the values
-    loss, parts = l2.derived_losses(prod, derived, L2Weights(key=0))
+    loss, parts = l2.derived_losses(prod, reader, derived, L2Weights(key=0))
     assert float(loss) < 1e-4 and parts['cos_A'] < 1e-4
     kb.close()
     export.close()

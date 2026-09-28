@@ -761,3 +761,32 @@ log your decisions and changes of direction"), newest last.
   dataset with supersession, gold records at a receding weight, held-out lineage
   filter, removed/swapped-record controls. Not yet: gradient into earlier rounds'
   writes (needs L1b), agent-environment episodes, a round-improvement term, RL.
+- 28 Sep (one producer path). `schnitz.kb.producer` is now the only implementation of
+  the producers: `Writer` (in-place writes and the codecs' items), `write_spans` (feeds
+  `teacher`, `self`, `free`), `WriteLog` and `Producers` (selective replay at the
+  serialized precision and batch composition, verification, depth-ordered backward),
+  used by `l1 build` (codec step), L1 writes and L1b, L2 and B9; `l1.Writer`,
+  `l1.WriteLog`, `l1.Producers`, `l1.free_run_grad`, `l1.ste_round` and L2's own
+  `Producers` are gone. Choices: (1) L2 now rounds the codecs' input span and the
+  items to bf16 straight-through, as the bank build and L1b do, and its `--feed free`
+  is the full free-run replay; the former one-pass `free` is `--feed self`. (2) L1b's
+  producers get their own AdamW groups, `--l1b-codec-lr` 3e-5 and `--l1b-writer-lr`
+  3e-6 (10x below the former 3e-4 and 3e-5), and each L1b step logs `l1b_change_rel`
+  after the optimizer step; smoke: 2.7% (max 4%) per step against 25% (max 37%) at
+  the former rates, first step still bit-exact. Old `reader.pt` optimizer states (two
+  groups) are refused. (3) B9 `--backprop-rounds k` (default 2) is built on the same
+  replay: per episode an in-memory write log of its rounds' writes; SFT reads of the
+  task's own record are recomputed (depth 1), and a depth-d replay recomputes the
+  write's own reads of the earlier record through `L1Reader.reread` (forward the
+  logged span exactly, gradient through the recomputation; separate leaves per depth
+  cut each path after k writes). Only this episode's own records are recomputed
+  (other records are read as stored: their writer state is older). The write site of
+  a round is now built as a write source (`experience.write_source`: token ids,
+  `<|mem|>` positions, read spans; row for row the former `write_prefix`), so the
+  replay's input equals the write's. (4) Bank span batch: batch 1 writes 2.1
+  records/s against 5.2-6.7 at 16 (96 records, shared GPU), and batch-16 spans differ
+  from batch-1 spans by 1.1% on average, up to 29%. At the 136,676 write-site records
+  batch 1 would take about 18 h instead of 6-7 h, so the build keeps its batched
+  default and `l1 build --help` and the stack doc state that L1b needs
+  `--span-batch-size 1`; `l1 train` keeps warning on other banks. Open: B9 backprop
+  not yet run on the GPU; the smoke banks and K1 stacks have the old space widths.

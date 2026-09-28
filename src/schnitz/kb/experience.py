@@ -305,6 +305,7 @@ class Attempt:
     mems: list[int] = field(default_factory=list)    # row index of each <|mem|>
     reads: list = field(default_factory=list)
     stop: str = ''                 # 'answer', 'call', 'write', 'length'
+    cache: object = None           # the ItemCache the reads fetched their items from
 
 
 def call_positions(proto: GenProtocol, block: list[int]) -> tuple[list[int], bool]:
@@ -427,6 +428,38 @@ def generate(lm, embed: Callable[[list[int]], Tensor], mid: Callable[[Tensor], T
     return attempt
 
 
+def write_ids(attempt: Attempt, proto: GenProtocol) -> list[int]:
+    """The token ids that open the round's write site after the attempt (none when the
+    attempt ended by calling ``memory_write()`` itself)."""
+    if attempt.stop == 'write':
+        return []
+    closed = attempt.tokens and attempt.tokens[-1] == proto.im_end
+    return (list(proto.turn_end[1:]) if closed else list(proto.turn_end)) + list(proto.write_call)
+
+
+def write_source(attempt: Attempt, proto: GenProtocol) -> tuple[Tensor, list[int], list[Tensor]]:
+    """The round's write site as a write source (``schnitz.kb.producer.WriteLog``): token
+    ids, the ``<|mem|>`` positions among them and the read span after each (in read
+    order), so ``Writer.inputs(ids, mems, spans)`` is ``write_prefix`` row for row."""
+    ids, mems, spans = [], [], []
+    at = set(attempt.mems)
+    j, rows = 0, attempt.tokens
+    while j < len(rows):
+        if rows[j] is None:
+            raise ValueError('a span row outside a memory slot')
+        ids.append(int(rows[j]))
+        if j in at:
+            k = j + 1
+            while k < len(rows) and rows[k] is None:
+                k += 1
+            mems.append(len(ids) - 1)
+            spans.append(attempt.embeds[j + 1:k].detach().float())
+            j = k
+            continue
+        j += 1
+    return torch.tensor(ids + write_ids(attempt, proto)), mems, spans
+
+
 def write_prefix(attempt: Attempt, proto: GenProtocol,
                  embed: Callable[[list[int]], Tensor]) -> Tensor:
     """The round's write site: the attempt, its turn closed, then the ``memory_write()``
@@ -434,9 +467,7 @@ def write_prefix(attempt: Attempt, proto: GenProtocol,
     attempt that ended by calling ``memory_write()`` itself is already there."""
     if attempt.stop == 'write':
         return attempt.embeds
-    closed = attempt.tokens and attempt.tokens[-1] == proto.im_end
-    ids = (list(proto.turn_end[1:]) if closed else list(proto.turn_end)) + list(proto.write_call)
-    return torch.cat([attempt.embeds, embed(ids).to(attempt.embeds.dtype)])
+    return torch.cat([attempt.embeds, embed(write_ids(attempt, proto)).to(attempt.embeds.dtype)])
 
 
 def read_mass(reads: Iterable, registry: Registry, task: str) -> dict[str, float]:

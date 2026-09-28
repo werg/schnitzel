@@ -157,6 +157,7 @@ class SpaceRead:
     scored: list[Ref] = field(default_factory=list)
     scored_gates: Tensor | None = None   # differentiable gates of every scored candidate
     recomputed: int = 0           # L1b: items read with the producers' recomputed values
+    scales: list[float] = field(default_factory=list)   # per item read: stored mass x weight
 
 
 @dataclass
@@ -166,6 +167,7 @@ class Read:
     aux: Tensor | None = None     # retrieval loss (targets present, retrieved mode)
     n: int = 0
     recall_at: dict = field(default_factory=dict)
+    state: Tensor | None = None   # the query-layer state the read was made for (detached)
 
 
 def current_ids(kb: KnowledgeBase, space: str) -> list[str]:
@@ -208,7 +210,7 @@ def _fetch(cache: ItemCache, by_dataset: Mapping[str, KnowledgeBase], space: str
 
 class Producer(Protocol):
     """L1b: the values of read items recomputed from their stored sources, with
-    gradients into the producers (``schnitz.kb.stages.l1.Producers``); None for an
+    gradients into the producers (``schnitz.kb.producer.Producers``); None for an
     item without a recomputable source."""
 
     def values(self, space: str, refs: Sequence[Ref]) -> list[Tensor | None]: ...
@@ -328,32 +330,68 @@ class L1Reader(nn.Module):
             # x the caller's per-item weight (B9's receding gold weight); gates only
             # scale mass, so this is each item's exact share, and read_count sees it
             scale = [cache.mass(d, s, i) * (weights or {}).get(i, 1.0) for d, i in refs]
-            if any(x != 1.0 for x in scale):
-                gates = gates * torch.tensor(scale, device=gates.device, dtype=gates.dtype)
-            g = gates.detach().float()
-            size = torch.tensor([float(v.shape[0]) for _, v in got], device=g.device)
-            count = max(1, round(float((g * size).sum() / g.sum().clamp_min(1e-12))))
-            out, mass = self.operators[s]([(v.to(q.device), gt, None) for (_, v), gt
-                                           in zip(got, gates)], q, count)
+            values = [v for _, v in got]
+            out, mass, count, g = self._combine(s, q, values, gates, scale)
             reads[s], masses[s] = out, mass
-            read_positions += [int(v.shape[0]) for _, v in got]
-            read_spaces += [s] * len(got)
+            read_positions += [int(v.shape[0]) for v in values]
+            read_spaces += [s] * len(values)
             read_gates.append(g)
             recall = recall_read = None
             if wanted:
                 recall = sum(r in set(scored) for r in wanted) / len(wanted)
                 recall_read = sum(r in set(refs) for r in wanted) / len(wanted)
             info[s] = SpaceRead(refs, g.cpu(), float(mass.detach()), count, recall, recall_read,
-                                scored, scored_gates, recomputed)
+                                scored, scored_gates, recomputed, list(scale))
         aux_loss = torch.stack(aux).mean() if aux else None
+        span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
+        return Read(span, info, aux_loss, n, recall_at, state.detach())
+
+    def _combine(self, space: str, q: Tensor, values: Sequence[Tensor], gates: Tensor,
+                 scale: Sequence[float]) -> tuple[Tensor, Tensor, int, Tensor]:
+        """S_s over the items read in ``space`` at ``gates`` x ``scale`` (stored mass x
+        caller weight): the space read, its mass, its count (the gate-weighted mean item
+        length) and the detached gates."""
+        if any(x != 1.0 for x in scale):
+            gates = gates * torch.tensor(list(scale), device=gates.device, dtype=gates.dtype)
+        g = gates.detach().float()
+        size = torch.tensor([float(v.shape[0]) for v in values], device=g.device)
+        count = max(1, round(float((g * size).sum() / g.sum().clamp_min(1e-12))))
+        out, mass = self.operators[space]([(v.to(q.device), gt, None) for v, gt
+                                           in zip(values, gates)], q, count)
+        return out, mass, count, g
+
+    def _span(self, reads, masses, read_positions, read_spaces, read_gates,
+              state: Tensor) -> tuple[Tensor, int]:
+        """R over the space reads with mass as gate, de-standardized; (span, count)."""
+        c = self.config
         live = [s for s in self.spaces if s in reads and float(masses[s].detach()) > 0]
         if not live:
-            return Read(torch.zeros(0, c.span_width, device=state.device), info, aux_loss, 0,
-                        recall_at)
+            return torch.zeros(0, c.span_width, device=state.device), 0
         n = read_count(read_positions, read_spaces, torch.cat(read_gates), budget=c.max_reps)
         y, _ = self.stack.recombiner([(s, reads[s], masses[s]) for s in live], n)
-        span = self.stack.mean + self.stack.std * y
-        return Read(span, info, aux_loss, n, recall_at)
+        return self.stack.mean + self.stack.std * y, n
+
+    def reread(self, state: Tensor, values: Mapping[str, Sequence[Tensor]],
+               scales: Mapping[str, Sequence[float]]) -> Tensor:
+        """The span of a read with its selection fixed: ``values[s]`` are the items read
+        in space s (in read order) and ``scales[s]`` their stored mass x caller weight;
+        gates from the items' keys against the query heads' keys of ``state`` (as a read
+        whose items are recomputed, L1b), then S_s and R. Gradients reach the values
+        (B9's chain through an earlier write's reads)."""
+        reads, masses, read_positions, read_spaces, read_gates = {}, {}, [], [], []
+        for s in self.spaces:
+            items = list(values.get(s, ()))
+            if not items:
+                continue
+            q = self.keys.query_key(s, state)
+            keys = torch.stack([self.keys.item_key(s, v.to(q.device)) for v in items])
+            gates = self.gates(s, self.keys.scores(s, q[None], keys)[0])
+            out, mass, _, g = self._combine(s, q, items, gates, scales[s])
+            reads[s], masses[s] = out, mass
+            read_positions += [int(v.shape[0]) for v in items]
+            read_spaces += [s] * len(items)
+            read_gates.append(g)
+        return self._span(reads, masses, read_positions, read_spaces, read_gates, state)[0]
 
     def _retrieval_loss(self, space, q, refs, scores, wanted, by_dataset, cache, query_time,
                         negatives: Sequence[Ref] = ()):

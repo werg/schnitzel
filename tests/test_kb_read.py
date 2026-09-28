@@ -9,6 +9,7 @@ import torch
 
 from schnitz.kb.losses import retrieval_loss
 from schnitz.kb.read import ItemCache, L1Reader, ReadConfig, current_ids, splice
+from schnitz.kb import producer
 from schnitz.kb.stages import l1
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.span_protocol import ProtocolTokens, untie
@@ -513,7 +514,7 @@ def write_context(tmp_path, live=True):
             kb.load_live()
     ctx = l1.Context(ctx.frozen, ctx.reader, kbs)
     model = writer_model(ctx.frozen.lm)
-    writer = l1.Writer(model, ctx.reader.stack, ctx.reader, ctx.frozen, batch=2)
+    writer = producer.Writer(model, ctx.reader.stack, ctx.frozen.embed, batch=2)
     return ctx, model, writer
 
 
@@ -526,7 +527,7 @@ def write_episode(name, qt=3, kb='ds', records=(['r1'], ['r2'])):
 
 def test_writes_enter_their_kb_for_later_steps_only(tmp_path):
     ctx, model, writer = write_context(tmp_path)
-    log = l1.WriteLog(tmp_path / 'writes')
+    log = producer.WriteLog(tmp_path / 'writes')
     args = train_args()
     opt = torch.optim.AdamW(ctx.reader.trainable(), lr=1e-3)
     e1, e2 = write_episode('e1'), episode(IDS, [3, 10], [6, 13])
@@ -565,7 +566,7 @@ def test_writes_enter_their_kb_for_later_steps_only(tmp_path):
     assert set(log.index) == {'write:e1#0'} and log.index['write:e1#0']['step'] == 3
     log.truncate(1)
     assert log.index['write:e1#0']['step'] == 1
-    assert l1.WriteLog(tmp_path / 'writes').index['write:e1#0']['step'] == 1
+    assert producer.WriteLog(tmp_path / 'writes').index['write:e1#0']['step'] == 1
 
 
 def test_write_prefix_is_causal(tmp_path):
@@ -585,7 +586,7 @@ def test_write_prefix_is_causal(tmp_path):
     with torch.no_grad():
         _, _, _, spans2 = l1.run_episode(ctx, ep2, ItemCache(train=False))
     req2, = l1.write_requests(ep2, spans2, model.text_ids, 0)
-    a, b = writer.generate([req, req2])
+    a, b = l1.generate_writes(writer, [req, req2])
     assert torch.equal(a, b) and a.shape[0] == req.count
 
 
@@ -616,14 +617,21 @@ RECORDS = {'r1': ('the first record text', 1), 'r2': ('another record, longer te
            'r3': ('third', 1)}
 
 
+def l1_producers(ctx, writer, texts, caches, log, mode='free', batch=1):
+    """The shared replay as ``l1.load_producers`` configures it for L1b."""
+    return producer.Producers(writer, origin=ctx.origin, texts=texts, caches=caches, level=0,
+                              log=log, mode=mode, batch=batch,
+                              stored=lambda d, s, i: ctx.kbs[d].read(s, [i])[0].values)
+
+
 def producer_setup(tmp_path, mode='free'):
     ctx, model, writer = write_context(tmp_path, live=False)
     kb, cache = codec_bank(tmp_path, ctx, model, RECORDS)
     ctx = l1.Context(ctx.frozen, ctx.reader, {'ds': kb})
-    writer = l1.Writer(model, ctx.reader.stack, ctx.reader, ctx.frozen, batch=2)
-    log = l1.WriteLog(None)
-    producers = l1.Producers(writer, ctx, {r: t for r, (t, _) in RECORDS.items()}, {'ds': cache},
-                             0, log, model.text_ids, mode, batch=2)
+    writer = producer.Writer(model, ctx.reader.stack, ctx.frozen.embed, batch=2)
+    log = producer.WriteLog(None)
+    producers = l1_producers(ctx, writer, {r: t for r, (t, _) in RECORDS.items()},
+                             {'ds': cache}, log, mode, batch=2)
     return ctx, model, writer, producers, log
 
 
@@ -656,7 +664,7 @@ def test_l1b_recompute_equals_stored_items_and_reaches_producers(tmp_path):
         _, _, _, spans = l1.run_episode(ctx, ep, ItemCache(train=False))
     requests = l1.write_requests(ep, spans, model.text_ids, 0)
     requests += l1.write_requests(write_episode('e8'), spans, model.text_ids, 0)
-    l1.commit_writes(ctx, writer, requests, writer.generate(requests), 1, log)
+    l1.commit_writes(ctx, writer, requests, l1.generate_writes(writer, requests), 1, log)
     log.flush(1)
     assert log.index['write:e9#0']['group'] == ['write:e9#0', 'write:e8#0']
     producers.begin()
@@ -665,10 +673,9 @@ def test_l1b_recompute_equals_stored_items_and_reaches_producers(tmp_path):
         value, = producers.values(s, [('ds', item_id)])
         assert torch.equal(value, kb.read(s, [item_id])[0].values.float())
     # replayed in the generation's batch composition (one unit for both writes)
-    assert len(producers.unit_of[('write', 'ds', 'write:e9#0')]) == 2
+    assert len(producers.unit_of[(('write', 'ds', 'write:e9#0'), 1)]) == 2
     # teacher-fed replay: one pass on the stored span, close to the stored item
-    teacher = l1.Producers(writer, ctx, producers.texts, producers.caches, 0, log,
-                           model.text_ids, 'teacher')
+    teacher = l1_producers(ctx, writer, producers.texts, producers.caches, log, 'teacher')
     teacher.begin()
     ids = current_ids(kb, 'D')
     for value, item in zip(teacher.values('D', [('ds', i) for i in ids]), kb.read('D', ids)):
@@ -686,7 +693,7 @@ def test_l1b_read_uses_recomputed_items(tmp_path):
     for s, info in read.spaces.items():   # the gradient goes to the recomputed leaves ...
         for d, i in info.refs:
             key = producers.source(d, s, i)
-            assert producers.leaves[key][s].grad.abs().sum() > 0
+            assert producers.leaves[(key, 1)][s].grad.abs().sum() > 0
     l1.set_phase(l1.parameter_sets(ctx.reader, model), ('writer', 'codecs'))
     producers.backward()                  # ... and on into the producers
     assert model.writer.rep.net[1].weight.grad.abs().sum() > 0
@@ -723,6 +730,7 @@ def test_phase_schedule_and_l1b_step(tmp_path):
                         producers=producers)
     assert out['phase'] == 'l1b' and out['items'] == 0 and out['l1b']['backward_sources'] > 0
     assert not torch.equal(rep, before_rep)                     # the writer trained
+    assert out['l1b']['change_rel'] > 0 and out['l1b']['change_units'] > 0   # logged
     assert all(torch.equal(a, b) for s in SPACES for a, b in zip(live(s), after_a[s]))
     with pytest.raises(ValueError):
         l1.train_step(ctx, [ep], opt, args, 2, phase='l1b', trainable=trainable)
@@ -802,9 +810,23 @@ def test_context_rows_follow_appends(tmp_path):
     assert rows[new] == len(before) and all(rows[k] == v for k, v in before.items())
 
 
+def test_l1b_producers_have_their_own_learning_rates(tmp_path):
+    from types import SimpleNamespace
+    ctx, model, _ = write_context(tmp_path, live=False)
+    sets = l1.parameter_sets(ctx.reader, model)
+    args = SimpleNamespace(lr=3e-4, l1b_codec_lr=3e-5, l1b_writer_lr=3e-6)
+    reader_group, codecs, writer = l1.optimizer_groups(sets, args)
+    assert (reader_group['lr'], codecs['lr'], writer['lr']) == (3e-4, 3e-5, 3e-6)
+    own = {id(p) for p in codecs['params'] + writer['params']}
+    assert codecs['params'] == list(ctx.reader.stack.codecs.parameters())
+    assert writer['params'] == list(model.writer.parameters())
+    assert not own & {id(p) for p in reader_group['params']}
+    assert len(reader_group['params']) + len(own) == sum(len(v) for v in sets.values())
+
+
 def test_ste_round_is_exactly_the_serialized_value():
     x = (torch.randn(4096) * 3).requires_grad_()
-    y = l1.ste_round(x)
+    y = producer.ste_round(x)
     assert torch.equal(y, x.detach().bfloat16().float())        # bitwise, not up to an ulp
     y.sum().backward()
     assert torch.equal(x.grad, torch.ones_like(x))

@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, generate,
-                                   read_items, write_prefix)
+                                   read_items, write_prefix, write_source)
 from schnitz.kb.read import ItemCache, L1Reader, ReadConfig
 from schnitz.kb.stages import b9, l1
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
@@ -285,3 +285,98 @@ def test_read_items_lists_items_with_nonzero_gates():
     info = SimpleNamespace(refs=[('ds', 'a'), ('ds', 'b')], gates=torch.tensor([0.5, 0.0]))
     read = SimpleNamespace(spaces={'A': info})
     assert read_items([read, None]) == {'a'}
+
+
+# -- gradients into earlier rounds' writes (--backprop-rounds) -------------------------------
+def b9_setup(tmp_path, k):
+    from test_kb_read import writer_model
+    from schnitz.kb.experience import Attempt
+    lm = tiny_lm()
+    frozen = l1.Frozen(lm, 2)
+    model = writer_model(lm)
+    r = reader()
+    for p in r.stack.codecs.parameters():
+        p.requires_grad_(True)
+    kb = corpus_kb(tmp_path)
+    ctx = l1.Context(frozen, r, {'ds': kb})
+    args = SimpleNamespace(gold_start=1.0, gold_anneal=0, gold_decay=0.5, temperature=0.0,
+                           seed=0, heldout_lineage='task', backprop_rounds=k, l1b_replay='free',
+                           item_lr=0.0, retrieval_weight=0.1)
+    exp = b9.Experience(args, model, frozen, r, {'ds': kb}, ctx, PROTO, 's0')
+    ids = [1, 9, 10, 11, 20, 21, 22, 23, 11, 12, 13, 40, 41, 13, MEM, MEM_END, 12, 13, 24, 25, 26]
+    targets = torch.arange(17, len(ids))
+    ep = l1.Episode('task', 'ds', torch.tensor(ids), targets, [6], [14],
+                    [{'kb': 'ds', 'record_ids': ['c0']}], 3, {})
+    prompt = [1, 2, 3, 4]
+
+    def attempt(read_state=None):
+        """An answer after the prompt; with ``read_state`` one read (of the KB as the
+        round sees it) spliced into a tool message first, as ``generate`` places it."""
+        if read_state is None:
+            tokens = prompt + [24, 25, 12]
+            return Attempt(frozen.embed(torch.tensor(tokens)), tokens, 'SELECT 1', 3,
+                           stop='answer')
+        view, weights = exp.view({'episode_id': 'task', 'kb': 'ds'}, 'train', 0)
+        cache = ItemCache('cpu', train=False)
+        with torch.no_grad():
+            read = r.read(read_state, [view], ['ds'], 3, cache, weights=weights)
+        head = prompt + PROTO.tool_open
+        tail = PROTO.tool_close + [24, 25, 12]
+        n = read.span.shape[0]
+        embeds = torch.cat([frozen.embed(torch.tensor(head)), read.span.detach().float(),
+                            frozen.embed(torch.tensor(tail))])
+        return Attempt(embeds, head + [None] * n + tail, 'SELECT 1', 3, mems=[len(head) - 1],
+                       reads=[read], stop='answer', cache=cache)
+    return exp, model, r, ep, attempt
+
+
+def run_rounds(exp, ep, attempt, rounds):
+    """The round loop of ``train_episode`` with given attempts: view, SFT, write (from
+    round 1 on the attempt reads the KB, the task's own record included)."""
+    row = {'episode_id': 'task', 'kb': 'ds'}
+    exp.begin_episode(row)
+    sft = []
+    for t in range(rounds):
+        view, weights = exp.view(row, 'train', 0)
+        att = attempt(torch.randn(HIDDEN, generator=torch.Generator().manual_seed(t))
+                      if t else None)
+        sft.append(exp.sft(ep, view, weights, 1.0, 'task'))
+        exp.write(row, ep, att, t, 0, 'train', True)
+    return sft, exp.end_episode()
+
+
+def test_write_source_rebuilds_the_write_prefix(tmp_path, torch_conv):
+    exp, model, _, _, attempt = b9_setup(tmp_path, 1)
+    embed = lambda t: exp.frozen.embed(torch.as_tensor(t))      # noqa: E731
+    for att in (attempt(), attempt(torch.randn(HIDDEN))):
+        ids, mems, spans = write_source(att, PROTO)
+        assert torch.equal(exp.writer.inputs(ids, mems, spans), write_prefix(att, PROTO, embed))
+    exp.kbs['ds'].close()
+
+
+@pytest.mark.parametrize('k', [0, 1])
+def test_backprop_rounds_reach_the_previous_rounds_write(tmp_path, k, torch_conv):
+    exp, model, r, ep, attempt = b9_setup(tmp_path, k)
+    _, stats = run_rounds(exp, ep, attempt, 2)
+    rep = model.writer.rep.net[1].weight.grad
+    codec = [p.grad for p in r.stack.codecs.parameters() if p.grad is not None]
+    if k == 0:       # writes detached: nothing reaches the writer or the codecs
+        assert stats is None and rep is None and not codec
+    else:            # round 1 read round 0's write as its recomputation, exactly
+        assert stats['backward_sources'] == 1 and stats['depth_max'] == 1
+        assert stats['match_exact'] == 1.0 and stats['drift'] == 0.0
+        assert rep.abs().sum() > 0 and any(g.abs().sum() > 0 for g in codec)
+    exp.kbs['ds'].close()
+
+
+@pytest.mark.parametrize('k', [1, 2])
+def test_backprop_rounds_chain_through_an_earlier_writes_reads(tmp_path, k, torch_conv):
+    """Round 2 reads round 1's write, whose attempt read round 0's write: with k = 2 the
+    gradient of round 2's losses reaches round 0's write through that read (a depth-2
+    replay); with k = 1 it stops at round 1's write."""
+    exp, model, r, ep, attempt = b9_setup(tmp_path, k)
+    _, stats = run_rounds(exp, ep, attempt, 3)
+    assert stats['depth_max'] == k and stats['match_exact'] == 1.0 and stats['drift'] == 0.0
+    if k == 2:
+        assert stats['reread_rel'] < 1e-5          # the recomputed read is the logged one
+    exp.kbs['ds'].close()

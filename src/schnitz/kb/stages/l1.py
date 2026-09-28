@@ -13,6 +13,10 @@ applied to the frozen decoder's query-layer state averaged over the record text.
 The initial key heads are seeded and saved beside the banks, so queries and keys
 start in one geometry; the trainer starts from them. Item time is the record's
 ``created_at``; provenance names the record id. Training reads stored items only.
+A bank that an L1b phase will replay must be built with ``--span-batch-size 1``: the
+writer's free run on the GPU depends on its batch composition, and only spans written
+one at a time are what L1b's one-at-a-time replay recomputes (the default batches the
+spans for throughput, about 3x faster; ``l1 train`` warns on such a bank).
 
 ``train``. The frozen decoder (``--reader-state``: the B3 merged decoder, protocol
 installed if the state has none; later B4) reads each transcript rendered with the
@@ -37,19 +41,22 @@ Phases (``--phase``, or alternating with ``--phase-schedule a:2000,b:500``):
 
 - *L1a, items in place*: item values updated by one sparse Adam step per touched
   (KB, space) after the reader's optimizer step; the writer is detached.
-- *L1b, through the sources* (``Producers``): the items a read keeps are recomputed
-  from their stored sources (a bank item: the writer's free run of its record under
-  the memory prompt, then the codecs; a written item: the writer's free run at its
-  write site from the logged prefix and reads), at the stored forward's serialized
-  precision and batch composition, so at the start of L1b the recomputed items equal
-  the stored payloads (bank spans written with `--span-batch-size 1`; writes replayed
-  with their writer batch)
-  (checked every step: ``l1b_match_*``). The gradients of all reads of a step
-  accumulate on the recomputed items, then the producers are recomputed with
-  gradients and the task loss reaches the writer's span heads (ratio code, rep head)
-  and the codecs (``--l1b-train`` names the sets; default also keys, S_s and R).
-  Live item values are not updated in L1b; an item modified in place by L1a is read
-  as its producers' recomputation there (L2 reconciles the two).
+- *L1b, through the sources* (``schnitz.kb.producer.Producers``, the replay L2 and
+  B9 use too): the items a read keeps are recomputed from their stored sources (a
+  bank item: the writer's free run of its record under the memory prompt, then the
+  codecs; a written item: the writer's free run at its write site from the logged
+  prefix and reads, ``WriteLog``), at the stored forward's serialized precision and
+  batch composition, so at the start of L1b the recomputed items equal the stored
+  payloads (bank spans written with ``build --span-batch-size 1``; writes replayed
+  with their writer batch; checked every step: ``l1b_match_*``). The gradients of all
+  reads of a step accumulate on the recomputed items, then the producers are
+  recomputed with gradients and the task loss reaches the writer's span heads (ratio
+  code, rep head) and the codecs (``--l1b-train`` names the sets; default also keys,
+  S_s and R). The producers have their own learning rates (``--l1b-codec-lr``,
+  ``--l1b-writer-lr``); after each step a few replay units are recomputed to log how
+  far the step moved their items (``l1b_change_rel``). Live item values are not
+  updated in L1b; an item modified in place by L1a is read as its producers'
+  recomputation there (L2 reconciles the two).
 
 Writes (``--writes``, v3 transcripts): each ``memory_write()`` site is rendered with an
 empty ``<|bg|><|/bg|>`` pair (not targets; the task pass keeps it empty in every arm).
@@ -93,6 +100,7 @@ from torch.utils.checkpoint import checkpoint
 from schnitz.kb.bank import (SpanCache, Transcripts, build_caches, kb_dir, read_sources,
                              record_sources, slots_of)
 from schnitz.kb.decoder import LEVELS, length_factors
+from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, producer_params
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, L1Reader,
                              ReadConfig, producer_index, source_index, splice)
 from schnitz.kb.stack import KeyHeads
@@ -411,14 +419,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
     return nll, int(ep.targets.numel()), reads, spans
 
 
-# -- in-context writes and the producers' forward ------------------------------------------
-def ste_round(x: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
-    """``x`` at the serialized precision in the forward (what the store or span cache
-    holds), the identity in the backward."""
-    # rounded + (x - x): exactly the rounded value (x + (rounded - x) is not, in float)
-    return x.detach().to(dtype).to(x.dtype) + (x - x.detach())
-
-
+# -- in-context writes ------------------------------------------------------------------
 @dataclasses.dataclass
 class WriteRequest:
     """One write site of an episode run in retrieve mode: its causal prefix (tokens
@@ -453,151 +454,12 @@ def write_requests(ep: Episode, spans: list[torch.Tensor], text_ids, level: int
     return out
 
 
-def free_run_grad(model, examples, lengths: list[int]) -> list[torch.Tensor]:
-    """``Model.free_run`` with gradients (the same operations, no stop decisions): each
-    rep is the writer's rep head on the last state of the span so far, fed back."""
-    heads = model.writer
-    width = model.decoder.embed_tokens.weight.shape[1]
-    reps = [torch.zeros(0, width, device=model.device) for _ in examples]
-    prefix = model.prefix(examples)
-
-    def last(*fed):
-        return tuple(h[-1:] for h in model.write(examples, list(fed), prefix, heads))
-    for step in range(max(lengths)):
-        if torch.is_grad_enabled():
-            # each step recomputed in backward: activations O(span) instead of O(span^2)
-            hidden = checkpoint(last, *reps, use_reentrant=False)
-        else:
-            hidden = last(*reps)
-        for i, h in enumerate(hidden):
-            if step < lengths[i]:
-                reps[i] = torch.cat([reps[i], heads.rep(h)])
-    return reps
-
-
-class Writer:
-    """The writer (``Model``: prefix, write, free run, span heads) with the stack's
-    codecs and the reader's item-key heads: in-context writes during L1 episodes and
-    the producers' forward that L1b replays."""
-
-    def __init__(self, model, stack, reader: L1Reader, frozen: Frozen, autocast=None,
-                 batch: int = 8):
-        self.model, self.stack, self.reader, self.frozen = model, stack, reader, frozen
-        self.autocast = autocast or frozen.autocast
-        self.batch = batch
-
-    def inputs(self, prefix_ids: torch.Tensor, mems: list[int], reads: list[torch.Tensor]
-               ) -> torch.Tensor:
-        """A write's input embeddings: the prefix with its reads spliced in."""
-        x, _ = splice(self.frozen.embed(prefix_ids), mems, reads)
-        return x
-
-    @torch.no_grad()
-    def generate(self, requests: list[WriteRequest]) -> list[torch.Tensor]:
-        """Each site's span, free-running from its causal prefix (``<|bg|>`` marker at
-        the site's ratio), as the frozen writer generates it in place."""
-        out = []
-        for start in range(0, len(requests), self.batch):
-            chunk = requests[start:start + self.batch]
-            examples = [{'inputs': self.inputs(r.prefix_ids, r.mems, r.reads),
-                         'factor': r.factor} for r in chunk]
-            with self.autocast():
-                reps, _ = self.model.free_run(examples, [r.count for r in chunk])
-            out += [r.float() for r in reps]
-        return out
-
-    def encode(self, span: torch.Tensor) -> dict[str, torch.Tensor]:
-        """The codecs' items of a span (as the bank build encodes a record's span)."""
-        with self.autocast():
-            items = self.stack.encode(span)
-        return {s: v.float() for s, v in items.items()}
-
-
-class WriteLog:
-    """The sources of in-context writes, for L1b's producer replay: per write its
-    prefix token ids, ``<|mem|>`` positions, the read spans spliced there, the ratio
-    and the generated span (float32, the codecs' exact input). One safetensors file
-    plus a JSON index per training step under ``root`` (``None``: in memory only); the
-    newest entry of a source wins. ``truncate(step)`` drops steps after a checkpoint."""
-
-    def __init__(self, root: Path | None):
-        self.root, self.index, self.memory, self.pending = root, {}, {}, {}
-        self._handles: dict[str, object] = {}
-        if root is not None:
-            root.mkdir(parents=True, exist_ok=True)
-            for meta in sorted(root.glob('step-*.json')):
-                if meta.with_suffix('.safetensors').exists():
-                    for source, entry in json.loads(meta.read_text()).items():
-                        self.index[source] = {**entry, 'file': meta.stem}
-
-    def __contains__(self, source: str) -> bool:
-        return source in self.index or source in self.pending
-
-    def add(self, req: WriteRequest, span: torch.Tensor, step: int,
-            group: list[str] | None = None) -> None:
-        """``group``: the sources generated in the same writer batch (replay unit)."""
-        self.pending[req.source] = {
-            'kb': req.ep.kb, 'mems': req.mems, 'factor': req.factor, 'step': step,
-            'group': list(group or [req.source]),
-            'tensors': {'prefix_ids': req.prefix_ids.to(torch.int32).cpu(),
-                        'span': span.detach().float().cpu(),
-                        **{f'read{j}': r.float().cpu() for j, r in enumerate(req.reads)}}}
-
-    def flush(self, step: int) -> None:
-        """Publish the pending writes as step ``step`` (the count of completed steps)."""
-        if not self.pending:
-            return
-        if self.root is None:
-            for source, entry in self.pending.items():
-                self.memory[source] = entry
-                self.index[source] = {k: v for k, v in entry.items() if k != 'tensors'}
-            self.pending = {}
-            return
-        from safetensors.torch import save_file
-        name = f'step-{step:08d}'
-        tensors, meta = {}, {}
-        for n, (source, entry) in enumerate(self.pending.items()):
-            for key, value in entry['tensors'].items():
-                tensors[f'{n}.{key}'] = value.contiguous()
-            meta[source] = {'n': n, 'reads': sum(k.startswith('read') for k in entry['tensors']),
-                            **{k: v for k, v in entry.items() if k != 'tensors'}}
-        save_file(tensors, str(self.root / f'{name}.safetensors'))
-        (self.root / f'{name}.json').write_text(json.dumps(meta) + '\n')
-        for source, entry in meta.items():
-            self.index[source] = {**entry, 'file': name}
-        self.pending = {}
-
-    def get(self, source: str) -> dict:
-        entry = self.index[source]
-        if self.root is None:
-            tensors = self.memory[source]['tensors']
-        else:
-            from safetensors import safe_open
-            handle = self._handles.get(entry['file'])
-            if handle is None:
-                handle = safe_open(str(self.root / f'{entry["file"]}.safetensors'),
-                                   framework='pt')
-                self._handles[entry['file']] = handle
-            tensors = {key: handle.get_tensor(f'{entry["n"]}.{key}') for key in
-                       ['prefix_ids', 'span'] + [f'read{j}' for j in range(entry['reads'])]}
-        return {'prefix_ids': tensors['prefix_ids'].long(), 'span': tensors['span'],
-                'mems': entry['mems'], 'factor': entry['factor'],
-                'reads': [tensors[f'read{j}'] for j in range(len(entry['mems']))]}
-
-    def truncate(self, step: int) -> None:
-        """Forget the writes of steps after ``step`` (their KB commits were discarded)."""
-        self.pending = {}
-        if self.root is None:
-            return
-        self._handles = {}
-        for meta in sorted(self.root.glob('step-*.json')):
-            if int(meta.stem.split('-')[1]) > step:
-                meta.with_suffix('.safetensors').unlink(missing_ok=True)
-                meta.unlink()
-        self.index = {}
-        for meta in sorted(self.root.glob('step-*.json')):
-            for source, entry in json.loads(meta.read_text()).items():
-                self.index[source] = {**entry, 'file': meta.stem}
+def generate_writes(writer: Writer, requests: list[WriteRequest]) -> list[torch.Tensor]:
+    """Each site's span, free-running from its causal prefix (``<|bg|>`` marker at the
+    site's ratio), as the frozen writer generates it in place (``Writer.generate``)."""
+    examples = [{'inputs': writer.inputs(r.prefix_ids, r.mems, r.reads), 'factor': r.factor}
+                for r in requests]
+    return writer.generate(examples, [r.count for r in requests])
 
 
 def commit_writes(ctx: Context, writer: Writer, requests: list[WriteRequest],
@@ -607,7 +469,7 @@ def commit_writes(ctx: Context, writer: Writer, requests: list[WriteRequest],
     the write site as source and ``step``; a site written before is superseded (same
     ids). Returns the number of writes."""
     groups = {}
-    for start in range(0, len(requests), writer.batch):   # ``Writer.generate``'s batches
+    for start in range(0, len(requests), writer.batch):   # ``generate_writes``' batches
         chunk = [r.source for r in requests[start:start + writer.batch]]
         groups.update({source: chunk for source in chunk})
     latest: dict[tuple[str, int], tuple[WriteRequest, torch.Tensor]] = {}
@@ -618,7 +480,9 @@ def commit_writes(ctx: Context, writer: Writer, requests: list[WriteRequest],
         for req, span in latest.values():
             by_kb.setdefault(req.ep.kb, []).append((req, writer.encode(span)))
             if log is not None:
-                log.add(req, span, step, groups[req.source])
+                log.add(req.source, kb=req.ep.kb, prefix_ids=req.prefix_ids, mems=req.mems,
+                        reads=req.reads, factor=req.factor, span=span, step=step,
+                        group=groups[req.source])
         for name, entries in by_kb.items():
             kb = ctx.kbs[name]
             for s in kb.spaces:
@@ -638,166 +502,6 @@ def commit_writes(ctx: Context, writer: Writer, requests: list[WriteRequest],
                 ctx.added(name, s, [i.id for i in done], 'write',
                           [i.provenance.sources for i in done])
     return len(latest)
-
-
-class Producers:
-    """L1b (owner: full gradient through the sources): the items a read retrieves are
-    recomputed from their stored sources with gradients into the producers.
-
-    - A bank item (producer ``codec``, one source record): the writer's span of the
-      record under the memory prompt at the bank's ratio level, then the codecs.
-    - A written item (producer ``write``): the writer's span at the write site from
-      the logged prefix and read spans (``WriteLog``), then the codecs.
-
-    ``mode`` 'free' replays the free run itself (the producer's actual forward:
-    ``free_run_grad``, each rep fed back); 'teacher' feeds the stored span and takes
-    the rep head's predictions (one pass, cheaper, but conditioned on the stored
-    span's rounded reps rather than the unrounded ones the free run fed back). The
-    span enters the codecs at its serialized precision (bf16 in the span cache for
-    bank items, float32 for writes) and the item at the store's (bf16), each by
-    ``ste_round``, so at the start of L1b the recomputed item equals the stored
-    payload (``stats``: ``match_exact``, ``match_rel``) - given the producer's batch
-    composition, since on the GPU the free run's numerics depend on padding: bank
-    items are replayed ``batch`` at a time (exact at 1 when the bank's spans were
-    written one at a time, ``build --span-batch-size 1``; measured 0.5-3% relative
-    otherwise), writes together with the sources of their writer batch (the logged
-    ``group``). The forward is deterministic (no dropout, no sampling); the backward
-    recomputes each replay unit in the same composition and checks the drift.
-
-    Items that L1a modified in place have no source-recompute equivalent: in L1b the
-    value read is the producers' recomputation, not the live value (L2 reconciles the
-    two). Items without a recomputable source (another producer, a record without
-    text or cached span, a write not in the log) keep their live value.
-
-    Per step: ``begin``; reads call ``values`` (forward without gradient, once per
-    source, item values as leaves so the gradients of all reads of the step
-    accumulate); ``backward`` recomputes the sources that received gradients with
-    gradients and backpropagates the accumulated item gradients into the writer's span
-    heads and the codecs (before the optimizer step: invariant 3)."""
-
-    def __init__(self, writer: Writer, ctx: Context, texts: dict[str, str],
-                 caches: dict[str, SpanCache], level: int, log: WriteLog | None,
-                 text_ids, mode: str = 'free', batch: int = 1):
-        if mode not in ('free', 'teacher'):
-            raise ValueError('mode is free or teacher')
-        self.writer, self.ctx, self.texts, self.caches = writer, ctx, texts, caches
-        self.level, self.log, self.text_ids, self.mode, self.batch = level, log, text_ids, mode, batch
-        self.leaves: dict[tuple, dict[str, torch.Tensor]] = {}
-        self.items: dict[tuple, dict[str, str]] = {}
-        self.stats: dict[str, list] = {}
-        self.unit_of: dict[tuple, tuple] = {}
-
-    def begin(self) -> None:
-        self.leaves, self.items, self.stats, self.unit_of = {}, {}, {}, {}
-
-    def source(self, dataset: str, space: str, item_id: str) -> tuple | None:
-        producer, sources = self.ctx.origin[dataset][space].get(item_id, (None, ()))
-        if len(sources) != 1:
-            return None
-        if producer == 'codec' and sources[0] in self.texts and dataset in self.caches \
-                and sources[0] in self.caches[dataset]:
-            return ('codec', dataset, sources[0])
-        if producer == 'write' and self.log is not None and sources[0] in self.log.index:
-            return ('write', dataset, sources[0])
-        return None
-
-    def _group(self, key: tuple) -> tuple:
-        """The replay unit of a written item: the sources generated together with it
-        (the writer's batch at the site, as logged), so the replay has the
-        generation's batch composition; the item alone when that is unknown."""
-        group = self.log.index[key[2]].get('group') or [key[2]]
-        unit = tuple(('write', self.log.index[g]['kb'], g) for g in group if g in self.log.index)
-        return unit if key in unit else (key,)
-
-    def values(self, space: str, refs) -> list[torch.Tensor | None]:
-        keys = [self.source(d, space, i) for d, i in refs]
-        todo = [k for k in dict.fromkeys(keys) if k is not None and k not in self.leaves]
-        codec = [k for k in todo if k[0] == 'codec']
-        units = [tuple(codec[i:i + self.batch]) for i in range(0, len(codec), self.batch)]
-        units += list(dict.fromkeys(self._group(k) for k in todo if k[0] == 'write'))
-        for unit in units:
-            if all(k in self.leaves for k in unit):
-                continue
-            with torch.no_grad():
-                outs = self.forward(list(unit))
-            for key, out in zip(unit, outs):
-                if key not in self.leaves:
-                    self.leaves[key] = {s: v.detach().requires_grad_() for s, v in out.items()}
-                    self.unit_of[key] = unit
-        for key, (_, item_id) in zip(keys, refs):
-            if key is not None and space not in self.items.setdefault(key, {}):
-                self.items[key][space] = item_id
-                self._verify(key, space, item_id)
-        return [None if k is None else self.leaves[k][space] for k in keys]
-
-    def _example(self, key: tuple) -> tuple[dict, torch.Tensor, bool]:
-        kind, dataset, source = key
-        device = self.writer.model.device
-        if kind == 'codec':
-            ids = self.text_ids(self.texts[source])
-            factor = length_factors(int(ids.shape[0]))[self.level]
-            feed = self.caches[dataset].get(source).to(device).float()
-            return {'ids': ids, 'prompt': 'memory', 'factor': factor}, feed, True
-        entry = self.log.get(source)
-        x = self.writer.inputs(entry['prefix_ids'], entry['mems'], entry['reads'])
-        return {'inputs': x, 'factor': entry['factor']}, entry['span'].to(device), False
-
-    def forward(self, keys: list[tuple]) -> list[dict[str, torch.Tensor]]:
-        """The producers' items of each source (gradients when enabled)."""
-        model = self.writer.model
-        parts = [self._example(k) for k in keys]
-        examples = [e for e, _, _ in parts]
-        with self.writer.autocast():
-            if self.mode == 'free':
-                reps = free_run_grad(model, examples, [f.shape[0] for _, f, _ in parts])
-            else:
-                hidden = model.write(examples, [f for _, f, _ in parts], model.prefix(examples))
-                reps = [model.writer.rep(h[:-1]) for h in hidden]
-        out = []
-        for rep, (_, _, cached) in zip(reps, parts):
-            span = ste_round(rep.float()) if cached else rep.float()
-            out.append({s: ste_round(v) for s, v in self.writer.encode(span).items()})
-        return out
-
-    @torch.no_grad()
-    def _verify(self, key: tuple, space: str, item_id: str) -> None:
-        """A recomputed item against the stored payload (bf16) of the same item."""
-        got = self.leaves[key][space]
-        stored = self.ctx.kbs[key[1]].read(space, [item_id])[0].values.float().to(got.device)
-        if got.shape != stored.shape:
-            self.stats.setdefault('match_rel', []).append(float('inf'))
-            return
-        self.stats.setdefault('match_exact', []).append(float((got == stored).float().mean()))
-        self.stats.setdefault('match_rel', []).append(
-            float((got - stored).norm() / stored.norm().clamp_min(1e-12)))
-
-    def backward(self) -> dict:
-        """Backpropagate the step's accumulated item gradients through the producers:
-        each replay unit holding an item with a gradient is recomputed with gradients
-        in the composition of its forward (``drift``: the largest difference to it)."""
-        todo = [k for k, leaves in self.leaves.items()
-                if any(v.grad is not None for v in leaves.values())]
-        drift = 0.0
-        for unit in dict.fromkeys(self.unit_of[k] for k in todo):
-            outs = self.forward(list(unit))
-            tensors, grads = [], []
-            for key, out in zip(unit, outs):
-                if self.unit_of.get(key) != unit:
-                    continue
-                for s, value in out.items():
-                    leaf = self.leaves[key][s]
-                    drift = max(drift, float((value.detach() - leaf).abs().max()))
-                    if leaf.grad is not None:
-                        tensors.append(value)
-                        grads.append(leaf.grad)
-            if tensors:
-                torch.autograd.backward(tensors, grads)
-        out = {'sources': len(self.leaves), 'backward_sources': len(todo), 'drift': drift}
-        for name, values in self.stats.items():
-            out[name] = round(sum(values) / len(values), 6) if values else None
-            if name == 'match_rel' and values:
-                out['match_rel_max'] = max(values)
-        return out
 
 
 # -- model loading (GPU container) ------------------------------------------------------
@@ -923,8 +627,8 @@ def build(args) -> None:
         todo = sorted(r for r in recs if r not in done)
         for start in range(0, len(todo), args.batch_size):
             batch = todo[start:start + args.batch_size]
-            with model.core.autocast():
-                encoded = [stack.encode(span_of(r)) for r in batch]
+            with model.core.autocast():     # the producers' codec step (schnitz.kb.producer)
+                encoded = [produce_items(stack, span_of(r)) for r in batch]
             per_space = {s: [] for s in DEFAULT_SPACES}
             for r, items in zip(batch, encoded):
                 for s in DEFAULT_SPACES:
@@ -1072,12 +776,20 @@ L1A_SET = ('keys', 'operators', 'recombiner')
 def parameter_sets(reader: L1Reader, writer_model=None) -> dict[str, list]:
     """The trainable parameter sets: key heads and gate offsets, S_s, R, the codecs
     and the writer's span heads (marker, ratio code, rep head)."""
-    sets = {'keys': list(reader.keys.parameters()) + list(reader.gate_offset.parameters()),
+    return {'keys': list(reader.keys.parameters()) + list(reader.gate_offset.parameters()),
             'operators': list(reader.operators.parameters()),
             'recombiner': list(reader.stack.recombiner.parameters()),
-            'codecs': list(reader.stack.codecs.parameters()),
-            'writer': [] if writer_model is None else list(writer_model.writer.parameters())}
-    return sets
+            **producer_params(writer_model, reader.stack)}
+
+
+def optimizer_groups(sets: dict[str, list], args) -> list[dict]:
+    """AdamW groups: the reader (keys, S_s, R) at ``--lr``; the producers at their own
+    L1b rates (``--l1b-codec-lr``, ``--l1b-writer-lr``), since one step at the reader's
+    rate moved the recomputed items by 25-45%."""
+    return [{'params': [p for name in ('keys', 'operators', 'recombiner') for p in sets[name]],
+             'lr': args.lr, 'weight_decay': 0.01},
+            {'params': sets['codecs'], 'lr': args.l1b_codec_lr, 'weight_decay': 0.01},
+            {'params': sets['writer'], 'lr': args.l1b_writer_lr, 'weight_decay': 0.0}]
 
 
 def set_phase(sets: dict[str, list], names) -> list:
@@ -1179,11 +891,17 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     params = trainable if trainable is not None else ctx.reader.trainable()
     torch.nn.utils.clip_grad_norm_(params, args.clip)
     optimizer.step()
+    change_units = getattr(args, 'l1b_change_units', 4)
+    if producer is not None and change_units >= 0:
+        # how far the step moved the recomputed items (at the producers' own rates)
+        t0 = time.time()
+        out['l1b'].update(producer.change(change_units))
+        out['l1b_change_s'] = round(time.time() - t0, 3)
     item_lr = 0.0 if args.retrieval_only or phase == 'l1b' else args.item_lr
     counts = cache.apply(item_lr)
     if requests:
         t0 = time.time()
-        spans = writer.generate(requests)
+        spans = generate_writes(writer, requests)
         out['writes'] = commit_writes(ctx, writer, requests, spans, step + 1, log)
         if log is not None:
             log.flush(step + 1)
@@ -1283,8 +1001,10 @@ def load_producers(args, ctx: Context, writer: Writer, log: WriteLog, model) -> 
               for producer, src in origin.values() if producer == 'codec' and len(src) == 1}
     dirs = {str(d) for d in manifest['transcripts']}
     texts = {r: v['text'] for r, v in read_sources(dirs, wanted).items()}
-    return Producers(writer, ctx, texts, caches, LEVELS.index(manifest['level']), log,
-                     model.text_ids, args.l1b_replay, args.l1b_batch)
+    return Producers(writer, origin=ctx.origin, texts=texts, caches=caches,
+                     level=manifest['level'], log=log, mode=args.l1b_replay,
+                     batch=args.l1b_batch,
+                     stored=lambda d, s, i: ctx.kbs[d].read(s, [i])[0].values)
 
 
 def train(args) -> None:
@@ -1317,9 +1037,7 @@ def train(args) -> None:
     reader.keys.load_state_dict(torch.load(args.banks / 'key_heads_init.pt', map_location='cpu'))
     reader.to(model.device)
     sets = parameter_sets(reader, model)
-    groups = [{'params': [p for name in ('keys', 'operators', 'recombiner', 'codecs')
-                          for p in sets[name]], 'lr': args.lr, 'weight_decay': 0.01},
-              {'params': sets['writer'], 'lr': args.writer_lr, 'weight_decay': 0.0}]
+    groups = optimizer_groups(sets, args)
     for p in sets['writer'] + sets['codecs']:     # AdamW takes them; phases enable them
         p.requires_grad_(True)
     optimizer = torch.optim.AdamW(groups, lr=args.lr)
@@ -1341,6 +1059,10 @@ def train(args) -> None:
     if state_path.exists():
         state = torch.load(state_path, map_location=model.device, weights_only=False)
         reader.load_state_dict(state['reader'])
+        if len(state['optimizer']['param_groups']) != len(groups):
+            raise ValueError(f'{state_path} has {len(state["optimizer"]["param_groups"])} '
+                             'optimizer groups (before the L1b codec/writer rates); '
+                             'restart from the banks or from --init-reader')
         optimizer.load_state_dict(state['optimizer'])
         if 'writer' in state:
             model.writer.load_state_dict(state['writer'])
@@ -1361,7 +1083,7 @@ def train(args) -> None:
             log.truncate(step)
     ctx = Context(frozen, reader, kbs)
     tok = model.tok
-    writer = Writer(model, stack, reader, frozen, batch=args.write_batch) \
+    writer = Writer(model, stack, frozen.embed, batch=args.write_batch) \
         if args.writes or 'l1b' in phases else None
     producers = load_producers(args, ctx, writer, log, model) if 'l1b' in phases else None
     args.write_level_index = LEVELS.index(args.write_level)
@@ -1504,10 +1226,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                             help='SpanCache directory (default <output>/spans)')
     build_args.add_argument('--cache', type=Path, help='B1 teacher cache (span source teacher)')
     build_args.add_argument('--span-batch-size', type=int,
-                            help='records per writer free run (default --batch-size). On '
-                                 'the GPU the free run depends on the batch composition '
-                                 '(padding), so L1b replays a bank exactly only when its spans '
-                                 'were written one at a time (1)')
+                            help='records per writer free run (default --batch-size, 32). '
+                                 'L1B NEEDS 1: on the GPU the free run depends on its batch '
+                                 'composition (padding), and L1b replays each bank item one at '
+                                 'a time, so only a bank written with --span-batch-size 1 is '
+                                 'replayed exactly (batch-16 spans differ from batch-1 spans by '
+                                 '1.1%% on average, up to 29%%). Batch 1 writes about 2.1 '
+                                 'records/s against 5-7 at 16 on the shared GPU (28 Sep, 96 '
+                                 'records), so the default stays batched for bank-scale '
+                                 'builds that no L1b phase replays')
     build_args.add_argument('--distractors', type=int, default=0,
                             help='extra records per KB beyond those the transcripts name')
     t = parser.add_argument_group('train')
@@ -1543,13 +1270,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                    help='alternating phases, cycled, e.g. a:2000,b:500 (L1a then L1b steps)')
     t.add_argument('--l1b-train', default='writer,codecs,keys,operators,recombiner',
                    help=f'parameter sets trained in L1b, from {",".join(PHASE_SETS)}')
-    t.add_argument('--l1b-replay', choices=('free', 'teacher'), default='free',
-                   help='L1b producer replay: the free run itself (the stored forward) or '
-                        'teacher-fed on the stored span (one pass)')
+    t.add_argument('--l1b-replay', choices=('free', 'teacher', 'self'), default='free',
+                   help='L1b producer replay (schnitz.kb.producer): the free run itself (the '
+                        'stored forward), teacher-fed on the stored span (one pass), or one '
+                        'pass fed with the writer\'s own free run')
     t.add_argument('--l1b-batch', type=int, default=1,
                    help='bank sources per producer pass (1: the replay is exact when the bank\'s '
                         'spans were written one at a time, build --span-batch-size 1)')
-    t.add_argument('--writer-lr', type=float, default=3e-5, help='L1b: writer span heads')
+    t.add_argument('--l1b-codec-lr', type=float, default=3e-5,
+                   help='L1b: the codecs\' learning rate (their own AdamW group)')
+    t.add_argument('--l1b-writer-lr', type=float, default=3e-6,
+                   help='L1b: the writer span heads\' learning rate (their own AdamW group)')
+    t.add_argument('--l1b-change-units', type=int, default=4,
+                   help='L1b: replay units recomputed after each optimizer step to log the '
+                        'relative change of their items (l1b_change_rel; 0: all, -1: off)')
     t.add_argument('--writes', action='store_true',
                    help='v3 write sites: the frozen writer generates each site\'s span in '
                         'place and its items enter the episode\'s KB for later steps')

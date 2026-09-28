@@ -44,9 +44,20 @@ never saw gold for the evaluation task (``--heldout-lineage task``; ``any``: no 
 lineage at all) and their own records of this evaluation; they write (``split='eval'``)
 into the persistent KB, never visible to training or to later evaluations.
 
-Gradient through the written spans into earlier rounds' writes (truncated backprop over
-2-3 rounds, the L1b regime): ``--backprop-rounds``; only 0 is implemented (writes are
-detached), since the selective producer replay of L1b is not built yet.
+Gradient into earlier rounds' writes (the L1b regime, ``--backprop-rounds k``, default
+2): the round's write is logged as a write source (``schnitz.kb.producer.WriteLog``: the
+write site's token ids, the attempt's read spans, the generated span and items, and per
+read its query state and the items it read). In the SFT pass of round t the task's own
+record (written at round t-1) is read as its producers' recomputation
+(``schnitz.kb.producer.Producers``: the same selective replay as L1b, bit-exact at the
+forward), so round t's losses reach the writer's span heads and the codecs through the
+write of round t-1; the replay of that write recomputes each of its reads of the task's
+own record from the round t-2 write (forward: the logged span exactly, gradient through
+the recomputed read: ``L1Reader.reread``), and so on, truncated after k writes. Other
+records are read as stored. The producers train at their own rates (``--l1b-codec-lr``,
+``--l1b-writer-lr``); with k = 0 the writes are detached and the writer and codecs are
+frozen. The log lives for one episode (its rounds share the parameters: one optimizer
+step per batch).
 
 Resume: every checkpoint pairs ``b9.pt`` (reader, optimizer, step, RNG, registries) with a
 live checkpoint of every KB; a restart restores it and discards later commits. Episodes
@@ -67,9 +78,10 @@ import torch
 
 from schnitz.kb.bank import Transcripts, slots_of, write_spans as bank_write_spans
 from schnitz.kb.experience import (GenProtocol, GoldSchedule, KBView, Registry, generate,
-                                   read_items, read_mass, write_prefix)
+                                   read_items, read_mass, write_source)
+from schnitz.kb.producer import (FEEDS, Producers, Writer, WriteLog, producer_params,
+                                 span_length)
 from schnitz.kb.read import ItemCache
-from schnitz.kb.producer import produce_items, span_length
 from schnitz.kb_store import NewItem, Provenance
 from schnitz.task_verifiers import check_episode
 
@@ -130,6 +142,12 @@ class Experience:
         self.registries = {name: Registry(kb.dataset) for name, kb in kbs.items()}
         self.schedule = GoldSchedule(args.gold_start, args.gold_anneal, args.gold_decay)
         self.device = frozen.device
+        # the writer's in-place writes and their replay (one write at a time: the replay
+        # has the generation's batch composition)
+        self.writer = None if model is None else Writer(model, reader.stack, frozen.embed, 1)
+        self.log: WriteLog | None = None
+        self.producers: Producers | None = None
+        self.producer_stats: list[dict] = []
         if args.temperature > 0:
             gen = torch.Generator(device='cpu').manual_seed(args.seed)
 
@@ -162,6 +180,54 @@ class Experience:
             mode=mode, swap_with=swap_with, heldout_lineage=self.args.heldout_lineage)
         return KBView(kb, hidden, substitute), weights
 
+    # -- gradients into earlier rounds' writes ------------------------------------------
+    def begin_episode(self, row: dict) -> None:
+        """With ``--backprop-rounds`` k > 0: a write log and a producer replay for the
+        episode's rounds (the task's own records written in this episode, depth k)."""
+        k = getattr(self.args, 'backprop_rounds', 0)
+        if k <= 0 or self.writer is None:
+            self.log = self.producers = None
+            return
+        reg = self.registries[self.kb_of(row).dataset]
+        self.log = log = WriteLog(None)
+
+        def resolve(dataset: str, space: str, item_id: str):
+            rec = reg.record_of(item_id)
+            if rec is not None and rec.record_id in log.index:
+                return ('write', dataset, rec.record_id)
+            return None
+        self.producers = Producers(self.writer, resolve=resolve, log=log,
+                                   mode=getattr(self.args, 'l1b_replay', 'free'), batch=1,
+                                   depth=k, reread=self.reader.reread)
+
+    def end_episode(self) -> dict | None:
+        """Backpropagate the episode's accumulated item gradients through its writes."""
+        if self.producers is None:
+            return None
+        stats = self.producers.backward()
+        self.producer_stats.append(stats)
+        self.log = self.producers = None
+        return stats
+
+    def _rereads(self, attempt, dataset: str) -> list:
+        """Per read of the attempt: its query state and, per space, the items read (their
+        values as read, their recomputable sources, their gate scales)."""
+        out = []
+        for read in attempt.reads:
+            if read is None or read.state is None or attempt.cache is None:
+                out.append(None)
+                continue
+            spaces = {}
+            for s, info in read.spaces.items():
+                if not info.refs:
+                    continue
+                spaces[s] = {'keys': [self.producers.source(d, s, i) for d, i in info.refs],
+                             'values': [attempt.cache.values[(d, s, i)].detach()
+                                        for d, i in info.refs],
+                             'scales': list(info.scales)}
+            out.append({'state': read.state, 'spaces': spaces})
+        return out
+
     # -- the three parts of a round -----------------------------------------------------
     @torch.no_grad()
     def attempt(self, row: dict, ep, view: KBView, weights: dict):
@@ -183,6 +249,7 @@ class Experience:
                            read, prompt_ids(row, self.model.tok), self.proto,
                            self.args.max_new, policy, self.args.max_reads,
                            self.frozen.autocast)
+        attempt.cache = cache
         return attempt, verify(attempt.answer, row['verify'])
 
     def sft(self, ep, view: KBView, weights: dict, weight: float, task: str) -> dict:
@@ -190,7 +257,8 @@ class Experience:
         cache = ItemCache(self.device, train=self.args.item_lr > 0)
         self.ctx.kbs = {ep.kb: view}
         try:
-            nll, n, reads, _ = run_episode(self.ctx, ep, cache, 'retrieve', weights=weights)
+            nll, n, reads, _ = run_episode(self.ctx, ep, cache, 'retrieve', weights=weights,
+                                           producer=self.producers)
             loss = weight * nll / n
             aux = [r.aux for r in reads if r.aux is not None]
             if aux and self.args.retrieval_weight:
@@ -213,13 +281,19 @@ class Experience:
         kb = self.kb_of(row)
         reg = self.registries[kb.dataset]
         task = row['episode_id']
-        x = write_prefix(attempt, self.proto, self.embed)
+        site, mems, reads = write_source(attempt, self.proto)
         factor, n = span_length(max(attempt.generated, 1), self.level)
-        with self.frozen.autocast():
-            spans, _ = self.model.free_run([{'inputs': x, 'factor': factor}], [n])
-            items = produce_items(self.reader.stack, spans[0].float())
+        span, = self.writer.generate([{'inputs': self.writer.inputs(site, mems, reads),
+                                       'factor': factor}], [n])
+        items = self.writer.encode(span)
         tag = f'eval{reg.generation}' if split == 'eval' else f's{step}'
         record_id = f'b9:{task}:{tag}:r{t}'
+        if self.log is not None and split == 'train':
+            self.log.add(record_id, kb=kb.dataset, prefix_ids=site, mems=mems, reads=reads,
+                         factor=factor, span=span, step=step,
+                         items={s: v.bfloat16().float() for s, v in items.items()},
+                         rereads=self._rereads(attempt, kb.dataset))
+            self.log.flush(step)
         previous = reg.own.get(task)
         ids = {}
         for s, values in items.items():
@@ -244,8 +318,7 @@ class Experience:
             return None
         span = bank_write_spans(self.model, [gold_text(row)], self.level)[0]
         record_id = f'b9gold:{task}'
-        with self.frozen.autocast():
-            items = produce_items(self.reader.stack, span.float())
+        items = self.writer.encode(span.float())
         ids = {}
         for s, values in items.items():
             key = self.reader.keys.item_key(s, values).float().cpu()
@@ -280,7 +353,10 @@ class Experience:
             return self.write(row, ep, attempt, t, step, 'train', state['correct'])
 
         out = []
-        for r in rounds_loop(task, self.args.rounds, view_for, attempt_fn, sft_fn, write_fn):
+        self.begin_episode(row)
+        rounds = rounds_loop(task, self.args.rounds, view_for, attempt_fn, sft_fn, write_fn)
+        self.end_episode()
+        for r in rounds:
             a = r['attempt']
             out.append({'round': r['round'], 'correct': r['record'].correct,
                         'generated': a.generated, 'reads': len(a.reads), 'stop': a.stop,
@@ -326,6 +402,18 @@ class Experience:
         return report
 
 
+def optimizer_groups(reader, producers: dict[str, list], args) -> list[dict]:
+    """The reader at ``--lr``; with ``--backprop-rounds`` > 0 the codecs and the writer's
+    span heads at their own (L1b) rates."""
+    own = {id(p) for ps in producers.values() for p in ps}
+    groups = [{'params': [p for p in reader.parameters() if p.requires_grad and id(p) not in own],
+               'lr': args.lr, 'weight_decay': 0.01}]
+    if args.backprop_rounds > 0:
+        groups += [{'params': producers['codecs'], 'lr': args.l1b_codec_lr, 'weight_decay': 0.01},
+                   {'params': producers['writer'], 'lr': args.l1b_writer_lr, 'weight_decay': 0.0}]
+    return groups
+
+
 def round_weights(text: str, rounds: int) -> list[float]:
     if not text:
         return [1.0 / rounds] * rounds
@@ -358,10 +446,8 @@ def usable(row: dict, kbs: dict, tok, ctx, max_tokens: int, skipped: dict):
 def run(args) -> None:
     from schnitz.kb.stages.l1 import Context, Frozen, load_model, open_live
     from schnitz.kb.stages.l2 import load_reader
-    if args.backprop_rounds != 0:
-        raise NotImplementedError('gradients into earlier rounds\' writes need the L1b '
-                                  'selective producer replay, which is not built; only '
-                                  '--backprop-rounds 0 is implemented')
+    if args.backprop_rounds < 0:
+        raise ValueError('--backprop-rounds counts earlier writes (0: detached)')
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
     banks = json.loads((args.banks / 'banks.json').read_text())
@@ -375,14 +461,16 @@ def run(args) -> None:
     reader, config = load_reader(model, args.banks, args.l1_reader, args.seed)
     for p in reader.parameters():
         p.requires_grad_(True)
-    for p in reader.stack.codecs.parameters():
-        p.requires_grad_(False)
+    producers = producer_params(model, reader.stack)
+    for p in producers['codecs'] + producers['writer']:   # trained only through the replay
+        p.requires_grad_(args.backprop_rounds > 0)
     args.output.mkdir(parents=True, exist_ok=True)
     kbs = open_live(args.banks, args.output, args.live_device, args.sync_every)
     ctx = Context(frozen, reader, kbs)
     exp = Experience(args, model, frozen, reader, kbs, ctx, GenProtocol.from_tokenizer(model.tok),
                      level)
-    optimizer = torch.optim.AdamW(reader.trainable(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(optimizer_groups(reader, producers, args), lr=args.lr)
+    params = [p for group in optimizer.param_groups for p in group['params']]
     state_path = args.output / 'b9.pt'
     step = 0
 
@@ -392,6 +480,7 @@ def run(args) -> None:
             kb.checkpoint_live(tag)
         pending = state_path.with_suffix('.pending')
         torch.save({'reader': reader.state_dict(), 'optimizer': optimizer.state_dict(),
+                    'writer': model.writer.state_dict(),
                     'step': step, 'rng': rng.getstate(), 'torch_rng': torch.get_rng_state(),
                     'registries': {k: r.state() for k, r in exp.registries.items()},
                     'live_tag': tag, 'live_updates': {k: kb.live_updates for k, kb in kbs.items()},
@@ -406,6 +495,8 @@ def run(args) -> None:
         state = torch.load(state_path, map_location=model.device, weights_only=False)
         reader.load_state_dict(state['reader'])
         optimizer.load_state_dict(state['optimizer'])
+        if 'writer' in state:
+            model.writer.load_state_dict(state['writer'])
         step = state['step']
         rng.setstate(state['rng'])
         torch.set_rng_state(state['torch_rng'].cpu())
@@ -429,7 +520,7 @@ def run(args) -> None:
     (args.output / 'config.json').write_text(json.dumps(dict(
         vars(args), level=level, read_config=dataclasses.asdict(config),
         train_transcripts=len(train_rows), eval_episodes=len(eval_eps),
-        eval_skipped=eval_skipped, trained=sum(p.numel() for p in reader.trainable()),
+        eval_skipped=eval_skipped, trained=sum(p.numel() for p in params),
         kbs={k: kb.stats() for k, kb in kbs.items()}), indent=2, default=str) + '\n')
     metrics = (args.output / 'metrics.jsonl').open('a', encoding='utf-8')
 
@@ -467,7 +558,12 @@ def run(args) -> None:
                     window[f'mass_{k}_r{t}'].append(v)
                 for k, v in r['sft_mass'].items():
                     window[f'sft_mass_{k}_r{t}'].append(v)
-        torch.nn.utils.clip_grad_norm_(reader.trainable(), args.clip)
+        for stats in exp.producer_stats:
+            for k, v in stats.items():
+                if isinstance(v, (int, float)):
+                    window[f'replay_{k}'].append(v)
+        exp.producer_stats = []
+        torch.nn.utils.clip_grad_norm_(params, args.clip)
         optimizer.step()
         step += 1
         if args.rekey_every and step % args.rekey_every == 0:
@@ -521,9 +617,14 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         help="per-task factor per supersede of the task's own record")
     parser.add_argument('--no-gold', action='store_true')
     parser.add_argument('--heldout-lineage', choices=('task', 'any'), default='task')
-    parser.add_argument('--backprop-rounds', type=int, default=0,
-                        help='rounds the gradient reaches back through written spans '
-                             '(only 0 is implemented: needs L1b replay)')
+    parser.add_argument('--backprop-rounds', type=int, default=2,
+                        help='earlier rounds\' writes the gradient of a round reaches through '
+                             'the recomputed written items (L1b replay; 0: writes detached, '
+                             'writer and codecs frozen)')
+    parser.add_argument('--l1b-replay', choices=FEEDS, default='free',
+                        help='producer replay of the writes (free: the stored forward, exact)')
+    parser.add_argument('--l1b-codec-lr', type=float, default=3e-5)
+    parser.add_argument('--l1b-writer-lr', type=float, default=3e-6)
     parser.add_argument('--round-weights', default='', help='SFT weight per round, e.g. 0.2,0.3,0.5')
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--item-lr', type=float, default=0.0,

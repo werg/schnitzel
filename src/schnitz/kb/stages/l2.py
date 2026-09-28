@@ -4,8 +4,10 @@ two-step route of 5.2 "Gradients into producers").
 L1a trains item values and keys in place with the writer detached. L2 trains the
 producers so that the producer path of each item's source reproduces the item L1a
 left: the writer's span of the source record under the memory prompt at the bank's
-ratio level (``schnitz.kb.producer.write_spans``, teacher-fed with the bank's cached
-span or free-running), the forward codecs, and for items whose lineage says they came
+ratio level, rounded to the span cache's bf16, then the forward codecs (the shared
+producer replay ``schnitz.kb.producer.Producers`` that L1b and B9 use; ``--feed``:
+teacher-fed with the bank's cached span, one gradient pass on the writer's own free run,
+or the free run replayed with gradients), and for items whose lineage says they came
 from a rewrite, S_s over their produced inputs (gates share x mass, conditioned on the
 item's key). The decoder is frozen; the writer's span heads train (rep head and ratio
 code), optionally the codecs (``--train codecs``) and S_s (``operators``).
@@ -41,7 +43,6 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-import contextlib
 import dataclasses
 import hashlib
 import json
@@ -55,9 +56,8 @@ import torch.nn.functional as F
 
 from schnitz.kb.bank import SpanCache, Transcripts, kb_dir, read_sources, slots_of
 from schnitz.kb.loop import Run, Window, warmup_optimizer
-from schnitz.kb.producer import (L2Weights, functional_loss, item_losses, key_loss, l2_loss,
-                                 produce_items, recombine, rewrite_item, span_length,
-                                 write_spans)
+from schnitz.kb.producer import (FEEDS, L2Weights, Producers, Writer, functional_loss,
+                                 item_losses, key_loss, l2_loss, recombine, rewrite_item)
 from schnitz.kb_store import KnowledgeBase, NewItem, Provenance
 
 
@@ -183,82 +183,62 @@ def collect_targets(kb: KnowledgeBase, bank: KnowledgeBase | None = None
 
 
 # -- the producer path ------------------------------------------------------------------
-class Producers:
-    """Writer span heads, codecs and S_s of the producer path, with the frozen decoder,
-    the L1 reader's key heads and R."""
-
-    def __init__(self, model, reader, level: str, feed: str, caches: dict[str, SpanCache],
-                 texts: dict[str, str], neighbour_keys: bool = False):
-        self.model, self.reader, self.level, self.feed = model, reader, level, feed
-        self.caches, self.texts = caches, texts
-        self.neighbour_keys = neighbour_keys
-        self._ids: dict[str, torch.Tensor] = {}
-
-    def ids(self, record_id: str) -> torch.Tensor:
-        if record_id not in self._ids:
-            self._ids[record_id] = self.model.text_ids(self.texts[record_id])
-        return self._ids[record_id]
-
-    def spans(self, kbs: list[str], record_ids: list[str]) -> list[torch.Tensor]:
-        examples, counts, teacher = [], [], []
-        for kb, r in zip(kbs, record_ids):
-            ids = self.ids(r)
-            factor, n = span_length(ids.shape[0], self.level)
-            cache = self.caches.get(kb)
-            if cache is not None and r in cache:
-                n = int(cache.index[r][2])
-                if self.feed == 'teacher':
-                    teacher.append(cache.get(r).float())
-            elif self.feed == 'teacher':
-                raise ValueError(f'record {r} has no cached span to feed')
-            examples.append({'ids': ids, 'prompt': 'memory', 'factor': factor})
-            counts.append(n)
-        return write_spans(self.model, examples, counts, self.feed,
-                           teacher if self.feed == 'teacher' else None)
-
-    def items(self, span: torch.Tensor) -> dict[str, torch.Tensor]:
-        with self._autocast():
-            return produce_items(self.reader.stack, span)
-
-    def derived(self, target: Derived, produced_inputs: list[dict[str, torch.Tensor]]):
-        inputs = [(items[target.space], gate, None) for items, (_, gate)
-                  in zip(produced_inputs, target.inputs)]
-        with self._autocast():
-            return rewrite_item(self.reader.operators[target.space], inputs, target.key,
-                                target.target.shape[0], self.neighbour_keys)
-
-    def _autocast(self):
-        core = getattr(self.model, 'core', None)
-        return core.autocast() if core is not None else contextlib.nullcontext()
+def producers(model, reader, level: str, feed: str, caches: dict[str, SpanCache],
+              texts: dict[str, str]) -> Producers:
+    """The shared producer replay (``schnitz.kb.producer.Producers``) over bank records:
+    the writer's span of each record under the memory prompt at ``level`` (fed per
+    ``feed``), rounded to the span cache's bf16, then the reader's codecs."""
+    return Producers(Writer(model, reader.stack), texts=texts, caches=caches, level=level,
+                     mode=feed)
 
 
-def record_losses(prod: Producers, records: list[Record], weights: L2Weights,
+def _codec(rec) -> tuple[str, str, str]:
+    return ('codec', rec.kb, rec.record_id)
+
+
+def derive(prod: Producers, reader, target: Derived,
+           produced_inputs: list[dict[str, torch.Tensor]],
+           neighbour_keys: bool = False) -> torch.Tensor:
+    """A rewrite output from its produced inputs (S_s at gate share x mass)."""
+    inputs = [(items[target.space], gate, None) for items, (_, gate)
+              in zip(produced_inputs, target.inputs)]
+    with prod.writer.autocast():
+        return rewrite_item(reader.operators[target.space], inputs, target.key,
+                            target.target.shape[0], neighbour_keys)
+
+
+def _inputs(prod: Producers, target: Derived) -> list[dict[str, torch.Tensor]]:
+    return prod.forward([('codec', target.kb, r) for r, _ in target.inputs])
+
+
+def record_losses(prod: Producers, reader, records: list[Record], weights: L2Weights,
                   functional: bool = True) -> tuple[torch.Tensor, dict]:
     """The L2 loss of a batch of records and its parts (means over the batch)."""
-    device = prod.model.device
-    spans = prod.spans([r.kb for r in records], [r.record_id for r in records])
+    model = prod.writer.model
+    device = model.device
+    spans = prod.spans([_codec(r) for r in records])
     parts: dict[str, list[torch.Tensor]] = defaultdict(list)
     produced_spans, target_spans, examples = [], [], []
     for rec, span in zip(records, spans):
-        items = prod.items(span)
+        items = prod.encode(span)
         target = {s: v.to(device) for s, v in rec.target.items()}
         for k, v in item_losses({s: items[s] for s in target}, target).items():
             parts[k].append(v)
-        parts['key'].append(torch.stack([key_loss(prod.reader.keys, s, items[s], rec.keys[s])
+        parts['key'].append(torch.stack([key_loss(reader.keys, s, items[s], rec.keys[s])
                                          for s in target]).mean())
         if functional:
             n = span.shape[0]
-            with prod._autocast():
-                produced_spans.append(recombine(prod.reader.stack, {s: items[s] for s in target}, n))
+            with prod.writer.autocast():
+                produced_spans.append(recombine(reader.stack, {s: items[s] for s in target}, n))
                 with torch.no_grad():
-                    target_spans.append(recombine(prod.reader.stack, target, n))
+                    target_spans.append(recombine(reader.stack, target, n))
             ids = prod.ids(rec.record_id)
             examples.append({'ids': ids, 'target': ids, 'task': 'reconstruct'})
     means = {k: torch.stack(v).mean() for k, v in parts.items()}
     logged = {}
     if functional:
-        with prod._autocast():
-            kl, info = functional_loss(prod.model, examples, produced_spans, target_spans)
+        with prod.writer.autocast():
+            kl, info = functional_loss(model, examples, produced_spans, target_spans)
         means['kl'] = kl
         logged.update(info)
     loss = l2_loss(means, weights)
@@ -266,17 +246,15 @@ def record_losses(prod: Producers, records: list[Record], weights: L2Weights,
     return loss, logged
 
 
-def derived_losses(prod: Producers, targets: list[Derived], weights: L2Weights
-                   ) -> tuple[torch.Tensor, dict]:
+def derived_losses(prod: Producers, reader, targets: list[Derived], weights: L2Weights,
+                   neighbour_keys: bool = False) -> tuple[torch.Tensor, dict]:
     """Per-space and key losses of rewrite outputs produced through their lineage."""
     parts: dict[str, list[torch.Tensor]] = defaultdict(list)
     for t in targets:
-        sources = [r for r, _ in t.inputs]
-        spans = prod.spans([t.kb] * len(sources), sources)
-        out = prod.derived(t, [prod.items(s) for s in spans])
+        out = derive(prod, reader, t, _inputs(prod, t), neighbour_keys)
         for k, v in item_losses({t.space: out}, {t.space: t.target.to(out.device)}).items():
             parts[k].append(v)
-        parts['key'].append(key_loss(prod.reader.keys, t.space, out, t.key))
+        parts['key'].append(key_loss(reader.keys, t.space, out, t.key))
     means = {k: torch.stack(v).mean() for k, v in parts.items()}
     return l2_loss(means, dataclasses.replace(weights, kl=0.0)), \
         {k: round(v.item(), 5) for k, v in means.items()}
@@ -284,40 +262,40 @@ def derived_losses(prod: Producers, targets: list[Derived], weights: L2Weights
 
 # -- evaluation ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate_records(prod: Producers, records: list[Record], batch_size: int) -> dict:
+def evaluate_records(prod: Producers, reader, records: list[Record], batch_size: int) -> dict:
     """Reproduction error per space, key cosine, and reading R(produced / target / bank
     items) against no memory, on the records' reconstruction (nats per token)."""
-    model = prod.model
+    model = prod.writer.model
     sums: dict[str, float] = defaultdict(float)
     per: dict[str, list[float]] = defaultdict(list)
     tokens = 0
     for start in range(0, len(records), batch_size):
         batch = records[start:start + batch_size]
-        spans = prod.spans([r.kb for r in batch], [r.record_id for r in batch])
+        spans = prod.spans([_codec(r) for r in batch])
         examples, arms = [], defaultdict(list)
         for rec, span in zip(batch, spans):
-            items = prod.items(span)
+            items = prod.encode(span)
             target = {s: v.to(model.device) for s, v in rec.target.items()}
             for k, v in item_losses({s: items[s] for s in target}, target).items():
                 per[k].append(v.item())
             for s in target:
-                per[f'keycos_{s}'].append(1 - key_loss(prod.reader.keys, s, items[s],
+                per[f'keycos_{s}'].append(1 - key_loss(reader.keys, s, items[s],
                                                        rec.keys[s]).item())
             if rec.bank:
                 bank = {s: v.to(model.device) for s, v in rec.bank.items()}
                 for k, v in item_losses(bank, {s: target[s] for s in bank}).items():
                     per[f'bank_{k}'].append(v.item())
             n = span.shape[0]
-            with prod._autocast():
-                arms['produced'].append(recombine(prod.reader.stack,
+            with prod.writer.autocast():
+                arms['produced'].append(recombine(reader.stack,
                                                   {s: items[s] for s in target}, n))
-                arms['target'].append(recombine(prod.reader.stack, target, n))
+                arms['target'].append(recombine(reader.stack, target, n))
                 if rec.bank:
-                    arms['bank'].append(recombine(prod.reader.stack, {
+                    arms['bank'].append(recombine(reader.stack, {
                         s: v.to(model.device) for s, v in rec.bank.items()}, n))
             ids = prod.ids(rec.record_id)
             examples.append({'ids': ids, 'target': ids, 'task': 'reconstruct'})
-        with prod._autocast():
+        with prod.writer.autocast():
             reads = {'noctx': model.read(examples, None)}
             target_logits = None
             for name, spans_ in arms.items():
@@ -345,8 +323,9 @@ def evaluate_records(prod: Producers, records: list[Record], batch_size: int) ->
 
 
 @torch.no_grad()
-def write_produced_kbs(prod: Producers, targets: dict[str, KnowledgeBase], dest: Path,
-                       batch_size: int) -> dict[str, KnowledgeBase]:
+def write_produced_kbs(prod: Producers, reader, targets: dict[str, KnowledgeBase], dest: Path,
+                       batch_size: int, neighbour_keys: bool = False
+                       ) -> dict[str, KnowledgeBase]:
     """A KB per dataset holding every target item replaced by its produced version (same
     ids and times; keys from the reader's item-key heads), for L1's evaluation arms."""
     out = {}
@@ -363,19 +342,18 @@ def write_produced_kbs(prod: Producers, targets: dict[str, KnowledgeBase], dest:
                 times[s][item.id] = (item.time, item.provenance.sources)
         for start in range(0, len(records), batch_size):
             batch = records[start:start + batch_size]
-            spans = prod.spans([r.kb for r in batch], [r.record_id for r in batch])
+            spans = prod.spans([_codec(r) for r in batch])
             for rec, span in zip(batch, spans):
-                items = prod.items(span)
+                items = prod.encode(span)
                 for s, item_id in rec.items.items():
                     t, sources = times[s][item_id]
                     per_space[s].append(NewItem(
-                        items[s].cpu(), prod.reader.keys.item_key(s, items[s]).cpu(),
+                        items[s].cpu(), reader.keys.item_key(s, items[s]).cpu(),
                         Provenance(tuple(sources), 'codec'), 1.0, t, item_id))
         for t in derived:
-            spans = prod.spans([t.kb] * len(t.inputs), [r for r, _ in t.inputs])
-            value = prod.derived(t, [prod.items(s) for s in spans])
+            value = derive(prod, reader, t, _inputs(prod, t), neighbour_keys)
             time_, sources = times[t.space][t.item_id]
-            per_space[t.space].append(NewItem(value.cpu(), prod.reader.keys.item_key(
+            per_space[t.space].append(NewItem(value.cpu(), reader.keys.item_key(
                 t.space, value).cpu(), Provenance(tuple(sources), 'rewrite'), 1.0, time_,
                 t.item_id))
         for s, items in per_space.items():
@@ -518,7 +496,7 @@ def train(args) -> None:
     train_sample = random.Random(1).sample(train_recs, min(len(train_recs), args.eval_records))
     train_derived = [d for d in derived if not any(heldout(s, args.heldout_mod)
                                                    for s, _ in d.inputs)]
-    prod = Producers(model, reader, level, args.feed, caches, texts, args.neighbour_keys)
+    prod = producers(model, reader, level, args.feed, caches, texts)
     weights = L2Weights.parse(args.weights)
     step = 0
     state = out.load('producers.pt', model.device)
@@ -538,11 +516,13 @@ def train(args) -> None:
 
     def evaluate(tag_step: int) -> None:
         model.writer.eval()
-        report = {'heldout': evaluate_records(prod, held, args.batch_size) if held else None,
-                  'train_sample': evaluate_records(prod, train_sample, args.batch_size)}
+        report = {'heldout': evaluate_records(prod, reader, held, args.batch_size) if held
+                  else None,
+                  'train_sample': evaluate_records(prod, reader, train_sample, args.batch_size)}
         if args.eval_episodes:
             dest = args.output / 'produced'
-            produced = write_produced_kbs(prod, targets, dest, args.batch_size)
+            produced = write_produced_kbs(prod, reader, targets, dest, args.batch_size,
+                                          args.neighbour_keys)
             report['task_arms'] = {
                 'target': task_arms(args, model, reader, args.query_layer, targets,
                                     transcripts, args.eval_episodes),
@@ -564,10 +544,10 @@ def train(args) -> None:
         batch = [train_recs[order.pop()] for _ in range(min(args.batch_size, len(order)))]
         model.writer.train()
         optimizer.zero_grad(set_to_none=True)
-        loss, parts = record_losses(prod, batch, weights, functional=weights.kl > 0)
+        loss, parts = record_losses(prod, reader, batch, weights, functional=weights.kl > 0)
         if train_derived and args.derived_every and step % args.derived_every == 0:
-            d_loss, d_parts = derived_losses(prod, rng.sample(train_derived, min(
-                len(train_derived), args.batch_size)), weights)
+            d_loss, d_parts = derived_losses(prod, reader, rng.sample(train_derived, min(
+                len(train_derived), args.batch_size)), weights, args.neighbour_keys)
             loss = loss + d_loss
             parts.update({f'derived_{k}': v for k, v in d_parts.items()})
         loss.backward()
@@ -602,8 +582,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--query-layer', type=int)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--level', help='ratio level of the writes (default: the banks\')')
-    parser.add_argument('--feed', choices=('teacher', 'free'), default='teacher',
-                        help="writer input: the bank's cached span, or its own free run")
+    parser.add_argument('--feed', choices=FEEDS, default='teacher',
+                        help="writer feed (schnitz.kb.producer.write_spans): the bank's cached "
+                             "span (teacher), one gradient pass on its own free run (self), or "
+                             "the free run replayed with gradients through every step (free, "
+                             "L1b's replay)")
     parser.add_argument('--train', default='writer',
                         help='comma list of writer (span heads), codecs, operators (S_s)')
     parser.add_argument('--neighbour-keys', action='store_true', help='S_s with input keys (K3b)')
