@@ -10,12 +10,10 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_bgkit_reps import TeacherCache  # noqa: E402
+from schnitz.kb.decoder import TeacherCache
 
 
 def main() -> None:

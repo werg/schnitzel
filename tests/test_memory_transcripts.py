@@ -125,11 +125,16 @@ def test_multihop_transcript_structure_slots_and_write():
     assert all(s['kb'] == 'kb' for s in slots(row))
     assert row['messages'][6] == {'role': 'assistant', 'content': '1842'}
     # a multi-hop answer is a reusable result: written after the answer
-    write = row['messages'][7]['tool_calls'][0]['function']
-    assert write['name'] == 'memory_write' and write['arguments']['content'].endswith('1842')
-    assert row['write_sites'][0]['source'] == 'own_result'
+    # the write call has no argument; the text is only a teacher target in write_sites
+    write = row['messages'][7]
+    assert write['tool_calls'][0]['function'] == {'name': 'memory_write', 'arguments': {}}
+    assert write['write_span'] == {'kb': 'kb', 'write_site': 0}
+    site = row['write_sites'][0]
+    assert site['source'] == 'own_result' and site['message'] == 7
+    assert site['teacher_text'].endswith('1842')
+    assert site['teacher_text'] not in json.dumps(row['messages'])
     assert counts['searches'] == 2 and counts['writes'] == 1
-    assert row['format'] == 2
+    assert row['format'] == 3
     json.dumps(row)  # serializable
 
 
@@ -175,7 +180,8 @@ def test_sql_stages_and_write():
     assert all(s['step'] == 0 and s['trigger'] == 'start' for s in row['search_sites'])
     answer = [m for m in row['messages'] if m['role'] == 'assistant' and m['content']]
     assert answer[-1]['content'] == gold
-    write = row['messages'][-2]['tool_calls'][0]['function']['arguments']['content']
+    assert row['messages'][-2]['tool_calls'][0]['function']['arguments'] == {}
+    write = row['write_sites'][0]['teacher_text']
     assert write.startswith('Database farm. Question: How many cities are villages?')
     assert write.endswith(gold)
     assert row['verify'] == episode['verify']
@@ -327,8 +333,8 @@ def test_multiturn_tool_docs_and_policy_sections_just_in_time():
     assert msgs[first + 1] == {'role': 'tool', 'name': 'get_user', 'content': '{"name": "Amy"}'}
     assert [t['name'] for t in row['tools']][2:] == ['cancel_reservation', 'get_user']
     write = msgs[-2]['tool_calls'][0]['function']
-    assert write['name'] == 'memory_write' and 'get_user -> cancel_reservation' in \
-        write['arguments']['content']
+    assert write == {'name': 'memory_write', 'arguments': {}}
+    assert 'get_user -> cancel_reservation' in row['write_sites'][0]['teacher_text']
 
 
 def test_scienceworld_pools_same_type_examples():
@@ -445,7 +451,29 @@ def test_render_through_lfm2_template():
     text = mt.render_text(row['messages'], row['tools'], tok)
     assert '<|tool_call_start|>[memory_search()]<|tool_call_end|>' in text
     assert text.count('<|reserved_23|><|reserved_24|>') == len(slots(row))
+    # the write: no argument, the model's own span in the same assistant turn
+    assert text.count('<|tool_call_start|>[memory_write()]<|tool_call_end|>'
+                      '<|reserved_20|><|reserved_22|><|im_end|>') == 1
+    assert row['write_sites'][0]['teacher_text'] not in text
     assert not mt.render_check(tok, row)
     row, _, _ = builder([PROTOCOL, FLOOR, HEAT, LAMP], command_df=DF).build(
         alfworld_episode(fail=True), 'train')
     assert not mt.render_check(tok, row)
+
+
+def test_audit_flags_write_text_and_arguments():
+    b = builder([HOP1, HOP2, FUTURE])
+    row, _, _ = b.build(qa_episode(), 'train')
+    assert not b.audit(row, ['1842'], 2)
+    bad = copy.deepcopy(row)
+    site = bad['write_sites'][0]
+    bad['messages'][site['message']]['tool_calls'][0]['function']['arguments'] = {
+        'content': site['teacher_text']}
+    got = b.audit(bad, ['1842'], 2)
+    assert got['write_site_malformed'] == 1 and got['teacher_text_in_messages'] == 1
+    bad = copy.deepcopy(row)
+    del bad['messages'][site['message']]['write_span']
+    assert b.audit(bad, ['1842'], 2)['write_site_malformed'] == 1
+    bad = copy.deepcopy(row)
+    bad['write_sites'] = []
+    assert b.audit(bad, ['1842'], 2)['write_without_site'] == 1

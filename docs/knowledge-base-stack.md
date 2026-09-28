@@ -201,66 +201,81 @@ in the tasks trained over them: the R6 passage corpora (reconstruction, QA,
 text continuation) and the task corpora (tool docs, schemas, background, worked
 examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
 
-### 5.1 Order
+### 5.1 Order (owner review, 28 September; concrete steps)
+
+Data principle: targeted corpora and targeted tasks, supervised by trajectories of
+more capable models (the SFT corpora we hold; local larger models such as
+LFM2.5-8B-A1B or Ling-3.0-tiny can generate more; paid teacher collection only by
+owner decision). A much larger KB run comes only after this works. Code: every
+stage is `scripts/train.py <stage>` over the shared package `schnitz.kb`
+(decoder, stack, losses, loop), so a change applies to every stage.
 
 1. **Writer, B3** (running): the decoder writes BGKit-style spans.
-2. **Decoder capabilities, B4 and the soft I/O port** (restart plan), while the
-   decoder still trains: general compression at all ratios, then the soft input
-   port and the soft output port ramped to half of the tasks.
-3. **K1 - Autoencoding through the spaces** (running, in parallel). Forward
-   codecs F_s and recombiner R: span → spaces → span. Losses: the frozen decoder
-   reads R's output and reconstructs the source text (NLL) with a KL to reading
-   the original span, plus a light cosine to the original span. Space dropout
-   forces every space to carry part of the content and R to work with spaces
-   missing. Inputs: first the cached S2 teacher spans (B1), then the writer's
-   own spans (offline generation by the frozen writer; invariant 1). Gate:
-   reconstruction through the stack close to reading the span itself; each
-   space's ablation costs something.
-4. **K2 - Keys.** A key head per space and query heads, initialized by
-   distillation from the R5d5 key table and routing addresses; only a starting
-   point, since L1 trains routing end to end.
-5. **K3a - Superposition operator warm-up** (no keys, drop-one). A neighbourhood
-   of items in space s, the target item removed; S_s, conditioned on the target
-   key only, produces an item from which R reconstructs the target's span. Only
-   needs to be roughly right, so that reads work in L1.
-6. **L1 - Live items, end to end** (the decoder frozen, so knowledge has to land
-   in the KB). Items start as the codecs' output and are then updated in place by
-   gradients from reads (sparse updates, optimizer state per item), a fast loop
-   to real superposition. Jointly trained: items, S_s (as the read-time
-   combiner), R, key and query heads.
-   - *Reads* are `memory_search()` tool calls without arguments in LFM2's native
-     format (trajectory memory v0.5; restart plan 3.2): the query is a vector,
-     not text: one key head per space projects a middle layer's state at the
-     call, so retrieval can start while the call finishes; the
-     result is a tool message whose content is the latent span between `<|mem|>`
-     and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
-     `memory_write()` calls in which the model generates the `<|bg|>` span
-     itself, in the same pass; per-space heads on that pass give the items and
-     keys (no text argument, no second encoding pass; owner, 28 September). A parameter store is consulted often, so SFT and
-     B9 data carry many calls per trajectory (several queries per site, query
-     diversity per B5); each call costs its few envelope tokens plus the span.
-   - *Routing through gates:* each space scores a candidate set and every
-     candidate's gate comes from its query-key similarity, sparse so that a read
-     keeps only a handful of items; gates scale mass
-     exactly, so the task loss trains keys and query heads (learned routing,
-     not expert mixing: the read result stays in context).
-   - *Tasks:* reconstruction and QA over the R6 KBs, trajectory SFT over the task
-     KBs, continuation of KB-domain text.
-   - *Superposition pressure:* the storage budget and recursive rewriting passes
-     with S_s between updates (section 5.2).
-7. **L2 - Learn to reproduce the live items.** The writer, forward codecs and
-   *recursive* applications of S_s are trained to produce the L1 items from the
-   sources alone: the in-place-trained items are the targets. This is where the
-   rewrite-then-recover objective lives (a neighbourhood rewritten by S_s into M
-   items, M < N compaction, M = N pure superposition; every original recoverable
-   at its own key), with L1's items as targets instead of self-reconstruction.
-   Afterwards the producers derive superposed items live from a new corpus.
-   S_s can also be distilled on L1's rewriting trajectories.
-8. **B9 loops and continual learning.** Multi-round attempts written back into
-   the per-dataset KBs; new corpora enter through the producers; periodic
-   rewriting; the KB-dependence tests (section 5.2).
-9. **Later:** teacher distillation (section 1.1) and joint co-training of the
-    decoder with the stack under replay.
+2. **B4, decoder capabilities** (the last stage in which the decoder trains):
+   - *B4a* (built, starts after B3): protocol tokens with LM-head rows,
+     ratio-stated prompts, `<|mem|>` delimiters in reads, soft input port for
+     questions (ramped to half).
+   - *B4b, soft output port:* on tasks whose answer is text (QA, summaries,
+     tool results), the decoder answers with a `<|port|>` … `<|/port|>` span
+     from its own rep and stop heads (not the memory writer's). Target: the
+     frozen S2 encoder's x1 encoding of the answer; losses: KL of a frozen S2
+     reader reading the port span against reading the target encoding, a light
+     reconstruction NLL, a loose cosine; rollout passes as for the writer.
+     Starts once the input port holds, ramps to half of those tasks; evaluated
+     over text/soft input × text/soft output.
+   - *B4c, in-context writes:* at the write sites of the memory transcripts
+     (v3) the model calls `memory_write()` and generates the span itself; the
+     span is distilled toward the writer's span of the site's teacher text
+     (teacher-fed, then free-running) and checked by a reader reconstructing
+     that text.
+3. **K1 - Autoencoding through the spaces** (running). Codecs F_s and
+   recombiner R: span → spaces → span, read by the frozen decoder; space dropout.
+4. **K2 - Keys.** Item-key heads per space (on the items) and query heads (on the
+   decoder's middle-layer state at `memory_search()`), trained with the
+   retrieval loss (5.2) on the transcripts' search sites against the items of
+   each slot's records, with in-batch and KB negatives. It is the L1 stage with
+   only the retrieval loss (`--retrieval-only`); no separate key-table
+   distillation.
+5. **K3 - Superposition operator warm-up** (drop-one: a neighbourhood of items in
+   space s with the target removed; S_s produces an item from which R
+   reconstructs the target's span).
+   - *K3a:* S_s conditioned on the target key only.
+   - *K3b:* additionally each neighbour item's key enters at each of its
+     positions (continues K3a; the key weights start at zero, so K3b begins as
+     K3a).
+6. **Bank creation** (offline): the model with a record in context calls
+   `memory_write()`; the span, the per-space heads and the key heads give the
+   items, one KB per dataset. The same path builds a user's KB from their own
+   corpus, so its throughput is a product property (measured).
+7. **L1 - End to end over the KBs** (decoder frozen, so knowledge has to land in
+   the KB). Reads are `memory_search()` calls (vector queries, sparse gates,
+   S_s → R → a short span in the tool result); writes are `memory_write()`.
+   Tasks: trajectory SFT over the task KBs, QA and reconstruction over the R6
+   KBs, continuation of KB-domain text. Two gradient regimes, run as
+   alternating phases:
+   - *L1a, items in place:* item values and keys are updated by gradients from
+     reads (live items, sparse optimizer state); key and query heads, S_s and R
+     train; the writer is detached. Fast loop to superposition.
+   - *L1b, through the sources:* for the items a read retrieves, their write is
+     recomputed from the stored source with gradients (selective producer
+     replay, the serialized forward exactly: invariant 3), so the task loss
+     trains the writer's span heads, codecs, keys, S_s and R end to end.
+     Training-only; inference still reads stored payloads (invariant 1).
+8. **L2 - Producers reproduce the L1a items** (two-step): writer, codecs and
+   recursive S_s trained to produce L1a's in-place-trained items from the
+   sources (the rewrite-then-recover objective with L1a's items as targets).
+9. **B9 - Learning by experience** (restart plan B9): the model works on a task
+   over its KB for several rounds; at the end of each round it writes what it
+   learned with `memory_write()` (single pass, its attempt in context), the
+   items enter the dataset's KB, and later rounds and later tasks read them. It
+   trains on these trajectories that read and write: SFT toward trajectories of
+   more capable models and verifiable outcomes, the gradient reaching earlier
+   rounds' writes (truncated over 2-3 rounds, the L1b regime), gold records at
+   a receding weight. This loop is how a user adapts the model to their use
+   case, repeated for several rounds over their KB.
+10. **Later:** a much larger KB when the targeted setting works; distillation
+    from larger models; joint co-training of the decoder with the stack under
+    replay.
 
 ### 5.2 Standing requirements
 
@@ -280,15 +295,34 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
   read's gates are sparse (a handful of items with nonzero mass out of the
   candidate set). The standing breadth experiment measures quality against KB
   size at a fixed per-sample read budget.
-- **Gradients into producers.** In L1 items are detached from the writer; L2
-  reconnects producers by distillation. Where task gradients must reach a
-  producer directly (B9 across rounds), selective producer replay applies
-  (invariant 3).
+- **Gradients into producers (owner: both routes).** Two-step: L1a trains items
+  in place with the writer detached, L2 trains the producers to reproduce them.
+  Direct: L1b and B9 backpropagate through the retrieved items' sources, with the
+  writes recomputed by selective producer replay (invariant 3: every value, key,
+  gate and shared-parameter path, the serialized forward, RNG and autocast).
 - **Store contracts.** Per-space variable-width items with masses, keys and
   rewrite lineage extend the mutable-bank (v0.8) and scale-out (v0.9) contracts;
   exact-scan index first, ANN measured separately (invariant 8).
 - **Writes during trajectories** (B9) are `memory_write` calls: supervised at
   episode or round ends first, learned write sites later.
+
+- **Read count (owner).** R's output length: during pretraining (K1, K3) the
+  target's own count; at read time the gate-mass-weighted mean of the retrieved
+  items' lengths in decoder reps (an item of m positions in space s stands for
+  m / r_s reps), capped by the per-read budget (`schnitz.kb.stack.read_count`).
+- **Retrieval auxiliary loss.** Per space, over a read's candidates:
+  −log Σ_{positive} softmax(score / τ), positives being the items of the slot's
+  records (after rewriting, their descendants weighted by responsibility share),
+  plus the same loss's recall@k in the logs. It starts routing (K2) and is
+  annealed in L1 as the task loss takes over (`schnitz.kb.losses`).
+- **Rewarding spread-out use.** Breadth needs many items to be useful, not a few
+  popular ones: a balance loss n · Σ_j f_j · p_j over the items a batch touches
+  (f_j an exponential moving average of item j's share of read mass, p_j its
+  mean gate in the batch), which penalizes routing mass onto already heavily
+  used items; the share of the KB read at least once per evaluation window, and
+  dead items, are logged. Per read, gates stay sparse (a handful of items);
+  spreading happens across reads. Sources spread over items through the budget
+  and the rewriting passes.
 
 ## 6. Relation to other plan stages
 
@@ -351,7 +385,10 @@ inputs are. Training data is regenerated where the format changes (owner:
   `src/schnitz/kb_eval.py` (pure, tested); the benchmark runner for
   LFM2.5-8B-A1B, Ling-3.0-tiny and LFM2-24B-A2B on the task corpora with their
   verifiers is `scripts/benchmark_models.py` (smoke-tested with LFM2.5-350M and
-  1.2B-Instruct; the large-model runs are pending).
+  1.2B-Instruct; the large-model runs are pending). Harness version 2 (28
+  September): per-task context budgets that cut no validation episode, per-turn
+  APIGen-MT scoring, Reasoning Gym normalizations, SynLogic with its verifiers,
+  sandboxed code execution.
 - **WP5 - Stack training after K1**: K2 key and query heads, K3a warm-up of S_s,
   the L1 read path (retrieve per space, gates from similarity, S_s, R, `<|mem|>`
   span).
@@ -365,8 +402,8 @@ inputs are. Training data is regenerated where the format changes (owner:
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
 | K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
 | KB store (WP2) | built (`src/schnitz/kb_store.py`, 18 tests, schema `schnitz.kb/2`): per-dataset KBs, per-space items with keys, masses, provenance, versions and lineage; cursor-pinned commits; exact chunked scan over memory-mapped keys. Rewrites carry per-(output, input) responsibility shares (each input's shares sum to one, output mass = share-weighted input mass, stored exactly; several outputs require explicit shares), and `lineage()`/`source_composition()` resolve share x mass through `kb_eval.source_composition`. Per-commit segment checksums (xxh3-128, else blake2b), hash-chained with the head in the manifest; `verify()`, optional on open. Live mode: per-item Adam state, live keys separate from the immutable stored keys (cursor-pinned and other-process reads never see live state), `pin_live()` snapshots of a live generation by in-memory copy on write, `checkpoint_live`/`restore_live` with bit-identical resume (optionally discarding later commits), export as a frozen KB. `compact()` writes a KB without superseded rows, their metadata in `history.jsonl`. 200k-item check (4 x 384 positions each): append 12 s, verify 0.3 s, 64-query scan 0.2 s, composition 3 s, checkpoint 4 s, compaction 19 s. Not yet used by a trainer; live mode is single-process |
-| Memory-protocol transcripts (WP3) | version 2 generated (`scripts/prepare_memory_transcripts.py`, 16 tests): 526,709 of 526,802 episodes of 22 corpora in `/archive/corpora/memory-<name>-20260928v2` (v1 dirs kept; the v1 row's 504,093 was a miscount, v1 also had 526,709). `memory_search()` calls without arguments; target record ids per call in the slot and in `search_sites` (with `step` and `trigger`). Agent trajectories search mid-episode: protocol at the start, tool docs and action-specific policy sections before the first call of the tool, ALFWorld know-how before the first action naming a listed object or place, worked examples before the first use of their most specific command and again before the next one, the protocol again after a failed action; ScienceWorld episodes without examples get three same-task examples from the KB's held-out pool (3.2 searches per train episode, was 1.3). Writes (`--writes reusable`): every trajectory plus SQL, table answers, tool calls, code up to 900 characters and multi-hop answers (281,875 writes). Audit clean (records exist, precede `query_time`, one KB, no gold outside train, source messages unchanged and in order, empty search arguments); LFM2.5-350M render check clean on the first 200 transcripts of every split. Open: `action_*` placement uses the agent's own next action (label side); 93 reasoning-gym episodes still have no records; no trainer reads them yet (L1) |
-| Evaluation harness (WP4) | built (`scripts/benchmark_models.py`, `src/schnitz/kb_eval.py`, verifiers in `src/schnitz/task_verifiers.py`; 15 tests): benchmark of reference models on 8 task corpora with oracle context and closed book; superposition metrics, counterfactual edits, removal and insertion reports. Smoke-tested on 350M and 1.2B (5 episodes per task); reference runs (8B-A1B, Ling-3.0-tiny, 24B-A2B) pending; kb_eval not yet called by a trainer |
+| Memory-protocol transcripts (WP3) | version 3 generated (`scripts/prepare_memory_transcripts.py`, 17 tests): 526,709 of 526,802 episodes of 22 corpora in `/archive/corpora/memory-<name>-20260928v3` (v1 and v2 dirs kept). Reads are `memory_search()` without arguments (record ids per call in the slot and in `search_sites` with `step` and `trigger`); writes are `memory_write()` without arguments, rendered with the model's own `<|bg|>`…`<|/bg|>` span in the same assistant turn (placeholder `<|reserved_20|><|reserved_22|>`, open and close in the loss); the content text is kept only as `write_sites[i].teacher_text` for B4 distillation and never rendered (audited). Agent trajectories search mid-episode (protocol at the start; tool docs and action-specific policy sections before the first call; ALFWorld know-how before the first action naming a listed object or place; worked examples before the first use of their most specific command and again before the next; protocol again after a failed action; placement is label-side, accepted by the owner). ScienceWorld episodes without examples get three same-task examples from the KB's held-out pool (3.2 searches per train episode, v1 1.3). Writes (`--writes reusable`): trajectories plus SQL, table answers, tool calls, code up to 900 characters and multi-hop answers (281,875). Audit clean; LFM2.5-350M render check clean on the first 200 transcripts of every split (9,085). Open: 93 reasoning-gym episodes have no records; no trainer reads them yet (B4 write sites, L1) |
+| Evaluation harness (WP4) | built (`scripts/benchmark_models.py`, `src/schnitz/kb_eval.py`, verifiers in `src/schnitz/task_verifiers.py`; 57 tests): benchmark of reference models on 9 task corpora with oracle context and closed book; superposition metrics, counterfactual edits, removal and insertion reports. Harness 2 (28 Sep; results of harness 1 are redone on rerun): required records are never cut and per-task context budgets (8k to 80k characters) cover every validation episode (0 truncated; longest full-context prompt 20.6k LFM2.5 / 25.4k Ling tokens, spider_memory; knights 18.1k; all fit the 32k LFM2.5 window with their generation budget, `--measure` reproduces this); APIGen-MT scores every tool-call turn on its gold causal prefix (1,228 calls in 274 validation episodes instead of 19 opening calls; first-call and opening-call rates kept); Reasoning Gym per-family normalizations (`reasoning_gym` is not installed; 521 of 549 validation episodes have a unique stored answer, 28 in 9 families whose scorer accepts any valid solution still undercount; +7 of 400 answers on the 350M run); SynLogic added with the repository's verifiers (local checkout, run sandboxed; 23 families, 3 `math_verify` families reimplemented; 286 validation episodes, `futoshiki` excluded because 12 of 20 stored puzzles have no solution); model code and SynLogic verifiers run in a sandbox (time, CPU, heap and file-size limits, own temporary directory, Internet sockets blocked in Python; KodCode gold pass rate unchanged, 179/200). `kb_eval.nll_summary(..., gain=False)` reproduces the K1 evaluation record exactly (tested) for the K1 stage to report through. Smoke-tested on 350M (5 episodes per task, harness 1; harness 2 on 3 episodes of 5 tasks); reference runs (8B-A1B, Ling-3.0-tiny, 24B-A2B) pending |
 | K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
 | L1, L2 | not built |
 | Teacher distributions | later phase; cache script smoke-tested (LFM2.5-1.2B-Base, 300 records: mass sums to 1, true token in the top 32 for 84% of positions); models in `/home/werg/sdkb-runs/hf-models` |

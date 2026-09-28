@@ -1,1 +1,1 @@
-"""Knowledge-base stack (docs/knowledge-base-stack.md): read path, stages."""
+"""Shared code of the knowledge-base training stages (docs/knowledge-base-stack.md)."""

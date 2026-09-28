@@ -13,8 +13,9 @@ evaluators can apply them to any store or model.
    the edited KB implies), domain removal and insertion, as data the evaluator
    applies; scoring says whether an output follows the KB or the decoder's prior.
 3. **Content over shuffled controls**: ``content_nats = NLL(shuffled) - NLL(actual)``
-   and captured fractions of the full-text gain, as ``scripts/train_kb_codecs.py``
-   reports them.
+   and captured fractions of the full-text gain; ``nll_summary(..., gain=False)``
+   is exactly the evaluation record of ``scripts/train_kb_codecs.py`` (tested), so
+   the K1 stage can report through it.
 
 Records follow ``scripts/prepare_task_corpora.py`` (``record_id``, ``text``,
 ``domain``, ``kind``, ``created_at``, ``provenance``); episodes carry ``episode_id``,
@@ -649,15 +650,19 @@ def captured_fraction(nll_arm: float, nll_noctx: float, nll_full: float) -> floa
 
 
 def nll_summary(sums: Mapping[str, float], tokens: int, arms: Iterable[str],
-                shuffled: Mapping[str, str]) -> dict:
+                shuffled: Mapping[str, str], gain: bool = True) -> dict:
     """``train_kb_codecs.evaluate``'s report from summed token NLLs per arm: mean
     NLL per arm, ``captured`` per arm (needs ``noctx`` and ``full``), and
     ``content_nats`` per ``shuffled`` pair (arm -> its shuffled control). ``gain`` is
     the full-text gain the captured fractions divide by; a nonpositive gain makes
-    them meaningless."""
+    them meaningless. With ``gain=False`` the record is exactly the one
+    the K1 stage (``schnitz.kb.stages.k1``) writes (same keys, order and values, with
+    ``shuffled={'span': 'span_shuffled', 'stack': 'stack_shuffled'}``)."""
     nll = {name: value / tokens for name, value in sums.items()}
-    return {'nll': {k: round(v, 4) for k, v in nll.items()},
-            'gain': round(nll['noctx'] - nll['full'], 4),
-            'captured': {k: round(captured_fraction(nll[k], nll['noctx'], nll['full']), 4)
-                         for k in arms},
-            'content_nats': {k: round(content_nats(nll[k], nll[s]), 4) for k, s in shuffled.items()}}
+    out = {'nll': {k: round(v, 4) for k, v in nll.items()}}
+    if gain:
+        out['gain'] = round(nll['noctx'] - nll['full'], 4)
+    out['captured'] = {k: round(captured_fraction(nll[k], nll['noctx'], nll['full']), 4)
+                       for k in arms}
+    out['content_nats'] = {k: round(content_nats(nll[k], nll[s]), 4) for k, s in shuffled.items()}
+    return out

@@ -280,7 +280,7 @@ fraction above 50% at x4.
 gated combiner that merged the gold records of one ratio level into one span,
 distilled towards the S2 encoding of the joined gold texts, after a codec stage
 that mapped s0 spans to BGKit's coarser ratios (`scripts/train_bgkit_codecs.py`,
-`scripts/train_bgkit_combiner.py`, `scripts/cache_bgkit_teacher.py --episodes`;
+`scripts/train_bgkit_combiner.py`, removed 28 September, in git history; `scripts/cache_bgkit_teacher.py --episodes`;
 these remain as records of the experiment). What it showed, used by the new
 design:
 
@@ -302,7 +302,7 @@ differentiable subagents: the decoder reads task prompts and questions given as
 BGKit soft tokens at x1 (no compression) and answers as BGKit soft tokens.
 
 - *Input port:* the prompt is encoded by the frozen S2 encoder at x1 and spliced
-  as a `<|bg|>(1)` span in place of its text.
+  between `<|port|>` and `<|/port|>` in place of its text (built in B4a).
 - *Output port:* a separate marker (`<|port|>`), rep head and stop head (not the
   memory writer's), targeting S2's x1 encoding of the response text, with the
   functional loss (a frozen S2 reader recovers the response). Its target space is
@@ -350,8 +350,9 @@ so later episodes sharing rules or entities can use them.
   seeds: a seed round is the model writing its first own record while w is high.
 - *Gradient path:* written records are reps, so later-round losses reach the
   writer of earlier rounds (truncated backprop over 2–3 rounds). Text
-  trajectories (sampled, then written) first; with the soft output port, attempts
-  go to the KB as soft tokens and the loop is fully differentiable.
+  trajectories are written by `memory_write()` in the same pass (the attempt in
+  context), so the loop is differentiable through the written spans; with the
+  soft output port, answers are soft tokens too.
 - *Causal boundary (invariant 2):* records are built only from the model's own
   outputs (and explicitly marked hint/gold records); never from teacher-forced
   targets.
@@ -614,3 +615,23 @@ log your decisions and changes of direction"), newest last.
   read intensity. Retrieval tasks are the starting point for this continual-
   learning system. Consequences: small read spans and candidate counts, and a
   standing experiment on quality against KB size at a fixed per-sample read budget.
+- 28 Sep (WP3 v3, `memory-<name>-20260928v3`). Transcripts follow the single-pass write:
+  a write site is `memory_write()` without arguments with the `<|bg|>` … `<|/bg|>` span
+  generated in the same assistant turn (reps without token loss; the open and close
+  decisions with loss). The v2 write text is kept only as `write_sites[i].teacher_text`,
+  the B4 distillation target, and is never rendered. The label-side placement of the
+  `action_*` searches (before the agent's own next action) is accepted by the owner: it
+  demonstrates when to call, like tool-call placement in SFT, and the call carries no
+  content.
+- 28 Sep (owner). Concrete plan (knowledge-base stack 5.1): B4 splits into B4a
+  (built), B4b soft output port and B4c in-context writes; K2 trains key and query
+  heads with the retrieval loss on transcript search sites (replacing R5d5
+  key-table distillation); K3 has K3a (target key) and K3b (neighbour keys too); L1
+  alternates L1a (items in place, writer detached) and L1b (full gradient through
+  the retrieved items' sources, selective producer replay); L2 keeps the two-step
+  route; B9 is the learning-by-experience loop (task, `memory_write()` of what was
+  learned, read and write over rounds) and the way users adapt their KB. Read
+  count, retrieval auxiliary loss and spread-out use are standing requirements.
+  Targeted corpora and tasks with trajectories of more capable models; no
+  corpus-exact reproduction of a reference model (owner). One code base:
+  `scripts/train.py <stage>` over `schnitz.kb`.

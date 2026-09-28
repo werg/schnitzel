@@ -1,1 +1,1 @@
-"""Training stages of the knowledge-base stack; each exposes ``add_args(parser)`` and ``run(args)``."""
+"""Training stages; each exposes ``add_args(parser)`` and ``run(args)`` (``scripts/train.py``)."""
