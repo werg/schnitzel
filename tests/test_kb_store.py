@@ -20,6 +20,23 @@ def make(tmp_path, name='kb', dataset='ds'):
     return KnowledgeBase.create(tmp_path / name, name=name, dataset=dataset, spaces=SPACES)
 
 
+def go_live(kb, resident, space='A', **options):
+    """Enable live mode; ``resident`` also keeps the live state in memory (load_live)."""
+    kb.enable_live(space)
+    if resident:
+        kb.load_live(**options)
+
+
+def writer(path, resident, **options):
+    kb = KnowledgeBase(path, writable=True)
+    if resident:
+        kb.load_live(**options)
+    return kb
+
+
+RESIDENT = pytest.mark.parametrize('resident', [False, True], ids=['journaled', 'resident'])
+
+
 def test_roundtrip_and_reopen(tmp_path):
     kb = make(tmp_path)
     new = [item(n=n, sources=(f'r{n}',), time=n) for n in (1, 3, 5)]
@@ -211,12 +228,13 @@ def test_scoping_and_cross_kb_authorization(tmp_path):
     assert set(b).isdisjoint(a)
 
 
+@RESIDENT
 @pytest.mark.parametrize('weight_decay', [0.0, 0.1])
-def test_live_adam_matches_torch_per_item(tmp_path, weight_decay):
+def test_live_adam_matches_torch_per_item(tmp_path, weight_decay, resident):
     kb = make(tmp_path)
     items = [item(n=n) for n in (2, 4, 3, 1)]
     ids = kb.append('A', items[:2])
-    kb.enable_live('A')
+    go_live(kb, resident)
     ids += kb.append('A', items[2:])      # items appended in live mode join live state
     params = [torch.nn.Parameter(i.values.to(torch.bfloat16).float()) for i in items]
     make_opt = torch.optim.AdamW if weight_decay else torch.optim.Adam
@@ -232,14 +250,16 @@ def test_live_adam_matches_torch_per_item(tmp_path, weight_decay):
                      eps=1e-6, weight_decay=weight_decay)
     assert kb.live_updates == len(schedule)
     kb.close()
-    kb = KnowledgeBase(tmp_path / 'kb', writable=True)   # persisted
+    kb = KnowledgeBase(tmp_path / 'kb', writable=True)   # persisted (close syncs)
     for j, got in enumerate(kb.read('A', ids, live=True)):
-        torch.testing.assert_close(got.values, params[j].detach(), rtol=1e-6, atol=1e-7)
+        # bit-identical to torch's single-tensor path on CPU
+        torch.testing.assert_close(got.values, params[j].detach(), rtol=0, atol=0)
         state = opts[j].state[params[j]]
         row = kb._rows['A'][ids[j]][-1]
         off, n = kb._map('A', 'rows.i64')[row, [0, 1]]
-        torch.testing.assert_close(torch.from_numpy(np.array(kb._map('A', 'live_m.f32')[off:off + n])),
-                                   state['exp_avg'], rtol=1e-6, atol=1e-8)
+        for file, want in (('live_m.f32', state['exp_avg']), ('live_v.f32', state['exp_avg_sq'])):
+            torch.testing.assert_close(torch.from_numpy(np.array(kb._map('A', file)[off:off + n])),
+                                       want, rtol=0, atol=0)
         assert kb._map('A', 'live_step.i64')[row] == int(state['step'])
     # stored bf16 payloads are untouched by live updates
     torch.testing.assert_close(kb.read('A', [ids[0]])[0].values, items[0].values.to(torch.bfloat16))
@@ -275,14 +295,15 @@ def test_live_journal_replay_and_torn_journal(tmp_path, monkeypatch):
     torch.testing.assert_close(kb.read('A', ids, live=True)[1].values, got[1].values)
 
 
-def test_export_live_is_frozen_snapshot(tmp_path):
+@RESIDENT
+def test_export_live_is_frozen_snapshot(tmp_path, resident):
     kb = make(tmp_path)
     ids = kb.append('A', [item(n=2, sources=(f's{i}',)) for i in range(3)])
     bid = kb.append('B', [item('B')])
     replaced = item(n=2)
     replaced.id = ids[2]
     kb.supersede('A', [replaced])
-    kb.enable_live('A')
+    go_live(kb, resident)
     kb.live_step('A', ids[:2], [torch.ones(2, 8)] * 2, lr=0.05)
     kb.set_live_keys('A', ids[:1], torch.ones(1, 4))
     live = kb.read('A', ids, live=True)
@@ -362,11 +383,12 @@ def test_rewrite_share_validation_and_recursive_composition(tmp_path):
     assert set(kb.source_composition(cursor=1)) == set(ids)
 
 
-def test_live_snapshot_pins_generation_and_stored_keys(tmp_path):
+@RESIDENT
+def test_live_snapshot_pins_generation_and_stored_keys(tmp_path, resident):
     kb = make(tmp_path)
     ids = kb.append('A', [item(n=2) for _ in range(4)])
     stored_keys = [i.key for i in kb.read('A', ids)]
-    kb.enable_live('A')
+    go_live(kb, resident)
     kb.live_step('A', ids[:2], [torch.randn(2, 8) for _ in range(2)], lr=0.1)
     q = torch.randn(3, 4)
     pin = kb.pin_live()
@@ -413,15 +435,17 @@ def test_live_snapshot_pins_generation_and_stored_keys(tmp_path):
 
 
 def _live_bytes(kb):
+    kb.sync_live()      # resident state reaches the files (a no-op when journaled)
     return {(space, file): (kb.root / space / file).read_bytes()
             for space in kb._manifest['live_spaces'] for file in kbs.LIVE_FILES}
 
 
-def test_checkpoint_restore_is_bit_identical(tmp_path):
+@RESIDENT
+def test_checkpoint_restore_is_bit_identical(tmp_path, resident):
     kb = make(tmp_path)
     ids = kb.append('A', [item(n=n) for n in (1, 2, 3, 2)])
     kb.append('B', [item('B')])
-    kb.enable_live('A')
+    go_live(kb, resident)
     gen = torch.Generator().manual_seed(0)
 
     def train(steps, seed):
@@ -453,7 +477,7 @@ def test_checkpoint_restore_is_bit_identical(tmp_path):
     torn = tmp_path / 'kb' / kbs.CHECKPOINTS / 'torn.pending'     # interrupted checkpoint
     torn.mkdir()
     (torn / 'checkpoint.json').write_text('{}')
-    kb = KnowledgeBase(tmp_path / 'kb', writable=True)
+    kb = writer(tmp_path / 'kb', resident)
     assert _live_bytes(kb) == reference and kb.live_checkpoints() == ['step5']
     assert not torn.exists()
     # commits after a checkpoint are refused unless discarded; later checkpoints die with them
@@ -473,7 +497,7 @@ def test_checkpoint_restore_is_bit_identical(tmp_path):
     kb.live_step('A', ids[:1], [torch.ones(1, 8)], lr=0.1)
     kbs._atomic_json(tmp_path / 'kb' / 'live.restore', {'tag': 'step5'})
     kb.close()
-    kb = KnowledgeBase(tmp_path / 'kb', writable=True)
+    kb = writer(tmp_path / 'kb', resident)
     assert _live_bytes(kb) == at_checkpoint and kb.cursor == 2
     assert not (tmp_path / 'kb' / 'live.restore').exists()
     # a corrupt checkpoint is refused; pinned snapshots block a restore
@@ -531,11 +555,12 @@ def test_checksums_verify_every_segment(tmp_path, monkeypatch, algorithm):
     KnowledgeBase(tmp_path / 'kb', verify=True)
 
 
-def test_compact_drops_superseded_rows_and_keeps_lineage(tmp_path):
+@RESIDENT
+def test_compact_drops_superseded_rows_and_keeps_lineage(tmp_path, resident):
     kb = make(tmp_path)
     ids = kb.append('A', [item(n=2, sources=(f's{i}',), mass=1.0 + i, time=i) for i in range(5)])
     bid = kb.append('B', [item('B')])
-    kb.enable_live('A')
+    go_live(kb, resident)
     kb.live_step('A', ids[:3], [torch.randn(2, 8) for _ in range(3)], lr=0.1)
     new = item(n=2, sources=())
     new.id = ids[0]
@@ -570,7 +595,7 @@ def test_compact_drops_superseded_rows_and_keeps_lineage(tmp_path):
     assert out.verify() == {'A': 1, 'B': 1}
     out.close()
     # the live state moves with the kept rows, so training continues exactly
-    live = KnowledgeBase(tmp_path / 'small', writable=True)
+    live = writer(tmp_path / 'small', resident)
     assert live.live_updates == kb.live_updates
     for a, b in zip(kb.read('A', current, live=True), live.read('A', current, live=True)):
         torch.testing.assert_close(a.values, b.values, rtol=0, atol=0)
@@ -593,3 +618,183 @@ def test_compact_drops_superseded_rows_and_keeps_lineage(tmp_path):
     assert again.source_composition()[outs[1]] == pytest.approx({'s1': 0.25, 's2': 0.75})
     assert again.source_composition()[ids[3]] == {'s3': 1.0}
     assert len(again._history()) == len(history) + 1 and again.verify()['A'] == 1
+
+
+SYNC = pytest.mark.parametrize('swap', [2.0, 0.0], ids=['journal-sync', 'swap-sync'])
+
+
+def _train_both(kbs_, ids, steps, seed, *, concat=False):
+    """Run the same sparse live updates (and key updates) on several KBs."""
+    gen = torch.Generator().manual_seed(seed)
+    for step in range(steps):
+        touched = [ids[j] for j in torch.randperm(len(ids), generator=gen)[:3].tolist()]
+        lengths = [len(kbs_[0].read('A', [i])[0].values) for i in touched]
+        grads = [torch.randn(n, 8, generator=gen) for n in lengths]
+        keys = torch.randn(1, 4, generator=gen)
+        for kb in kbs_:
+            kb.live_step('A', touched, torch.cat(grads) if concat else grads, lr=0.03,
+                         betas=(0.85, 0.99), weight_decay=0.02)
+            if step % 2:
+                kb.set_live_keys('A', touched[:1], keys)
+
+
+def _assert_same_live(a, b, ids):
+    for x, y in zip(a.read('A', ids, live=True), b.read('A', ids, live=True)):
+        torch.testing.assert_close(x.values, y.values, rtol=0, atol=0)
+        torch.testing.assert_close(x.key, y.key, rtol=0, atol=0)
+
+
+@SYNC
+def test_resident_matches_journaled_bitwise(tmp_path, monkeypatch, swap):
+    monkeypatch.setattr(kbs, '_SWAP_FRACTION', swap)
+    items = [item(n=n) for n in (1, 2, 3, 2, 4, 1)]
+    one, two = make(tmp_path, 'one'), make(tmp_path, 'two')
+    ids = one.append('A', items[:4])
+    assert two.append('A', [NewItem(i.values, i.key, i.provenance, i.mass, i.time, j)
+                            for i, j in zip(items[:4], ids)]) == ids
+    go_live(one, False)
+    go_live(two, True, sync_every=3)
+    _train_both([one, two], ids, 5, 0)
+    more = [NewItem(i.values, i.key, i.provenance, i.mass, i.time, f'late{k}')
+            for k, i in enumerate(items[4:])]
+    for kb in (one, two):           # commits in live mode: new rows join the resident state
+        kb.append('A', more)
+        new = NewItem(items[0].values * 2, items[0].key, Provenance((), 'codec'), id=ids[1])
+        kb.supersede('A', [new])
+    ids = ids + ['late0', 'late1']
+    _train_both([one, two], ids, 6, 1, concat=True)
+    assert one.live_updates == two.live_updates == 5 + 2 + 6 + 3
+    assert two.synced_live_updates == 15 and one.synced_live_updates == 16
+    _assert_same_live(one, two, ids)
+    q = torch.randn(3, 4)
+    assert one.search('A', q, 5, live=True).ids == two.search('A', q, 5, live=True).ids
+    two.sync_live()
+    assert _live_bytes(one) == _live_bytes(two)
+    assert two.live_device == torch.device('cpu') and one.live_device is None
+    with pytest.raises(ValueError, match='concatenated'):
+        two.live_step('A', ids[:2], torch.zeros(3, 8), lr=0.1)
+
+
+def test_resident_crash_reopens_at_last_sync(tmp_path, monkeypatch):
+    kb = make(tmp_path)
+    ids = kb.append('A', [item(n=n) for n in (2, 1, 3, 2)])
+    go_live(kb, True)
+    _train_both([kb], ids, 4, 0)
+    kb.sync_live()
+    synced = kb.read('A', ids, live=True)
+    _train_both([kb], ids, 3, 1)
+    assert kb.live_updates == 4 + 2 + 3 + 1 and kb.synced_live_updates == 6
+    kb._live = None                 # crash: the resident state is lost, nothing is synced
+    kb.close()
+    kb = writer(tmp_path / 'kb', True)
+    assert kb.live_updates == 6
+    for got, want in zip(kb.read('A', ids, live=True), synced):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+        torch.testing.assert_close(got.key, want.key, rtol=0, atol=0)
+    # a crash after the journal commit point, before it is applied: replayed at open
+    _train_both([kb], ids, 3, 2)
+    latest = kb.read('A', ids, live=True)
+    monkeypatch.setattr(kbs, '_PART_BYTES', 64)          # several journal parts
+    monkeypatch.setattr(kbs, '_SWAP_FRACTION', 2.0)      # never a swap
+    monkeypatch.setattr(KnowledgeBase, '_apply_journal', lambda self, path: None)
+    kb.sync_live()
+    monkeypatch.undo()
+    parts = sorted(p.name for p in (tmp_path / 'kb').glob(kbs.JOURNAL_PART + '*'))
+    assert len(parts) > 1 and (tmp_path / 'kb' / 'live.journal').exists()
+    kb._live = None
+    kb.close()
+    kb = writer(tmp_path / 'kb', True)
+    assert kb.live_updates == 6 + 3 + 1 and not list((tmp_path / 'kb').glob('live.journal*'))
+    for got, want in zip(kb.read('A', ids, live=True), latest):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+        torch.testing.assert_close(got.key, want.key, rtol=0, atol=0)
+    # parts of a sync that never reached its commit point are discarded
+    _train_both([kb], ids, 2, 3)
+    kb._live = None
+    kb.close()
+    (tmp_path / 'kb' / f'{kbs.JOURNAL_PART}1').write_bytes(b'torn')
+    kb = writer(tmp_path / 'kb', True)
+    assert kb.live_updates == 10 and not (tmp_path / 'kb' / f'{kbs.JOURNAL_PART}1').exists()
+    for got, want in zip(kb.read('A', ids, live=True), latest):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+    # the same for a sync that replaces the files: committed swaps finish at open ...
+    _train_both([kb], ids, 3, 4)
+    latest = kb.read('A', ids, live=True)
+    monkeypatch.setattr(kbs, '_SWAP_FRACTION', 0.0)
+    monkeypatch.setattr(KnowledgeBase, '_apply_swap', lambda self, path: None)
+    kb.sync_live()
+    monkeypatch.undo()
+    assert (tmp_path / 'kb' / 'live.swap').exists()
+    assert len(list((tmp_path / 'kb' / 'A').glob('*.next'))) == len(kbs.LIVE_FILES)
+    kb._live = None
+    kb.close()
+    kb = writer(tmp_path / 'kb', True)
+    assert kb.live_updates == 14 and not (tmp_path / 'kb' / 'live.swap').exists()
+    assert not list((tmp_path / 'kb' / 'A').glob('*.next'))
+    for got, want in zip(kb.read('A', ids, live=True), latest):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+        torch.testing.assert_close(got.key, want.key, rtol=0, atol=0)
+    # ... uncommitted ones (files written, no marker) are discarded
+    _train_both([kb], ids, 2, 5)
+    monkeypatch.setattr(kbs, '_atomic_json', lambda path, value: None)
+    with pytest.raises(FileNotFoundError):
+        kb.sync_live()              # the marker was never written
+    monkeypatch.undo()
+    kb._live = None
+    kb.close()
+    kb = writer(tmp_path / 'kb', False)
+    assert kb.live_updates == 14 and not list((tmp_path / 'kb' / 'A').glob('*.next'))
+    for got, want in zip(kb.read('A', ids, live=True), latest):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+
+
+def test_resident_close_and_sync_every(tmp_path, monkeypatch):
+    kb = make(tmp_path)
+    ids = kb.append('A', [item(n=n) for n in (3, 1, 2)])
+    go_live(kb, True, sync_every=2)
+    grads = [torch.ones(3, 8), torch.ones(1, 8), -torch.ones(2, 8)]
+    kb.live_step('A', ids, grads, lr=0.1)
+    assert (kb.live_updates, kb.synced_live_updates) == (1, 0)
+    kb.live_step('A', ids[:1], grads[:1], lr=0.1)
+    assert (kb.live_updates, kb.synced_live_updates) == (2, 2)
+    other = KnowledgeBase(tmp_path / 'kb')              # readers never see live state
+    assert other.live_updates == 2
+    monkeypatch.setattr(kbs, '_PART_BYTES', 1)          # one item per journal part
+    kb.live_step('A', ids[1:], grads[1:], lr=0.1)
+    before = kb.read('A', ids, live=True)
+    with pytest.raises(ValueError, match='already resident'):
+        kb.load_live()
+    kb.close()                                          # a clean close syncs
+    kb = KnowledgeBase(tmp_path / 'kb', writable=True)
+    assert kb.live_updates == 3
+    for got, want in zip(kb.read('A', ids, live=True), before):
+        torch.testing.assert_close(got.values, want.values, rtol=0, atol=0)
+    kb.load_live()
+    kb.live_step('A', ids[:1], grads[:1], lr=0.1)
+    kb.unload_live()                                    # back to per-update journaling
+    assert kb.live_device is None and kb.synced_live_updates == 4
+    kb.live_step('A', ids[:1], grads[:1], lr=0.1)
+    assert kb.synced_live_updates == 5
+    with pytest.raises(PermissionError):
+        KnowledgeBase(tmp_path / 'kb').load_live()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
+def test_resident_on_cuda_matches_cpu(tmp_path):
+    items = [item(n=n) for n in (1, 2, 3, 2)]
+    one, two = make(tmp_path, 'one'), make(tmp_path, 'two')
+    ids = one.append('A', items)
+    two.append('A', [NewItem(i.values, i.key, i.provenance, i.mass, i.time, j)
+                     for i, j in zip(items, ids)])
+    go_live(one, True)
+    go_live(two, True, device='cuda')
+    _train_both([one, two], ids, 6, 0)
+    assert two.live_device.type == 'cuda'
+    for x, y in zip(one.read('A', ids, live=True), two.read('A', ids, live=True)):
+        torch.testing.assert_close(x.values, y.values, rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(x.key, y.key, rtol=0, atol=0)
+    two.checkpoint_live('c')
+    reference = _live_bytes(two)
+    _train_both([two], ids, 3, 1)
+    two.restore_live('c')
+    assert _live_bytes(two) == reference
