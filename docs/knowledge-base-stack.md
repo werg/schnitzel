@@ -201,66 +201,81 @@ in the tasks trained over them: the R6 passage corpora (reconstruction, QA,
 text continuation) and the task corpora (tool docs, schemas, background, worked
 examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
 
-### 5.1 Order
+### 5.1 Order (owner review, 28 September; concrete steps)
+
+Data principle: targeted corpora and targeted tasks, supervised by trajectories of
+more capable models (the SFT corpora we hold; local larger models such as
+LFM2.5-8B-A1B or Ling-3.0-tiny can generate more; paid teacher collection only by
+owner decision). A much larger KB run comes only after this works. Code: every
+stage is `scripts/train.py <stage>` over the shared package `schnitz.kb`
+(decoder, stack, losses, loop), so a change applies to every stage.
 
 1. **Writer, B3** (running): the decoder writes BGKit-style spans.
-2. **Decoder capabilities, B4 and the soft I/O port** (restart plan), while the
-   decoder still trains: general compression at all ratios, then the soft input
-   port and the soft output port ramped to half of the tasks.
-3. **K1 - Autoencoding through the spaces** (running, in parallel). Forward
-   codecs F_s and recombiner R: span → spaces → span. Losses: the frozen decoder
-   reads R's output and reconstructs the source text (NLL) with a KL to reading
-   the original span, plus a light cosine to the original span. Space dropout
-   forces every space to carry part of the content and R to work with spaces
-   missing. Inputs: first the cached S2 teacher spans (B1), then the writer's
-   own spans (offline generation by the frozen writer; invariant 1). Gate:
-   reconstruction through the stack close to reading the span itself; each
-   space's ablation costs something.
-4. **K2 - Keys.** A key head per space and query heads, initialized by
-   distillation from the R5d5 key table and routing addresses; only a starting
-   point, since L1 trains routing end to end.
-5. **K3a - Superposition operator warm-up** (no keys, drop-one). A neighbourhood
-   of items in space s, the target item removed; S_s, conditioned on the target
-   key only, produces an item from which R reconstructs the target's span. Only
-   needs to be roughly right, so that reads work in L1.
-6. **L1 - Live items, end to end** (the decoder frozen, so knowledge has to land
-   in the KB). Items start as the codecs' output and are then updated in place by
-   gradients from reads (sparse updates, optimizer state per item), a fast loop
-   to real superposition. Jointly trained: items, S_s (as the read-time
-   combiner), R, key and query heads.
-   - *Reads* are `memory_search()` tool calls without arguments in LFM2's native
-     format (trajectory memory v0.5; restart plan 3.2): the query is a vector,
-     not text: one key head per space projects a middle layer's state at the
-     call, so retrieval can start while the call finishes; the
-     result is a tool message whose content is the latent span between `<|mem|>`
-     and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
-     `memory_write()` calls in which the model generates the `<|bg|>` span
-     itself, in the same pass; per-space heads on that pass give the items and
-     keys (no text argument, no second encoding pass; owner, 28 September). A parameter store is consulted often, so SFT and
-     B9 data carry many calls per trajectory (several queries per site, query
-     diversity per B5); each call costs its few envelope tokens plus the span.
-   - *Routing through gates:* each space scores a candidate set and every
-     candidate's gate comes from its query-key similarity, sparse so that a read
-     keeps only a handful of items; gates scale mass
-     exactly, so the task loss trains keys and query heads (learned routing,
-     not expert mixing: the read result stays in context).
-   - *Tasks:* reconstruction and QA over the R6 KBs, trajectory SFT over the task
-     KBs, continuation of KB-domain text.
-   - *Superposition pressure:* the storage budget and recursive rewriting passes
-     with S_s between updates (section 5.2).
-7. **L2 - Learn to reproduce the live items.** The writer, forward codecs and
-   *recursive* applications of S_s are trained to produce the L1 items from the
-   sources alone: the in-place-trained items are the targets. This is where the
-   rewrite-then-recover objective lives (a neighbourhood rewritten by S_s into M
-   items, M < N compaction, M = N pure superposition; every original recoverable
-   at its own key), with L1's items as targets instead of self-reconstruction.
-   Afterwards the producers derive superposed items live from a new corpus.
-   S_s can also be distilled on L1's rewriting trajectories.
-8. **B9 loops and continual learning.** Multi-round attempts written back into
-   the per-dataset KBs; new corpora enter through the producers; periodic
-   rewriting; the KB-dependence tests (section 5.2).
-9. **Later:** teacher distillation (section 1.1) and joint co-training of the
-    decoder with the stack under replay.
+2. **B4, decoder capabilities** (the last stage in which the decoder trains):
+   - *B4a* (built, starts after B3): protocol tokens with LM-head rows,
+     ratio-stated prompts, `<|mem|>` delimiters in reads, soft input port for
+     questions (ramped to half).
+   - *B4b, soft output port:* on tasks whose answer is text (QA, summaries,
+     tool results), the decoder answers with a `<|port|>` … `<|/port|>` span
+     from its own rep and stop heads (not the memory writer's). Target: the
+     frozen S2 encoder's x1 encoding of the answer; losses: KL of a frozen S2
+     reader reading the port span against reading the target encoding, a light
+     reconstruction NLL, a loose cosine; rollout passes as for the writer.
+     Starts once the input port holds, ramps to half of those tasks; evaluated
+     over text/soft input × text/soft output.
+   - *B4c, in-context writes:* at the write sites of the memory transcripts
+     (v3) the model calls `memory_write()` and generates the span itself; the
+     span is distilled toward the writer's span of the site's teacher text
+     (teacher-fed, then free-running) and checked by a reader reconstructing
+     that text.
+3. **K1 - Autoencoding through the spaces** (running). Codecs F_s and
+   recombiner R: span → spaces → span, read by the frozen decoder; space dropout.
+4. **K2 - Keys.** Item-key heads per space (on the items) and query heads (on the
+   decoder's middle-layer state at `memory_search()`), trained with the
+   retrieval loss (5.2) on the transcripts' search sites against the items of
+   each slot's records, with in-batch and KB negatives. It is the L1 stage with
+   only the retrieval loss (`--retrieval-only`); no separate key-table
+   distillation.
+5. **K3 - Superposition operator warm-up** (drop-one: a neighbourhood of items in
+   space s with the target removed; S_s produces an item from which R
+   reconstructs the target's span).
+   - *K3a:* S_s conditioned on the target key only.
+   - *K3b:* additionally each neighbour item's key enters at each of its
+     positions (continues K3a; the key weights start at zero, so K3b begins as
+     K3a).
+6. **Bank creation** (offline): the model with a record in context calls
+   `memory_write()`; the span, the per-space heads and the key heads give the
+   items, one KB per dataset. The same path builds a user's KB from their own
+   corpus, so its throughput is a product property (measured).
+7. **L1 - End to end over the KBs** (decoder frozen, so knowledge has to land in
+   the KB). Reads are `memory_search()` calls (vector queries, sparse gates,
+   S_s → R → a short span in the tool result); writes are `memory_write()`.
+   Tasks: trajectory SFT over the task KBs, QA and reconstruction over the R6
+   KBs, continuation of KB-domain text. Two gradient regimes, run as
+   alternating phases:
+   - *L1a, items in place:* item values and keys are updated by gradients from
+     reads (live items, sparse optimizer state); key and query heads, S_s and R
+     train; the writer is detached. Fast loop to superposition.
+   - *L1b, through the sources:* for the items a read retrieves, their write is
+     recomputed from the stored source with gradients (selective producer
+     replay, the serialized forward exactly: invariant 3), so the task loss
+     trains the writer's span heads, codecs, keys, S_s and R end to end.
+     Training-only; inference still reads stored payloads (invariant 1).
+8. **L2 - Producers reproduce the L1a items** (two-step): writer, codecs and
+   recursive S_s trained to produce L1a's in-place-trained items from the
+   sources (the rewrite-then-recover objective with L1a's items as targets).
+9. **B9 - Learning by experience** (restart plan B9): the model works on a task
+   over its KB for several rounds; at the end of each round it writes what it
+   learned with `memory_write()` (single pass, its attempt in context), the
+   items enter the dataset's KB, and later rounds and later tasks read them. It
+   trains on these trajectories that read and write: SFT toward trajectories of
+   more capable models and verifiable outcomes, the gradient reaching earlier
+   rounds' writes (truncated over 2-3 rounds, the L1b regime), gold records at
+   a receding weight. This loop is how a user adapts the model to their use
+   case, repeated for several rounds over their KB.
+10. **Later:** a much larger KB when the targeted setting works; distillation
+    from larger models; joint co-training of the decoder with the stack under
+    replay.
 
 ### 5.2 Standing requirements
 
@@ -280,15 +295,34 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
   read's gates are sparse (a handful of items with nonzero mass out of the
   candidate set). The standing breadth experiment measures quality against KB
   size at a fixed per-sample read budget.
-- **Gradients into producers.** In L1 items are detached from the writer; L2
-  reconnects producers by distillation. Where task gradients must reach a
-  producer directly (B9 across rounds), selective producer replay applies
-  (invariant 3).
+- **Gradients into producers (owner: both routes).** Two-step: L1a trains items
+  in place with the writer detached, L2 trains the producers to reproduce them.
+  Direct: L1b and B9 backpropagate through the retrieved items' sources, with the
+  writes recomputed by selective producer replay (invariant 3: every value, key,
+  gate and shared-parameter path, the serialized forward, RNG and autocast).
 - **Store contracts.** Per-space variable-width items with masses, keys and
   rewrite lineage extend the mutable-bank (v0.8) and scale-out (v0.9) contracts;
   exact-scan index first, ANN measured separately (invariant 8).
 - **Writes during trajectories** (B9) are `memory_write` calls: supervised at
   episode or round ends first, learned write sites later.
+
+- **Read count (owner).** R's output length: during pretraining (K1, K3) the
+  target's own count; at read time the gate-mass-weighted mean of the retrieved
+  items' lengths in decoder reps (an item of m positions in space s stands for
+  m / r_s reps), capped by the per-read budget (`schnitz.kb.stack.read_count`).
+- **Retrieval auxiliary loss.** Per space, over a read's candidates:
+  −log Σ_{positive} softmax(score / τ), positives being the items of the slot's
+  records (after rewriting, their descendants weighted by responsibility share),
+  plus the same loss's recall@k in the logs. It starts routing (K2) and is
+  annealed in L1 as the task loss takes over (`schnitz.kb.losses`).
+- **Rewarding spread-out use.** Breadth needs many items to be useful, not a few
+  popular ones: a balance loss n · Σ_j f_j · p_j over the items a batch touches
+  (f_j an exponential moving average of item j's share of read mass, p_j its
+  mean gate in the batch), which penalizes routing mass onto already heavily
+  used items; the share of the KB read at least once per evaluation window, and
+  dead items, are logged. Per read, gates stay sparse (a handful of items);
+  spreading happens across reads. Sources spread over items through the budget
+  and the rewriting passes.
 
 ## 6. Relation to other plan stages
 
