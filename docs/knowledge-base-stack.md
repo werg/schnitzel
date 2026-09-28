@@ -284,13 +284,21 @@ applies to every stage.
      (default 2), each S_s over a neighbourhood of level L-1 items, down to the
      sources. The task loss trains the source items, S_s, keys, query heads and
      R together, so every source is shaped by all the items it feeds.
-     Mechanics: level items are computed lazily (only those a read retrieves,
-     their level-1 inputs from a cache refreshed on a schedule, gradients through
-     the read level and a sampled part of the level below); fixed neighbourhood
-     graphs per level from keys, rebuilt periodically; against the identity,
-     fewer top-level items than sources (the storage budget) and drop-one at
-     level 1; each source's contributions normalized to its mass (invariants 5
-     and 7), recorded as rewrite shares; an item's time is the latest of its
+     S_s runs across a field in key space, like a convolution (owner): each
+     application reads the items in its field, with each input's position
+     relative to the field's anchor (key offsets as per-item features), and
+     writes one item at the anchor. Anchors at every level are spaced so fields
+     overlap (each input falls into about c = 3 fields), so a level with fields
+     of size f has about c/f as many items as the one below: compaction and
+     superposition by construction. The field size per space is comparable to
+     the read-time combine neighbourhood. A top item depends on at most f^L
+     leaves; gradients stop at the trainable KB records (the leaves).
+     Mechanics: items are computed lazily (only those a read retrieves, the
+     level below from a cache refreshed on a schedule, gradients through the
+     read level and a sampled part of the level below); anchors and field
+     assignments rebuilt periodically; drop-one at level 1; each input's
+     contributions normalized to its mass across its fields (invariants 5 and
+     7), recorded as rewrite shares; an item's time is the latest of its
      sources' (invariant 2); mixing only within one KB (invariant 6). Control:
      depth 0 (the items themselves) at the same storage and read budget.
    - *L1b, through the sources:* for the items a read retrieves, their write is
