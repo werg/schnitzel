@@ -812,3 +812,53 @@ log your decisions and changes of direction"), newest last.
   identity); the trained top-level items become targets, and L2 trains several
   S_s layers mapping the original KB to them. K3 gains a depth-2 warm-up. Depth-0
   items at the same budget are the control.
+- 28 Sep (owner question: S_s see-saw between write and read side). Decided:
+  shared warm-up, then untie into S_s^w and S_s^r; S_s^w frozen or a slow EMA of
+  S_s^r; the leaves carry per-KB adaptation; S_s^r anchored on held-out entries of
+  all KBs; S_s^w changes only in item-preserving consolidation steps (leaves re-fit
+  to the pre-update entries). The owner's alternation stays available as a phase
+  schedule and is the comparison.
+- 28 Sep (owner; supersedes the untie design above). No read-time S_s: with
+  superposed entries it is redundant with R and is what couples read-side updates
+  to the entries. Reads: top entries per space -> R (query-conditioned) -> span. S_s
+  is write-side only (fields, re-superposition on writes, L2's stack). Kept: the
+  read anchor (on R and heads), item-preserving consolidation of write fields, the
+  r/w phase schedule and a `--read-combine s_s` ablation.
+- 28 Sep (owner, binding). Superposition operators are cluster/grid aggregators:
+  the KB holds their outputs at anchors (cluster centres or grid points in key
+  space); they are conditioned on the anchor's position with inputs at positions
+  relative to it, and are never run at a query's or a written record's key. K3
+  becomes aggregator pretraining with recovery by reading (covering entries -> R ->
+  the member record); the target-key K3a/K3b and my depth-2 variant of it are
+  superseded and will be replaced on the field code.
+- 28 Sep (owner). No long-term split between write and read side: after a short
+  read-side warm-up, leaves, aggregators, R and key heads train jointly; anchor,
+  consolidation and phase alternation are off by default, remedies only if the
+  logged drift and retention metrics show see-saw.
+- 28 Sep (owner, confirmed; supersedes the two entries above on anchors and K3).
+  Rows are the stored learnable records of a space and are the anchors: at every
+  row the write side has an S_s output consuming a field of write inputs (lower
+  level items nearest the row; overlapping fields; >= 2 levels down to source-level
+  items). The write side is trained by the task loss through reads or by matching
+  each row's learned value, never by reproducing particular source records. K3 is
+  a short L1a with free rows followed by fitting the write stack to them (L2's
+  stack code); the target-key K3 stage is removed.
+- 28 Sep (owner). The write-side schedule is a long read-side phase with free
+  rows, then the write fit against the rows' key/value pairs without the decoder
+  (sequential on exported rows by default; optionally a separate job following
+  row snapshots). No interleaving inside one trainer; the joint read/write default
+  of the entry above applies only if reads are later switched to stack outputs.
+- 28 Sep (owner). Key-space updates on both sides: read phase with free row keys
+  trained by retrieval and gate gradients (index re-keyed from live keys); write
+  side with row keys as the share-weighted combination of their field inputs' keys
+  plus a learned correction; fields reassigned from updated keys; the write fit
+  matches keys and values.
+- 28 Sep (owner). Write-side keys are learned through key-dependent field shares:
+  share(j->i) = softmax over input j's candidate rows of tau cos(k_j, k_i), gate =
+  mass x share, so fit and task gradients move input and row keys toward the rows
+  an input helps and away from those it hurts (zero-sum per input, invariant 7).
+  Keys = key head + free per-item correction; balance loss on row load. The
+  learned per-pair content score I had proposed is not added.
+- 28 Sep (owner). Superposition field size is an empirical, tuned hyperparameter
+  (as large as memory allows); training samples field sizes from a range so the
+  model is robust to it and to KB density; evals sweep sizes with memory and time.

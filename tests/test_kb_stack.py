@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 import torch
 
@@ -105,7 +106,6 @@ def test_stack_standardizes_spans_with_corpus_statistics():
 
 
 def test_k1_multi_record_input_concatenates_neighbours_within_the_token_budget():
-    from types import SimpleNamespace
 
     from schnitz.kb.stages.k1 import _multi_example
     texts = ['aaaa', 'bb', 'cccccc', 'dd']

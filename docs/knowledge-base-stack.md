@@ -125,17 +125,27 @@ rewrite: S_s(neighbourhood | target keys) ──▶ items in space s, written ba
   Retrieval neighbourhoods grow with coarseness: fine spaces retrieve few items,
   coarse spaces many.
 - **Forward codecs** F_s map the writer's span to each space.
-- **Superposition operator, per space.** S_s maps a neighbourhood of items of
-  space s to items of space s, conditioned on target keys. Because input and
-  output live in the same space (closure), the same operator serves reads
-  (combine a retrieved neighbourhood into one item for a query) and rewriting the
-  store (replace a neighbourhood by new items, written back). Rewriting is meant
+- **Superposition operator, per space.** S_s is a field aggregator on the write
+  side (owner, 28 September). A space's KB is a set of rows, one per stored
+  learnable record; at every row the write side has an S_s output that consumes
+  a field of write inputs (the lower level's items nearest the row in key space,
+  entering with positions relative to the row; neighbouring fields overlap).
+  With two or more levels, the write inputs are themselves S_s outputs over
+  fields of the level below, down to the source-level items. S_s never runs at
+  a query's key, and it is never trained to reproduce particular source records:
+  its losses are the task loss through reads, or matching each row's directly
+  learned value. Input and output live
+  in the same space (closure), so it can be applied recursively. It is a
+  write-side operator: it runs across overlapping fields of the store and
+  replaces them by superposed items, written back (at reads, R reads retrieved
+  entries directly; section 5.1 step 7). Rewriting is meant
   to increase superposition and the availability of knowledge, not to reduce the
   amount of representation: *compaction* (fewer outputs than inputs) is only its
   special case. Applied recursively, it spreads each source over more items and
   lets each item carry more sources. (Earlier drafts called it the compactor.)
 - **Recombiner (reverse codec)** R reads the items of all spaces and produces a
-  span in the decoder's input space. Spaces may be missing (a space may not
+  span in the decoder's input space; at reads it takes the retrieved entries
+  with their gates and is conditioned on the query key. Spaces may be missing (a space may not
   retrieve anything relevant), so R is trained with spaces dropped.
 - **Output positions** are variable. In pre-training the target count is given by
   the target (the original span's n). At inference S_s emits the average
@@ -253,17 +263,40 @@ applies to every stage.
    each slot's records, with in-batch and KB negatives. It is the L1 stage with
    only the retrieval loss (`--retrieval-only`); no separate key-table
    distillation.
-5. **K3 - Superposition operator warm-up** (drop-one: a neighbourhood of items in
-   space s with the target removed; S_s produces an item from which R
-   reconstructs the target's span).
-   - *K3a:* S_s conditioned on the target key only.
-   - *K3b:* additionally each neighbour item's key enters at each of its
-     positions (continues K3a; the key weights start at zero, so K3b begins as
-     K3a).
-   - *Depth (owner, 28 September):* the warm-up also runs S_s recursively, at
-     least two levels (a neighbourhood of level-1 items, each itself S_s over a
-     neighbourhood of records), so the operator works on its own outputs before
-     L1 uses it that way.
+5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
+   short warm-up: first a long read-side phase in which the rows are free
+   learnable parameters trained by reads alone, until they have drifted far from
+   their codec-derived start (the more drift the write side has to absorb, the
+   more superposition it must learn; drift is logged). Then the read side is cut
+   off at the rows' key/value pairs and the write stack (S_s levels over fields of
+   the source-level items, rows as anchors) is fitted to them, without the
+   decoder in the loop: sequentially on the exported rows by default, or as a
+   separate job following row snapshots that the read phase exports as it goes.
+   The fit is the L2 stack objective and code. Reads seeing the stack's outputs
+   instead of free rows is a later switch.
+   *Key space (owner):* in the read phase each row's key is a free parameter
+   too, moved by the retrieval and gate gradients (the search index is re-keyed
+   from the live row keys on a schedule). On the write side a row's key follows
+   its field: the keys of its field inputs weighted by the operator's weights
+   for them (the normalized shares), plus a learned correction; fields are
+   reassigned from the updated keys. The write fit matches keys as well as
+   values.
+   The field shares themselves depend on keys: an input sends to each of its
+   candidate rows (top-k by key, re-drawn on a schedule) a share softmax(tau
+   cos(input key, row key)) over those rows, and the row's operator receives it
+   with gate mass x share. So the write fit (and the task loss, straight
+   through) pulls an input's key toward rows its content helps reproduce and
+   away from rows it hurts, and row keys likewise; per-input normalization keeps
+   responsibilities summing to one and makes the competition zero-sum. Input
+   keys are the key head's output plus a free per-item correction; a balance
+   loss on row load prevents collapse onto a few rows.
+   *Field size is empirical (owner):* larger fields should speed up learning,
+   at a cost in memory and time (a top row depends on up to f^L leaves). It is a
+   tuned hyperparameter, and the model is trained to be robust to it: field
+   sizes are sampled from a range per space during training (the operator
+   already sees its input-to-output size), evaluations sweep fixed sizes with
+   their memory and time per step, and KBs of different density (rows
+   subsampled) are evaluated, since every KB differs in density anyway.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
@@ -284,15 +317,34 @@ applies to every stage.
      (default 2), each S_s over a neighbourhood of level L-1 items, down to the
      sources. The task loss trains the source items, S_s, keys, query heads and
      R together, so every source is shaped by all the items it feeds.
-     Mechanics: level items are computed lazily (only those a read retrieves,
-     their level-1 inputs from a cache refreshed on a schedule, gradients through
-     the read level and a sampled part of the level below); fixed neighbourhood
-     graphs per level from keys, rebuilt periodically; against the identity,
-     fewer top-level items than sources (the storage budget) and drop-one at
-     level 1; each source's contributions normalized to its mass (invariants 5
-     and 7), recorded as rewrite shares; an item's time is the latest of its
+     S_s runs across a field in key space, like a convolution (owner): each
+     application reads the items in its field, with each input's position
+     relative to the field's anchor (key offsets as per-item features), and
+     writes one item at the anchor. Anchors at every level are spaced so fields
+     overlap (each input falls into about c = 3 fields), so a level with fields
+     of size f has about c/f as many items as the one below: compaction and
+     superposition by construction. The field size per space is comparable to
+     the read-time combine neighbourhood. A top item depends on at most f^L
+     leaves; gradients stop at the trainable KB records (the leaves).
+     Mechanics: items are computed lazily (only those a read retrieves, the
+     level below from a cache refreshed on a schedule, gradients through the
+     read level and a sampled part of the level below); anchors and field
+     assignments rebuilt periodically; drop-one at level 1; each input's
+     contributions normalized to its mass across its fields (invariants 5 and
+     7), recorded as rewrite shares; an item's time is the latest of its
      sources' (invariant 2); mixing only within one KB (invariant 6). Control:
      depth 0 (the items themselves) at the same storage and read budget.
+     *One set of aggregators, trained jointly (owner, 28 September):* S_s is
+     write-side only: its fields build the superposed entries and re-superpose
+     them when knowledge is added. A read retrieves the top entries per space and
+     R reads them directly (gates from retrieval times stored mass), conditioned
+     on the query key; no aggregator runs at reads. Training: a short read-side
+     warm-up (R and key heads on fixed entries), then leaves, aggregators, R and
+     heads trained jointly from the same task loss. A read anchor, item-preserving
+     consolidation and read/write phase alternation exist as remedies, off by
+     default, switched on only if item drift, read drift on a fixed probe set or
+     cross-KB retention show see-saw (logged every eval). A per-space read combine
+     stays as an ablation.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
@@ -390,8 +442,10 @@ are the levers; the dense per-pair form is kept on purpose.
 ## 8. Open questions
 
 - Space count, widths and position ratios (the table above is a starting point).
+- Field sizes per space and level: as large as affordable; tuned by sweeps, with
+  training robust to the size (section 5.1 step 5).
 - Neighbourhood sizes per space, and M/N in rewrite-then-recover.
-- Whether R also receives the query (question-conditioned recombination).
+- (Decided 28 September: R receives the query key; no per-query S_s at reads.)
 - How rewriting levels are scheduled once the store is large.
 - Top-k size for cached teacher distributions, and the distillation corpus.
 
@@ -510,7 +564,7 @@ inputs are. Training data is regenerated where the format changes (owner:
 | Evaluation harness (WP4) | built (`scripts/benchmark_models.py`, `src/schnitz/kb_eval.py`, verifiers in `src/schnitz/task_verifiers.py`; 57 tests): benchmark of reference models on 9 task corpora with oracle context and closed book; superposition metrics, counterfactual edits, removal and insertion reports. Harness 2 (28 Sep; results of harness 1 are redone on rerun): required records are never cut and per-task context budgets (8k to 80k characters) cover every validation episode (0 truncated; longest full-context prompt 20.6k LFM2.5 / 25.4k Ling tokens, spider_memory; knights 18.1k; all fit the 32k LFM2.5 window with their generation budget, `--measure` reproduces this); APIGen-MT scores every tool-call turn on its gold causal prefix (1,228 calls in 274 validation episodes instead of 19 opening calls; first-call and opening-call rates kept); Reasoning Gym per-family normalizations (`reasoning_gym` is not installed; 521 of 549 validation episodes have a unique stored answer, 28 in 9 families whose scorer accepts any valid solution still undercount; +7 of 400 answers on the 350M run); SynLogic added with the repository's verifiers (local checkout, run sandboxed; 23 families, 3 `math_verify` families reimplemented; 286 validation episodes, `futoshiki` excluded because 12 of 20 stored puzzles have no solution); model code and SynLogic verifiers run in a sandbox (time, CPU, heap and file-size limits, own temporary directory, Internet sockets blocked in Python; KodCode gold pass rate unchanged, 179/200). `kb_eval.nll_summary(..., gain=False)` reproduces the K1 evaluation record exactly (tested) for the K1 stage to report through. Smoke-tested on 350M (5 episodes per task, harness 1; harness 2 on 3 episodes of 5 tasks); reference runs (8B-A1B, Ling-3.0-tiny, 24B-A2B) pending |
 | Bank creation (write step) | built (`schnitz.kb.bank`, `train.py bank`): records the transcripts name, the frozen writer's span of each (memory prompt, a ratio level), one resumable span cache per dataset KB; shared by L1's KB build and B4c slot filling. Measured about 2 records/s at level s0 during a shared-GPU smoke; the write-site caches (136,676 records) are scheduled after B3 |
 | K2 keys | built as `train.py l1 train --retrieval-only` (item-key and query heads of `schnitz.kb.stack`, retrieval loss of `schnitz.kb.losses`); GPU smoke only, not trained |
-| K3a/K3b superposition operator | built, not run (`train.py k3`: drop-one or target-present neighbourhoods from the neighbour table, target key, `--neighbour-keys` for K3b, key-only control); waits for a K1 whose spaces carry content |
+| K3 write-stack warm-up | to be built on the superposed-KB code (short L1a with free rows, then the L2 stack fitted to them); the earlier target-key K3 stage (`train.py k3`) was removed 28 Sep |
 | L1 | built, not trained: `train.py l1 build|train` (`src/schnitz/kb/read.py`, `src/schnitz/kb/stages/l1.py`; 31 read-path and trainer tests, 1 store test for batched reads). L1a, L1b (producer replay) alternating by `--phase-schedule`, K2 -> L1a chaining (`--init-reader`), same-KB in-batch negatives, in-context writes from v3 write sites. Live reads gather once per (KB, space) and call on the resident state, onto the reader's device. GPU smoke 28 Sep (bird, alfworld and r6-mixed v3, 80 train transcripts each, 20 KBs, 718 records plus 16 distractors per KB, K1 codecs and B3 writer snapshots of 16:52, batch 4, shared GPU at 0.15): K2 6 steps, then L1 12 steps `a:4,b:2` from K2's heads with writes; 2-4 writes per step, 0.6-4.8 s; after 4 steps training reads start retrieving earlier episodes' writes, and at the step-12 evaluation 78% of validation reads in space C had a written item among the items read (41% of C's read mass; A, B, D 0%), so written items attract routing without carrying content (retrieved 1.7278 vs shuffled 1.7275 nats, noctx 2.02, text 1.58); L1a steps 6-17 s with the live state on the CPU, 7-18 s on CUDA (no gain: the decoder passes dominate; the former 22 s per step of per-item GPU gathers is gone). L1b replay is bit-exact on the GPU at its first step (`l1b_match_exact` 1.0, drift 0, bank and written items) when the bank's spans were written one at a time (`build --span-batch-size 1`) and replayed one at a time; spans written in batches of 16 differ from a batch-1 replay by 0.4-3.5% (padding changes the free run's numerics). Cost per L1b step (free replay): 50-130 s, of which the producers' backward 30-86 s for 26-60 sources (about 1.5 s per source) against 6-17 s for L1a; `--l1b-replay teacher` 14-23 s (backward 4-6 s), 0.56% from the stored items. One L1b step at the former rates moved the recomputed items by 25-45% relative (lr 3e-4 on the codecs), so the producers now have their own AdamW groups (`--l1b-codec-lr` 3e-5, `--l1b-writer-lr` 3e-6) and every L1b step logs the relative change of the recomputed items after the optimizer step (`l1b_change_rel`, `--l1b-change-units`). The replay is the shared `schnitz.kb.producer.Producers` (also L2's and B9's); GPU smoke after the merge (the batch-1 banks of the 28 Sep smoke, K2 heads, batch 4): first L1b step still bit-exact (`l1b_match_exact` 1.0, drift 0, 26 sources); one step moves the items by 2.7% (max 4.0%) at the new rates against 25.3% (max 37%) at the old; the second step 2.5% (max 16%), its match to the stored items 2.8% after one update. Bank write throughput (96 bird records, level s0, shared GPU at 0.12): 2.1 records/s at span batch 1, 5.2-6.7 at 16; batch-16 spans differ from batch-1 spans by 1.1% on average, up to 29%, so L1b needs `--span-batch-size 1` banks (documented in `l1 build --help`; the default stays batched) |
 | L2 | built, not trained: `train.py l2 export|train` (`src/schnitz/kb/stages/l2.py`, producer path `src/schnitz/kb/producer.py`, the replay L1b and B9 use: one `Producers` class, one `WriteLog`, one `Writer`; 5 CPU tests). Targets: the live KBs of an L1 run at its reader checkpoint's live tag, restored in a scratch copy and exported frozen (`export_live`; the L1 run is not touched), or given exports. Producer per record: the writer's span of the source under the memory prompt at the banks' level, teacher-fed with the bank's cached span (`--feed teacher`), free-running without gradients then one gradient pass (`self`; was `free` before the producer merge) or the free run replayed with gradients through every step (`free`, L1b's replay), rounded to the span cache's bf16 like L1b's replay, then the codecs; rewrite outputs through their lineage (S_s over the produced inputs at gate share x mass, conditioned on the item's key; one level, since an export keeps only metadata of superseded rows). Losses: per space 1 - cosine and MSE over the target's mean square, key cosine (L1 item-key heads on the produced values vs the live key), KL of the frozen decoder reading R(produced) vs R(live items) on the source's reconstruction (R from the L1 reader, frozen). Trained: the writer's rep head and ratio code (`--train writer`), optionally codecs and S_s. Eval: held-out records and a training sample (reproduction error per space, key cosine, NLL of R(produced) / R(live) / R(bank item) / no memory), and `--eval-episodes N` re-runs L1's arms with a KB written from the producers. GPU smoke (28 spider records built by `l1 build` from 40 v3 transcripts with the K1 codecs, B3 writer): after 8 L1a steps at item lr 1e-2 the live items had barely moved (bank vs live MSE 0.001, the teacher-fed reproduction floor), so L2 had nothing to learn; after 16 L1a steps at item lr 0.1 (bank vs live relative MSE 0.16 in A, 0.21-0.23 in D), 60 L2 steps (batch 4, lr 1e-4) lowered the functional KL to the live items from 0.018 to 0.006 on the training sample and from 0.036 to 0.023 on 7 held-out records, key cosine in D 0.90 to 0.93, the value MSE only slightly (A 0.157 to 0.150); L1's arms with produced items: retrieved 0.827 vs 0.823 nats with live items (6 validation episodes, content over shuffled at noise level in both). About 1 s per step of 4 records |
 | B9 | built, not trained: `train.py b9` (`src/schnitz/kb/stages/b9.py`, building blocks `src/schnitz/kb/experience.py`; 12 CPU tests). Per episode R rounds (default 3): the attempt generated with the KV cache, each emitted `memory_search()` executed as an L1 read (query at the call's closing parenthesis from a pass over the exact prefix, the span in the tool message; the protocol tokens match the template's rendering), scored by `schnitz.task_verifiers`; the SFT pass on the teacher transcript with its reads from the KB as it is at round t (task NLL plus retrieval loss; trains the L1 reader, items in place with `--item-lr`); then the single-pass write (`memory_write()` after the attempt, the frozen writer free-running in place, codecs, item-key heads), appended the first time and superseded after (one current record per task). Gold records (teacher text by the bank writer) read at w = schedule x decay^supersedes, applied as a gate factor where S_s combines the read items (gates scale mass, so w is its exact share; hidden at 0). Registry of records (model / hinted / gold, tasks whose gold is in the lineage); held-out rounds read only records without gold for their task (`--heldout-lineage any`: no gold at all), write their own records (never visible to training or later evaluations) and run the `removed` and `swapped` controls. Gradients into earlier rounds' writes (`--backprop-rounds k`, default 2): each training round's write is logged as a write source (site token ids, the attempt's read spans, the generated span and items, and per read its query state and items read); the SFT pass of round t reads the task's own record as its producers' recomputation (the shared L1b replay, bit-exact at the forward), so round t's losses reach the writer's span heads and codecs through round t-1's write, and the replay of that write recomputes its reads of the own record from round t-2's write (`L1Reader.reread`: forward the logged span exactly, gradient through the recomputed read), truncated after k writes; producers at their own rates (`--l1b-codec-lr`, `--l1b-writer-lr`); k = 0 keeps writes detached and writer and codecs frozen (CPU tests: gradient reaches the previous round's write at k >= 1 and not at k = 0; a depth-2 chain at k = 2 and not at k = 1; replay exact, reread equal to the logged read). The write site's cached prefix (`Model.prefix`) is a no-gradient cache, so a chained replay computes it with gradients (`producer.prefix_for`; same forward bit for bit, gradient reaches the site's inputs). GPU smoke (spider, 20 transcripts, random-init codecs at the new widths, B3 snapshot, 3 rounds, 2 steps x 2 episodes, k = 2): per episode 3 replays (rounds 0 and 1 at depth 1, round 0 again at depth 2 through round 1's read of it), bit-exact (`replay_match_exact` 1.0, drift 0, reread equal to the logged read), 18-26 s per step. Single-answer verifiers only (agent trajectories and APIGen-MT turns are skipped). GPU smoke (spider, 2 rounds, 6 steps x 2 episodes, 4 held-out episodes, `--open-with-search` because the B3 decoder never emits the call on its own): runs end to end with resume (restore of the live checkpoint with later commits discarded); accuracy 0 in every round and arm (the 350M answers `SELECT 1` or a guessed table); with the 8-step L1 reader, B9 records were 7-38% of the scored candidates but never among the items read, so round 1 read exactly what round 0 read; with the banks' initial heads the gold record took 6-10% of read mass at step 1 and held-out round 1 read its own record (4.5% of mass), 2 records became `hinted`. About 13-40 s per step |
