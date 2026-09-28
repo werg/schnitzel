@@ -342,11 +342,16 @@ class L1Reader(nn.Module):
              negatives: Mapping[str, Sequence[Ref]] | None = None,
              exclude: Mapping[str, Collection[Ref]] | None = None,
              producer: Producer | None = None,
-             weights: Mapping[str, float] | None = None) -> Read:
+             weights: Mapping[str, float] | None = None,
+             alternatives: Mapping[str, Sequence[Ref]] | None = None) -> Read:
         """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
-        they are the read). Every KB must be authorized, and so must every target and
-        negative item.
+        they are the read). ``alternatives`` (per space): other items that alone hold
+        the slot's content (redundant copies); they are extra positives of the
+        retrieval loss and never its negatives, recall then counts a read as a hit
+        when any positive is among the items (``any``), and the gold read stays
+        ``targets``. Every KB must be authorized, and so must every target,
+        alternative and negative item.
 
         ``negatives`` (per space): extra items scored as negatives in the retrieval
         loss (in-batch negatives; the caller passes only items of the read's own KBs).
@@ -369,7 +374,8 @@ class L1Reader(nn.Module):
         if denied:
             raise PermissionError(f'not authorized to read {denied}')
         by_dataset = {kb.dataset: kb for kb in kbs}
-        for what, named in (('target', targets), ('negative', negatives)):
+        for what, named in (('target', targets), ('alternative', alternatives),
+                            ('negative', negatives)):
             for dataset, _ in (r for rs in (named or {}).values() for r in rs):
                 if dataset not in allowed or dataset not in by_dataset:
                     raise PermissionError(f'{what} item of {dataset!r} is not readable here')
@@ -382,9 +388,13 @@ class L1Reader(nn.Module):
             q = self.keys.query_key(s, state)
             queries[s] = q
             wanted = list(dict.fromkeys((targets or {}).get(s, ())))
+            copies = [r for r in dict.fromkeys((alternatives or {}).get(s, ()))
+                      if r not in set(wanted)]
             banned = set((exclude or {}).get(s, ()))
-            # positives: the slot's items (weight 1), or the rows covering them (share)
-            positive = cache.positives(s, wanted) if superposed else dict.fromkeys(wanted, 1.0)
+            # positives: the slot's items and their copies (weight 1), or the rows
+            # covering them (share)
+            positive = cache.positives(s, wanted + copies) if superposed \
+                else dict.fromkeys(wanted + copies, 1.0)
             if gold:
                 refs = cache.gold(s, [r for r in wanted if r not in banned], banned) \
                     if superposed else [r for r in wanted if r not in banned]
@@ -458,7 +468,10 @@ class L1Reader(nn.Module):
             read_spaces += [s] * len(values)
             read_gates.append(g)
             recall = recall_read = None
-            if positive:
+            if positive and copies:          # redundant copies: any positive is a hit
+                recall = float(any(r in set(scored) for r in positive))
+                recall_read = float(any(r in set(refs) for r in positive))
+            elif positive:
                 total = sum(positive.values())
                 recall = sum(w for r, w in positive.items() if r in set(scored)) / total
                 recall_read = sum(w for r, w in positive.items() if r in set(refs)) / total

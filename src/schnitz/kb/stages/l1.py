@@ -462,6 +462,16 @@ class Context:
         return {s: [(ep.kb, i) for r in slot['record_ids'] for i in index[s].get(r, ())]
                 for s in index}
 
+    def alternatives(self, ep: Episode, j: int) -> dict[str, list[tuple[str, str]]] | None:
+        """The slot's redundant copies (``alternatives``: records that alone hold its
+        content) per space, as extra retrieval positives; None without any."""
+        slot = ep.slots[j]
+        names = [r for r in slot.get('alternatives') or () if r not in slot['record_ids']]
+        if not names:
+            return None
+        index = self.index[ep.kb]
+        return {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())] for s in index}
+
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
                 spans: list[torch.Tensor] | None = None, retrieval_only: bool = False,
@@ -520,6 +530,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                 with ctx.autocast():
                     read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
+                                           alternatives=ctx.alternatives(ep, j),
                                            gold=mode == 'gold', negatives=negatives,
                                            exclude=exclude,
                                            producer=None if mode == 'gold'

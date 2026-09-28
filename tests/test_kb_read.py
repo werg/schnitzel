@@ -167,6 +167,30 @@ def test_retrieval_loss_over_candidates_and_missed_targets(tmp_path):
             assert cache.values[('ds', s, ref[1])].grad.abs().sum() > 0
 
 
+def test_alternatives_are_positives_never_negatives_and_gold_reads_targets(tmp_path):
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(8)))
+    r = reader(candidates={'A': 3, 'B': 3, 'C': 3, 'D': 3})
+    state = torch.randn(HIDDEN)
+    targets, copies = targets_of(kb, ['r0']), targets_of(kb, ['r5', 'r7'])
+    cache = ItemCache(train=True)
+    # a copy offered as a negative is still a positive
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets, alternatives=copies,
+                  negatives=copies)
+    want = []
+    for s, info in read.spaces.items():
+        positives = targets[s] + copies[s]
+        assert info.recall == float(any(p in set(info.scored) for p in positives))
+        pool = info.scored + [p for p in positives if p not in set(info.scored)]
+        q = r.keys.query_key(s, state)
+        keys = torch.stack([r.keys.item_key(s, cache.get(kb, s, [i])[0][0]) for _, i in pool])
+        positive = torch.tensor([p in set(positives) for p in pool])
+        want.append(retrieval_loss(r.keys.scores(s, q[None], keys), positive[None])[0])
+    torch.testing.assert_close(read.aux, torch.stack(want).mean())
+    gold = r.read(state, [kb], ['ds'], 3, ItemCache(train=False), targets=targets,
+                  alternatives=copies, gold=True)
+    assert all(info.refs == targets[s] for s, info in gold.spaces.items())
+
+
 def test_read_count_is_mass_weighted_length_in_reps_capped(tmp_path):
     kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1)))   # items 2 and 3 positions long
     targets = targets_of(kb, ['r1', 'r2'])
