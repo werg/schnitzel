@@ -106,7 +106,6 @@ def test_stack_standardizes_spans_with_corpus_statistics():
 
 
 def test_k1_multi_record_input_concatenates_neighbours_within_the_token_budget():
-    from types import SimpleNamespace
 
     from schnitz.kb.stages.k1 import _multi_example
     texts = ['aaaa', 'bb', 'cccccc', 'dd']
@@ -121,35 +120,3 @@ def test_k1_multi_record_input_concatenates_neighbours_within_the_token_budget()
     sep = [ord('\n')] * 2
     assert ex['ids'].tolist() == [ord('a')] * 4 + sep + [ord('b')] * 2
     assert ex['span'].shape[0] == 1 + 2 and ex['span'][1:].eq(1.0).all()
-
-
-def test_k3_depth_two_rewrites_through_level_one_items():
-    import random
-
-    from schnitz.kb.stack import Stack
-    from schnitz.kb.stages.k3 import K3, _deep_inputs
-    torch.manual_seed(0)
-    stack = Stack(0.8, state=16, hidden=8, layers=1, checkpointing=False, width=24)
-    k3 = K3(stack, state=16, hidden=8, layers=1, checkpointing=False, query_width=24, depth=2)
-    items = {f'r{i}': (0, i, f'r{i}', 5, i) for i in range(5)}
-    table = {'r0': ['r1', 'r2'], 'r1': ['r0', 'r3'], 'r2': ['r4', 'r0'], 'r3': [], 'r4': []}
-    neighbours = SimpleNamespace(of=lambda item, k: [items[x] for x in table[item[2]][:k]])
-    encoded = {r: stack.encode(torch.randn(6, 24)) for r in items}
-    calls = []
-
-    def encode(item):
-        calls.append(item[2])
-        return encoded[item[2]]
-    level1 = _deep_inputs(encode, neighbours, items['r0'], 2, None, 0.0, present=False,
-                          absent=True)
-    assert [len(hood) for _, hood in level1] == [2, 2]   # r1: r3 + itself; r2: r4 + itself
-    assert 'r0' not in calls                               # absent: never encoded
-    out = k3.deep_rewrite(encoded['r0'], level1, neighbour_keys=False)
-    assert {s: v.shape[0] for s, v in out.items()} == {s: v.shape[0]
-                                                       for s, v in encoded['r0'].items()}
-    out['D'].sum().backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in k3.deep['D'].parameters())
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in k3.ops['D'].parameters())
-    present = _deep_inputs(encode, neighbours, items['r0'], 2, random.Random(0), 1.0,
-                           present=True)
-    assert len(present) == 3 and all(len(h) >= 1 for _, h in present)

@@ -835,3 +835,11 @@ log your decisions and changes of direction"), newest last.
   read-side warm-up, leaves, aggregators, R and key heads train jointly; anchor,
   consolidation and phase alternation are off by default, remedies only if the
   logged drift and retention metrics show see-saw.
+- 28 Sep (owner, confirmed; supersedes the two entries above on anchors and K3).
+  Rows are the stored learnable records of a space and are the anchors: at every
+  row the write side has an S_s output consuming a field of write inputs (lower
+  level items nearest the row; overlapping fields; >= 2 levels down to source-level
+  items). The write side is trained by the task loss through reads or by matching
+  each row's learned value, never by reproducing particular source records. K3 is
+  a short L1a with free rows followed by fitting the write stack to them (L2's
+  stack code); the target-key K3 stage is removed.
