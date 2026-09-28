@@ -574,3 +574,8 @@ log your decisions and changes of direction"), newest last.
   name, passage title) that the causal prefix lacks; allowed for now since headers
   are public metadata of the KB, to be revisited with the local-LLM query rewriter
   (`--query-hook`) before L1 measures retrieval from generated queries.
+- 28 Sep (WP4 merged). Reference benchmark order: our 350M and 1.2B-Instruct at
+  200 episodes per task now (small); weights of LFM2.5-8B-A1B, Ling-3.0-tiny and
+  LFM2-24B-A2B downloaded to `/archive/hf-models` (root disk too full); 8B-A1B
+  (thinking, first pass at 100 per task) and Ling after B3 ends, 24B when B3 or K1
+  frees memory. Ling runs on a transformers 4.57 overlay for its remote code.
