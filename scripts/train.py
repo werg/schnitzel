@@ -18,6 +18,8 @@ STAGES = {
     'k1': 'schnitz.kb.stages.k1',           # autoencoding through the spaces
     'k3': 'schnitz.kb.stages.k3',           # superposition-operator warm-up (K3a/K3b)
     'l1': 'schnitz.kb.stages.l1',           # live items end to end (K2: --retrieval-only)
+    'l2': 'schnitz.kb.stages.l2',           # producers reproduce the L1a items
+    'b9': 'schnitz.kb.stages.b9',           # learning by experience over rounds
 }
 
 
