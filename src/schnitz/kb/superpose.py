@@ -621,6 +621,13 @@ class WriteOps(nn.Module):
         return [float(self.tau(n, space).detach()) for n in range(1, depth + 1)]
 
 
+def head_input(out: Tensor) -> Tensor:
+    """The key head's input: the row output's mean over positions, unit length (the
+    outputs' rows have norm sqrt(width), so an unnormalized mean would make every Adam
+    step of the zero-initialized head move the key by about lr x width)."""
+    return nn.functional.normalize(out.float().mean(0), dim=-1)
+
+
 def field_key(head: nn.Module, keys: Sequence[Tensor], gates, out: Tensor) -> Tensor:
     """A row's key from its field: the inputs' unit keys weighted by the aggregator's
     input weights (gates share x mass, normalized; differentiable), plus the key head's
@@ -629,7 +636,7 @@ def field_key(head: nn.Module, keys: Sequence[Tensor], gates, out: Tensor) -> Te
     w = w.to(out.device).float()
     w = w / w.sum().clamp_min(1e-12)
     base = (w[:, None] * torch.stack([k.to(out.device).float() for k in keys])).sum(0)
-    return nn.functional.normalize(base + head(out.float().mean(0)), dim=-1)
+    return nn.functional.normalize(base + head(head_input(out)), dim=-1)
 
 
 def apply_field(op: nn.Module, values: Sequence[Tensor], gates, offsets: Sequence[Tensor],
@@ -712,7 +719,7 @@ def combine_many(ops: WriteOps, graph: SpaceGraph, level: int, rows: Sequence[in
     w = gates / total[owner_t].clamp_min(1e-12)
     base = torch.zeros(len(rows), key_in.shape[1], device=device).index_add(
         0, owner_t, w[:, None] * key_in)
-    head = ops.key_head(level, graph.space)(torch.stack([o.mean(0) for o in outs]))
+    head = ops.key_head(level, graph.space)(torch.stack([head_input(o) for o in outs]))
     out_keys = nn.functional.normalize(base + head, dim=-1)
     return [(o, k, m.float()) for o, k, (_, m) in zip(outs, out_keys, got)]
 
@@ -1464,11 +1471,17 @@ class SuperposedCache(ItemCache):
             return list(zip(values, keys, masses))
         return leaf
 
-    def backward(self) -> dict:
-        """Recompute the rows that received gradients and backpropagate."""
+    def backward(self, balance: float = 0.0, usage: dict | None = None) -> dict:
+        """Recompute the rows that received gradients and backpropagate. With
+        ``balance`` > 0 also the write side's balance loss on those rows' loads (their
+        masses under the dynamic shares, differentiable in the leaves' keys and tau)
+        against a moving average of each row's load (``usage['write/<kb>/<space>']``,
+        ``losses.balance_loss``): mass moving onto already loaded rows costs."""
+        from schnitz.kb.losses import UsageEMA, balance_loss
         if not self.train:
             raise ValueError('an evaluation cache does not backpropagate')
         done, drift = 0, 0.0
+        balances = []
         for view in self.views.values():
             view.counters = {}
         groups: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
@@ -1481,6 +1494,17 @@ class SuperposedCache(ItemCache):
             g = view.graphs[space]
             got = view.grad_values(space, g.depth, [g.top_index[r[2]] for r in refs],
                                    self.leaf_fn(dataset, view.kb))
+            if balance > 0 and usage is not None:
+                name = f'write/{dataset}/{space}'
+                ema = usage.setdefault(name, UsageEMA(len(g.row_ids)))
+                ema.grow(len(g.row_ids))
+                rows = torch.tensor([g.top_index[r[2]] for r in refs])
+                loads = torch.stack([m for _, _, m in got])
+                b = balance_loss(rows, loads, ema)
+                ema.update(rows, loads.detach())
+                tensors.append(balance * b)
+                grads.append(torch.ones_like(b))
+                balances.append(float(b.detach()))
             for ref, (out, out_key, _) in zip(refs, got):
                 value, key = self.tops[ref], self.top_keys[ref]
                 drift = max(drift, float((out.detach().to(value.device)
@@ -1493,7 +1517,10 @@ class SuperposedCache(ItemCache):
         if tensors:
             torch.autograd.backward(tensors, grads)
         deep = sum(v.counters.get('deep', 0) for v in self.views.values())
-        return {'rows': done, 'deep': deep, 'drift': drift}
+        out = {'rows': done, 'deep': deep, 'drift': drift}
+        if balances:
+            out['write_balance'] = sum(balances) / len(balances)
+        return out
 
     def touched_tops(self) -> list[tuple[str, str, str]]:
         return [ref for ref, leaf in self.tops.items() if leaf.grad is not None]

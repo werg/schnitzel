@@ -763,14 +763,20 @@ def train_stack(args) -> None:
         rng.setstate(state['rng'])
         snapshot_step = state.get('targets_step', snapshot_step)
     budgets = fit.load(load_row_targets(targets_dir, dirs), step)
-    params = list(ops.parameters())
+    # the key paths (the stack's row-key heads, the leaves' item-key heads and corrections)
+    # at their own rate: their outputs are unit keys that a full-rate step overshoots
+    key_params = list(ops.key_heads.parameters())
     if 'keys' in trained:
-        params += list(heads.item.parameters()) + list(fit.corrections.parameters())
+        key_params += list(heads.item.parameters()) + list(fit.corrections.parameters())
     else:
         for p in list(heads.parameters()) + list(fit.corrections.parameters()):
             p.requires_grad_(False)
-    optimizer, schedule = warmup_optimizer(params, args.warmup, step, lr=args.lr,
-                                           weight_decay=0.0)
+    ids = {id(p) for p in key_params}
+    params = [p for p in ops.parameters() if id(p) not in ids] + key_params
+    optimizer, schedule = warmup_optimizer(
+        [{'params': [p for p in ops.parameters() if id(p) not in ids], 'lr': args.lr},
+         {'params': key_params, 'lr': args.key_lr}], args.warmup, step, lr=args.lr,
+        weight_decay=0.0)
     if state is not None:
         optimizer.load_state_dict(state['optimizer'])
     weights = L2Weights.parse(args.weights)
@@ -1122,6 +1128,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                              '--export-rows-every) and reload when a newer one appears')
     parser.add_argument('--follow-every', type=int, default=50,
                         help='stack: steps between checks for a newer snapshot')
+    parser.add_argument('--key-lr', type=float, default=1e-4,
+                        help='stack: rate of the key paths (row-key heads, item-key heads, '
+                        'leaf corrections)')
     parser.add_argument('--unbatched', action='store_true',
                         help='stack: aggregators row by row (reference path)')
     parser.add_argument('--max-pairs', type=int,

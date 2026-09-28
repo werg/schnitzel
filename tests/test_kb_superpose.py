@@ -376,7 +376,8 @@ def test_train_step_with_rows_from_the_stack_and_the_phases(tmp_path):
     args = SimpleNamespace(phase='l1a', retrieval_only=False, inbatch_negatives=4,
                            balance_weight=0.01, retrieval_weight=0.5, retrieval_anneal=0,
                            retrieval_floor=0.0, clip=1.0, item_lr=0.01, write_level_index=0,
-                           consolidate_every=0, read_anchor=0.0, rows_from_stack='x')
+                           consolidate_every=0, read_anchor=0.0, rows_from_stack='x',
+                           write_balance=0.01)
     sets = l1.parameter_sets(r, None, ops)
     params = [p for ps in sets.values() for p in ps]
     opt = torch.optim.AdamW(l1.optimizer_groups(sets, SimpleNamespace(
@@ -396,9 +397,12 @@ def test_train_step_with_rows_from_the_stack_and_the_phases(tmp_path):
     assert 'superpose' not in out and out['items'] == 0
     assert all(torch.equal(a, b) for a, b in zip(live(), start))
     assert torch.equal(op_weight, start_op)
-    out = l1.train_step(ctx, [ep], opt, args, 1, phase='l1a',
+    usage = {}
+    out = l1.train_step(ctx, [ep], opt, args, 1, usage, phase='l1a',
                         trainable=l1.set_phase(sets, l1.phase_set('l1a', args)))
     assert out['superpose']['rows'] > 0 and out['superpose']['drift'] < 1e-5
+    assert out['superpose']['write_balance'] > 0          # the rows' write loads, balanced
+    assert any(k.startswith('write/ds/') and bool(u.touched.any()) for k, u in usage.items())
     assert out['items'] > 0 and not torch.equal(op_weight, start_op)
     assert any(not torch.equal(a, b) for a, b in zip(live(), start))
     report = l1.superposition_metrics(ctx, {})
@@ -610,4 +614,54 @@ def test_batched_rows_equal_row_by_row_values_and_gradients(tmp_path):
         for a, b in zip(ga, gb):
             assert (a is None) == (b is None)
             if a is not None:       # up to summation order, relative to the tensor's scale
-                assert float((a - b).abs().max()) <= 1e-4 * float(b.abs().max()) + 1e-5
+                # (0-d: tau, a sum of cancelling share gradients)
+                tol = (1e-4 if a.dim() == 0 else 1e-5) + 1e-4 * float(b.abs().max())
+                assert float((a - b).abs().max()) <= tol
+
+
+def test_fit_key_path_learns_row_keys_away_from_the_field_mean(tmp_path):
+    kb = leaf_kb(tmp_path)
+    view, ops = view_of(kb, config(), tmp_path)
+    gen = torch.Generator().manual_seed(3)
+    stored = {s: {it.id: it for it in kb.read(s, g.ids, live=True)}
+              for s, g in view.graphs.items()}
+    corrections = {s: torch.zeros(len(g.ids), SPACES[s].key_width, requires_grad=True)
+                   for s, g in view.graphs.items()}
+
+    def leaf(space, ids):
+        g = view.graphs[space]
+        rows = torch.tensor([g.index[i] for i in ids])
+        keys = nn.functional.normalize(torch.stack([stored[space][i].key.float() for i in ids])
+                                       + corrections[space][rows], dim=-1)
+        return [(stored[space][i].values.float(), k, torch.tensor(1.0))
+                for i, k in zip(ids, keys.unbind(0))]
+    targets, values = {}, {}
+    for s, g in view.graphs.items():     # learned row keys that left their fields' mean
+        values[s] = [v.detach() for v, _, _ in view.items(s, g.depth, range(len(g.row_ids)))]
+        targets[s] = nn.functional.normalize(
+            g.row_keys + 0.7 * torch.randn(g.row_keys.shape, generator=gen), dim=-1)
+    opt = torch.optim.Adam(list(ops.key_heads.parameters()) + list(corrections.values()),
+                           lr=1e-2)
+
+    def key_cos() -> float:
+        out = []
+        for s, g in view.graphs.items():
+            view.clear()
+            got = view.grad_values(s, g.depth, list(range(len(g.row_ids))), leaf, deep=1.0)
+            out += [float(nn.functional.cosine_similarity(k, t, dim=-1))
+                    for (_, k, _), t in zip(got, targets[s])]
+        return sum(out) / len(out)
+    before = key_cos()
+    for _ in range(60):
+        opt.zero_grad()
+        total = 0
+        for s, g in view.graphs.items():
+            view.clear()
+            loss, parts, _ = sp.fit_losses(view, s, g.row_ids, values[s],
+                                           targets[s], leaf, weights=(0.0, 0.0, 1.0))
+            total = total + loss
+        total.backward()
+        opt.step()
+    after = key_cos()
+    assert after > before + 0.2, (before, after)
+    assert any(float(p.abs().sum()) > 0 for p in ops.key_heads.parameters())

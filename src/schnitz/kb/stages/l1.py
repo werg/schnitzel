@@ -104,7 +104,7 @@ from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, prod
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
                              L1Reader, ReadConfig, current_ids, producer_index, source_index,
                              splice)
-from schnitz.kb.stack import KeyHeads
+from schnitz.kb.stack import SPACES, KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.memory_transcripts import render_ids, render_text
@@ -960,7 +960,7 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             before = {ref: cache.tops[ref].detach().clone() for ref in touched}
         if phase != 'r':
             t0 = time.time()
-            out['superpose'] = cache.backward()
+            out['superpose'] = cache.backward(getattr(args, 'write_balance', 0.0), usage)
             out['superpose']['backward_s'] = round(time.time() - t0, 3)
     if producer is not None:
         t0 = time.time()
@@ -1514,9 +1514,27 @@ def train(args) -> None:
     producers = load_producers(args, ctx, writer, log, model) if 'l1b' in phases else None
     args.write_level_index = LEVELS.index(args.write_level)
 
-    def rebuild() -> dict:
+    # level-1 field sizes: the nominal size, or with a range (``--field A=4:16``) one drawn
+    # log-uniformly every ``--refield-every`` steps from (seed, step), so resume is exact
+    nominal = {s: superpose.field_size(s) for s in SPACES} if superpose else {}
+    ranged = bool(views) and any(lo < hi for lo, hi in
+                                 (superpose.field_range(s) for s in SPACES))
+    fields_now = dict(nominal)
+
+    def rebuild(fields: dict | None = None) -> dict:
         """Fields from the leaves' and rows' current keys (``--rows-from-stack``)."""
-        return {name: view.rebuild(step) for name, view in views.items()}
+        chosen = fields or fields_now
+        return {name: view.rebuild(step, fields={s: f for s, f in chosen.items()
+                                                 if s in view.rows})
+                for name, view in views.items()}
+
+    def refield() -> None:
+        nonlocal fields_now
+        draw = random.Random(f'{args.seed}:field:{step}')
+        fields_now = {s: superpose.sample_field(s, draw) for s in SPACES}
+        for view in views.values():
+            view.refield({s: f for s, f in fields_now.items() if s in view.graphs}, step)
+            view.rekey()
 
     budgets = rebuild() if views else None
 
@@ -1652,6 +1670,11 @@ def train(args) -> None:
             rekey()
         if views and superpose.graph_every and step % superpose.graph_every == 0:
             rebuild()
+        elif ranged and args.refield_every and step % args.refield_every == 0:
+            refield()
+        if ranged:
+            for s, f in fields_now.items():
+                window.setdefault(f'field_{s}', []).append(f)
         if anchor is not None and args.anchor_every and step % args.anchor_every == 0:
             anchor.refresh(step)
         if step % args.log_every == 0:
@@ -1665,7 +1688,7 @@ def train(args) -> None:
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
             rekey()
             if views:
-                rebuild()
+                rebuild(nominal)       # evaluations at the nominal field size
             save()
             reader.eval()
             log_record({'step': step, 'eval': run_eval()})
@@ -1724,6 +1747,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                           'every checkpoint)')
     sup.add_argument('--max-positives', type=int,
                      help='--rows-from-stack: covering rows kept as retrieval positives (8)')
+    sup.add_argument('--refield-every', type=int, default=10,
+                     help='--rows-from-stack with a --field range: draw new level-1 field '
+                     'sizes every N steps (10)')
+    sup.add_argument('--write-balance', type=float, default=0.01,
+                     help='--rows-from-stack: balance loss on the rows\' write loads (0.01)')
     sup.add_argument('--unbatched', action='store_true',
                      help='aggregators row by row (the reference path; default: all rows of a '
                      'level in one pass)')
