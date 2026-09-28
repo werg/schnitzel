@@ -124,6 +124,75 @@ retained producer IDs and experimental/original ordering type. These metadata ar
 not writer inputs. Training validates unique episode IDs and consistent source IDs,
 hashes input files, then uses offsets rather than keeping every episode's text in RAM.
 
+## Task corpus: parallel-version recall
+
+`scripts/prepare_task_corpora.py parallel-recall` builds `tasks-parallel-recall-<date>`
+in the task-corpus schema. `scripts/prepare_memory_transcripts.py` turns it into
+`memory-parallel-recall-<tag>` transcripts (format 3). The generator is
+`schnitz.parallel_recall` and its tests are in `tests/test_parallel_recall.py`. The task
+is a knowledge probe whose KB holds many *versions of the same content*. The target
+has high entropy for the model alone but is nearly determined by the KB.
+
+- **Data.** Verse-aligned CSVs of public-domain (or CC0) Bible translations from
+  [scrollmapper/bible_databases](https://github.com/scrollmapper/bible_databases):
+  `master` at `e1b254c` (2026-07-10), and the legacy `2024` branch at `19e9663` for
+  the World English Bible. The raw files are in `/archive/raw/parallel-20260928/`
+  (host `/mnt/external/sdkb-archive/raw/...`). Its README lists each version's
+  declared licence and the versions skipped (non-PD, or PD status unclear).
+  `schnitz.parallel_recall.VERSIONS` lists the 25 English and 22 French, German,
+  Spanish, Chinese and Japanese versions obtained. No Arabic version is available
+  in the source.
+- **KB records** (`kind: parallel_passage`, `created_at` 1). Each record is a run
+  of 4-10 consecutive verses of one chapter, at most `RECORD_CHARS` (1500)
+  characters, headed `<title> [<code>], <Book> <c>:<v1>-<v2>`, one numbered verse
+  per line. Chunk boundaries are drawn per version. Text cleaning removes footnotes
+  (`{...}`), tags and italic brackets. A version keeps a book only if at least 90%
+  of the book's chapters have the reference (KJV) verse count. It keeps a chapter
+  only if the chapter's count matches, and for English only if the text lines up
+  verse by verse. This removes, for example, Vulgate-numbered Psalms (DRC, CPDV) and
+  the JPS books with Hebrew numbering. The stored versions come from `--versions`,
+  or else all versions of `--kb-languages` (default `en`). The KB stores the whole
+  text of every stored version, including passages no episode uses.
+- **Targets** (`--target-versions`, default `WEB BBE`) are modern, less-memorized
+  translations. They are **never stored**, so no record contains a target. An
+  episode is also rejected (`target_in_kb`) if any stored version equals the target
+  word for word over the whole range.
+- **Episodes.** A target is a run of consecutive verses in one chapter of 64-200
+  tokens (LFM2.5 tokenizer with `--tokenizer`, otherwise characters/4), one numbered
+  verse per line. There are two query modes. `reference`: "Give <Book c:v1-v2> in the
+  <title> (<code>) wording". `continuation`: the target version's preceding verse is
+  quoted and the next N verses are asked for, without a reference. In `supports`,
+  each covering stored version's overlapping records form one `sufficient_groups`
+  entry. `required_ids` is their union. `redundancy` is the number of covering
+  versions (`--min-versions`, default 3). `provenance` records `covering_versions`,
+  `verbatim_verses` (target verses that some stored version has word for word),
+  `nearest_version` / `nearest_similarity` (word-sequence ratio) and `target_tokens`.
+- **Split** by chapter: about 10% of chapters (hashed) are validation. Validation
+  passages are never trained on, although their other versions are in the KB.
+- **Transcripts.** The builder searches once per covering translation (`kind`
+  `parallel_passage`, space hint `fine`), all before the answer. With the v3
+  defaults, 30% of the multi-call sites are split into sequential calls. There are no
+  write sites, and the role line is "Other translations of the requested text are in
+  the knowledge base."
+
+Built 28 September (`tasks-parallel-recall-20260928`, `memory-parallel-recall-20260928v3`,
+same transcript options as the other v3 corpora, LFM2.5-350M render check on 200 per
+split):
+
+- The KB has 23 English versions and 90,651 records.
+- There are 4000 train episodes (712 chapters) and 300 validation episodes (54 of the
+  119 validation chapters), half WEB and half BBE. 47% are continuation queries.
+- Redundancy is 11-22 (median 17). Old-Testament passages are covered by about 16-18
+  versions and New-Testament passages by 20-22.
+- Target length: quartiles of 92/111/131 tokens.
+- How close the nearest stored version comes differs by target. For WEB the median
+  similarity is 0.97, because its derivative NHEB is stored. For BBE it is 0.60,
+  because no stored version is close to it. Use `--versions` without `NHEB-JE
+  NHEB-ME` for a harder WEB condition. 19% of target verses appear verbatim in some
+  stored version.
+- Transcripts average 17.7 `memory_search()` calls per episode, with about 23 slot
+  records.
+
 ## Stored-only measurement
 
 Evaluation has a separate write phase, serializes payload precision, reopens the bank,

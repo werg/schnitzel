@@ -903,3 +903,12 @@ log your decisions and changes of direction"), newest last.
   real corpora serve. A synthetic fictional-people world (32 vs 4 records per fact)
   is being built as a controlled redundancy knob; high redundancy is expected to be
   key to learning content use.
+- 28 September: parallel-version recall (`tasks-parallel-recall-20260928`,
+  `memory-parallel-recall-20260928v3`) as the high-redundancy, high-target-entropy
+  probe. The KB holds 23 public-domain English Bible translations (90,651 passages);
+  an episode asks for 64-200 tokens of the World English Bible or the Bible in Basic
+  English, which are never stored, and 13-22 stored translations cover every target
+  (median 17). The wording is hard to guess without the KB and nearly fixed by it
+  (nearest stored version: median word-sequence similarity 0.97 for WEB, whose
+  derivative NHEB is stored, 0.60 for BBE, which has no close relative). Split by chapter.
+  4000/300 episodes, one `memory_search()` per covering translation.
