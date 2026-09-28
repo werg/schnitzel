@@ -1,4 +1,4 @@
-"""Memory-protocol chat transcripts for LFM2, version 2 (knowledge-base stack WP3, restart
+"""Memory-protocol chat transcripts for LFM2, version 3 (knowledge-base stack WP3, restart
 plan 3.2).
 
 Every episode of an R6 or task corpus becomes one LFM2 chat transcript in the
@@ -18,8 +18,14 @@ structured form ``tok.apply_chat_template(messages, tools=tools)`` renders:
 - the answer: an ``assistant`` message (text, or native tool calls for function
   calling); multi-turn corpora keep their ``turns`` (customers and observations as
   ``user``, API results as ``tool``, agent API calls as native tool calls);
-- write sites (``--writes``): a final ``memory_write(content=...)`` call with text
-  content and a ``tool`` ack.
+- write sites (``--writes``): a final ``assistant`` message with a ``memory_write()``
+  call WITHOUT arguments and a ``write_span`` field: in the same assistant turn the
+  model generates a ``<|bg|>`` ... ``<|/bg|>`` span itself (owner, 28 Sep: single-pass
+  latent writes). The renderer puts the placeholder ``<|bg|><|/bg|>`` right after the
+  call, inside the assistant turn (the trainer fills the reps; the open and close
+  decisions carry loss, the reps no token loss). The text a write should hold is kept
+  only in ``write_sites[i]["teacher_text"]``, a teacher target for B4 distillation that
+  is never rendered into the trained tokens. A ``tool`` ack follows.
 
 Which records a search returns comes from the source episode (``required_ids``, the
 first valid ``sufficient_groups`` entry for R6, related ``supports`` such as column
@@ -58,15 +64,17 @@ Placement (trajectories), per record; a site sits right before the agent turn
   (``observation_failure``).
 
 The ``action_*`` triggers place a search before the agent's own next action (as
-the tool-doc placement of version 1): the decision uses the record's identity and
-the step the agent takes next, never an observation or answer the agent has not
-seen; the call itself carries no text, and everything before it is the unchanged
+the tool-doc placement of version 1): the placement is label-side, a demonstration
+of when to call, like tool-call placement in SFT (accepted by the owner, 28 Sep);
+the call itself carries no content, and everything before it is the unchanged
 causal prefix. ``observation_failure`` uses only the prefix.
 
-Enforced checks (counts in ``manifest.json``): every ``memory_search`` call has empty
-arguments; every slot record exists in the episode's KB (``sources.jsonl`` of the
-corpus; for R6 each dataset domain is its own KB) with ``created_at`` before the
-episode's ``query_time`` and in the transcript's KB; slots never contain a record
+Enforced checks (counts in ``manifest.json``): every ``memory_search`` and
+``memory_write`` call has empty arguments, every write has a ``write_span`` and a
+``write_sites`` entry whose teacher text appears in no message; every slot record
+exists in the episode's KB (``sources.jsonl`` of the corpus; for R6 each dataset
+domain is its own KB) with ``created_at`` before the episode's ``query_time`` and in
+the transcript's KB; slots never contain a record
 that copies the episode's own long answer (its gold trajectory) unless it is an
 explicit ``--gold-slots`` record (train only, flagged ``gold`` with a
 ``receding_weight``, restart plan B9); validation and test transcripts never
@@ -77,8 +85,9 @@ later turns that the request lacks. Output is deterministic (per-episode RNG fro
 ``--seed`` and the episode id) and hashed in the manifest.
 
 Loss policy: every assistant message (content and tool calls, including
-``memory_search`` and ``memory_write`` calls) gets loss; system, user and tool
-content never does. The LFM2 template marks assistant spans with
+``memory_search`` and ``memory_write`` calls and the write span's ``<|bg|>`` and
+``<|/bg|>``; the reps between them have no token loss) gets loss; system, user and
+tool content never does. The LFM2 template marks assistant spans with
 ``{% generation %}``.
 """
 from __future__ import annotations
@@ -96,7 +105,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS  # noqa: E402
 
-FORMAT = 2
+FORMAT = 3
 NGRAM = 5
 OWN_GOLD_TOKENS = 12        # answers shorter than this are not checked for copies
 OWN_GOLD_OVERLAP = 0.5      # share of a record's 8-grams inside the answer = a copy
@@ -124,7 +133,7 @@ ROLE = {
     'text_to_sql': 'Database schemas, column values and notes are in the knowledge base.',
     'stored_table_qa': 'Database contents are in the knowledge base.',
 }
-WRITE_POLICY = 'When the task is done, store reusable results with memory_write.'
+WRITE_POLICY = 'When the task is done, store reusable results with memory_write().'
 
 # search stages, in order; kinds of one stage share a site
 STAGES = (('protocol', 'policy', 'rules'), ('schema',), ('column_values', 'table_rows'),
@@ -380,14 +389,48 @@ def is_memory(message: dict) -> bool:
                                for tc in calls)
 
 
+WRITE_CALL = '[memory_write()]<|tool_call_end|>'
+WRITE_FILL = SPAN_TOKENS['bg'][0] + SPAN_TOKENS['bg_end'][0]
+
+
+def _shown(messages: list[dict], fill: str) -> list[dict]:
+    return [{**m, 'content': fill} if isinstance(m.get('content'), dict) and 'slot' in m['content']
+            else m for m in messages]
+
+
 def render_text(messages: list[dict], tools: list[dict], tok,
                 slot_text: str | None = None) -> str:
-    """Render through the tokenizer's chat template with every slot replaced by an
-    empty ``<|mem|><|/mem|>`` pair (the trainer puts the latent span between them)."""
+    """Render through the tokenizer's chat template with every search slot replaced by
+    an empty ``<|mem|><|/mem|>`` pair and an empty ``<|bg|><|/bg|>`` write span right
+    after every ``memory_write()`` call, in the same assistant turn (the trainer puts
+    the latent spans between them)."""
     fill = slot_text or SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
-    shown = [{**m, 'content': fill} if isinstance(m.get('content'), dict) and 'slot' in m['content']
-             else m for m in messages]
-    return tok.apply_chat_template(shown, tools=tools, tokenize=False)
+    text = tok.apply_chat_template(_shown(messages, fill), tools=tools, tokenize=False)
+    return text.replace(WRITE_CALL + '<|im_end|>', WRITE_CALL + WRITE_FILL + '<|im_end|>')
+
+
+def render_ids(tok, messages: list[dict], tools: list[dict]) -> tuple[list[int], list[int]]:
+    """Token ids and assistant (loss) mask of ``render_text``: the template's own mask,
+    with the ``<|bg|>``/``<|/bg|>`` pair of each write span inserted after the call's
+    ``<|tool_call_end|>`` inside the assistant turn (both in the loss)."""
+    fill = SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
+    out = tok.apply_chat_template(_shown(messages, fill), tools=tools, tokenize=True,
+                                  return_dict=True, return_assistant_tokens_mask=True)
+    ids, mask = list(out['input_ids']), list(out['assistant_masks'])
+    call_start = tok.convert_tokens_to_ids('<|tool_call_start|>')
+    call_end = tok.convert_tokens_to_ids('<|tool_call_end|>')
+    new_ids, new_mask, opened = [], [], None
+    for i, (t, m) in enumerate(zip(ids, mask)):
+        new_ids.append(t)
+        new_mask.append(m)
+        if t == call_start:
+            opened = i
+        elif t == call_end and opened is not None:
+            if tok.decode(ids[opened + 1:i]) == '[memory_write()]':
+                new_ids += [SPAN_TOKENS['bg'][1], SPAN_TOKENS['bg_end'][1]]
+                new_mask += [m, m]
+            opened = None
+    return new_ids, new_mask
 
 
 def render_check(tok, row: dict) -> Counter:
@@ -397,12 +440,9 @@ def render_check(tok, row: dict) -> Counter:
     memory call inside it and no system, user or tool token in it."""
     bad: Counter = Counter()
     messages, tools = row['messages'], row['tools']
-    fill = SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
-    shown = [{**m, 'content': fill} if isinstance(m.get('content'), dict) and 'slot' in m['content']
-             else m for m in messages]
-    out = tok.apply_chat_template(shown, tools=tools, tokenize=True, return_dict=True,
-                                  return_assistant_tokens_mask=True)
-    ids, mask = out['input_ids'], out['assistant_masks']
+    ids, mask = render_ids(tok, messages, tools)
+    if tok.decode(ids) != render_text(messages, tools, tok):
+        bad['render_ids_text_mismatch'] += 1
     slots = sum(isinstance(m.get('content'), dict) and 'slot' in m['content'] for m in messages)
     mem = [i for i, t in enumerate(ids) if t in (SPAN_TOKENS['mem'][1], SPAN_TOKENS['mem_end'][1])]
     if len(mem) != 2 * slots:
@@ -421,8 +461,16 @@ def render_check(tok, row: dict) -> Counter:
         bad['memory_search_not_empty_in_loss'] += 1
     writes = sum(tc['function']['name'] == 'memory_write' for m in messages
                  for tc in m.get('tool_calls') or [])
-    if trained.count('memory_write(') != writes:
-        bad['memory_write_not_in_loss'] += 1
+    if trained.count(WRITE_CALL + WRITE_FILL) != writes or \
+            text.count('memory_write(') != text.count('memory_write()'):
+        bad['memory_write_not_empty_with_span_in_loss'] += 1
+    spans = [i for i, t in enumerate(ids) if t in (SPAN_TOKENS['bg'][1], SPAN_TOKENS['bg_end'][1])]
+    if len(spans) != 2 * writes or not all(mask[i] for i in spans):
+        bad['write_span_tokens'] += 1
+    for site in row.get('write_sites') or []:
+        teacher = site.get('teacher_text') or ''
+        if teacher and clean(teacher) in clean(text):
+            bad['teacher_text_rendered'] += 1
     start, end = tok.convert_tokens_to_ids('<|im_start|>'), tok.convert_tokens_to_ids('<|im_end|>')
     role = None
     for i, t in enumerate(ids):
@@ -892,11 +940,13 @@ class Builder:
 
         write_sites = []
         if content:
-            messages.append({'role': 'assistant', 'content': '', 'tool_calls': [call(
-                'memory_write', {'content': content})]})
+            messages.append({'role': 'assistant', 'content': '',
+                             'tool_calls': [call('memory_write', {})],
+                             'write_span': {'kb': kb, 'write_site': len(write_sites)}})
             source_index.append(None)
             write_sites.append({'message': len(messages) - 1, 'call': 0, 'site': 'episode_end',
-                                'source': 'own_trajectory' if turns else 'own_result'})
+                                'source': 'own_trajectory' if turns else 'own_result',
+                                'teacher_text': content})
             messages.append({'role': 'tool', 'name': 'memory_write',
                              'content': {'write_result': {'kb': kb, 'status': 'stored'}}})
             source_index.append(None)
@@ -935,6 +985,23 @@ class Builder:
         """Independent re-check of a finished transcript; returns violations."""
         bad: Counter = Counter()
         messages = row['messages']
+        # writes: memory_write() without arguments and a write span; the teacher text
+        # lives only in write_sites and appears in no message
+        visible = json.dumps(messages, ensure_ascii=False)
+        for site in row.get('write_sites') or []:
+            m = messages[site['message']]
+            calls = m.get('tool_calls') or []
+            if len(calls) != 1 or calls[0]['function']['name'] != 'memory_write' or \
+                    calls[0]['function']['arguments'] or 'write_span' not in m or \
+                    m['role'] != 'assistant':
+                bad['write_site_malformed'] += 1
+            teacher = site.get('teacher_text') or ''
+            if teacher and json.dumps(teacher, ensure_ascii=False)[1:-1] in visible:
+                bad['teacher_text_in_messages'] += 1
+        n_writes = sum(tc['function']['name'] == 'memory_write' for m in messages
+                       for tc in m.get('tool_calls') or [])
+        if n_writes != len(row.get('write_sites') or []):
+            bad['write_without_site'] += 1
         for i, m in enumerate(messages):
             for j, tc in enumerate(m.get('tool_calls') or []):
                 if tc['function']['name'] != 'memory_search':
@@ -1093,6 +1160,10 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
                             'example_reads': options.example_reads, 'limit': limit},
                 'memory_tools': [t['name'] for t in MEMORY_TOOLS],
                 'memory_search_arguments': 'none (query = hidden state at the call)',
+                'memory_write_arguments': 'none (the model generates a <|bg|> span in the '
+                                          'same turn; teacher_text in write_sites only)',
+                'write_render': f'[memory_write()] {SPAN_TOKENS["bg"][0]} latent span '
+                                f'{SPAN_TOKENS["bg_end"][0]} (same assistant turn)',
                 'slot_render': f'{SPAN_TOKENS["mem"][0]} latent span {SPAN_TOKENS["mem_end"][0]}',
                 'loss_mask': LOSS_POLICY, 'splits': summary, 'sha256': digests}
     (tmp / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -1108,7 +1179,7 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('corpora', nargs='+', type=Path, help='corpus directories')
     parser.add_argument('--output-root', type=Path, required=True)
-    parser.add_argument('--tag', default='20260928v2', help='tag of output directories')
+    parser.add_argument('--tag', default='20260928v3', help='tag of output directories')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--distractor-rate', type=float, default=0.0,
                         help='share of episodes with one unhelpful search (default off)')
