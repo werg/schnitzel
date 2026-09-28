@@ -327,11 +327,13 @@ inputs are. Training data is regenerated where the format changes (owner:
   results as latent slots filled at training time, and `memory_write` calls;
   checks that results only contain records that exist before the call and that
   query text never leaks the answer.
-- **WP4 - Evaluation** (`scripts/evaluate_kb.py`). Superposition metrics (sources
-  per item, items per source, effective items per read), KB-dependence tests
-  (edited, removed and inserted knowledge), and a benchmark runner for
+- **WP4 - Evaluation**. Superposition metrics (sources per item, items per
+  source, effective items per read, retention), KB-dependence tests (edited,
+  removed and inserted knowledge) and content-over-shuffled helpers are built in
+  `src/schnitz/kb_eval.py` (pure, tested); the benchmark runner for
   LFM2.5-8B-A1B, Ling-3.0-tiny and LFM2-24B-A2B on the task corpora with their
-  verifiers.
+  verifiers is `scripts/benchmark_models.py` (smoke-tested with LFM2.5-350M and
+  1.2B-Instruct; the large-model runs are pending).
 - **WP5 - Stack training after K1**: K2 key and query heads, K3a warm-up of S_s,
   the L1 read path (retrieve per space, gates from similarity, S_s, R, `<|mem|>`
   span).
