@@ -239,18 +239,10 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
    at its own key), with L1's items as targets instead of self-reconstruction.
    Afterwards the producers derive superposed items live from a new corpus.
    S_s can also be distilled on L1's rewriting trajectories.
-8. **Recurrence pilot.** The decoder converted to prelude / looped core / coda
-   (`recurrence.md`): the prelude runs uninformed, the query comes from
-   processed states, later core passes see the read results (multi-hop within a
-   step, depth without parameters). It costs core share × extra passes in
-   training FLOPs per token (6 of 16 layers looped: +37.5% for two passes, +75%
-   for three), plus a bridge from span format into the core's residual stream.
-   Compared with between-token reads at matched compute on multi-hop and agent
-   tasks; adopted if it wins.
-9. **B9 loops and continual learning.** Multi-round attempts written back into
+8. **B9 loops and continual learning.** Multi-round attempts written back into
    the per-dataset KBs; new corpora enter through the producers; periodic
    rewriting; the KB-dependence tests (section 5.2).
-10. **Later:** teacher distillation (section 1.1) and joint co-training of the
+9. **Later:** teacher distillation (section 1.1) and joint co-training of the
     decoder with the stack under replay.
 
 ### 5.2 Standing requirements
@@ -283,8 +275,11 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
 - B5 (keys, query diversity) becomes K2 and L1's routing, per space; the query
   diversity measures (several queries per site, coverage discount, repulsion,
   exploration) carry over unchanged.
-- B6 (reads) is L1's read path; reads at loop boundaries return with the
-  recurrence pilot.
+- B6 (reads) is L1's read path. Recurrence (reads between looped core passes) is
+  dropped (owner, 28 September): it costs 37-75% more training FLOPs per token plus
+  its own conversion phase, and buys quality per parameter rather than per
+  training FLOP; between-token reads with a mid-layer query already overlap
+  retrieval with computation, and multi-hop happens across read sites.
 - B9 (recursive improvement) stores its trajectories through the writer and this
   stack; one persistent KB per dataset. Rewriting only mixes items within one KB
   (one authorization domain), and learned selection is never used as
@@ -314,5 +309,5 @@ are the levers; the dense per-pair form is kept on purpose.
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
 | K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
 | K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
-| L1, L2, recurrence pilot | not built |
+| L1, L2 | not built |
 | Teacher distributions | later phase; cache script smoke-tested (LFM2.5-1.2B-Base, 300 records: mass sums to 1, true token in the top 32 for 84% of positions); models in `/home/werg/sdkb-runs/hf-models` |

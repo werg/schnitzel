@@ -223,8 +223,8 @@ checkpoint 1000).
 *Several, diverse queries per read site (owner, 27 September).* R5 queried every
 space at two of its three loop boundaries (8 queries per read site) but nothing
 kept those queries apart, so later loops could repeat the first query. From B5 on:
-(1) one query per loop boundary and space plus 2 query heads per space, later
-loops conditioned on what was read (multi-hop bridges); (2) coverage over
+(1) several query heads per space at each read site, and later read sites
+conditioned on what earlier ones read (multi-hop across sites); (2) coverage over
 repetition - within a site, a record already retrieved by an earlier query gets a
 discounted gate in the superposition operator, and the query set is trained on union recall of a
 sufficient group; (3) a margin-hinged repulsion between one site's query vectors;
@@ -236,8 +236,8 @@ distinct records per site, union recall, pairwise query similarity.
 **B6 — Reads.** A read retrieves a neighbourhood per KB space, combines each
 with that space's superposition operator and the spaces with the recombiner
 ([knowledge-base stack](knowledge-base-stack.md)), and splices the resulting
-span into the read workspace at the loop boundary, instead of the MLP reader's
-fixed slots. Build the bank by frozen-writer generation and the forward codecs;
+span after the read position (between tokens; the query comes from a middle
+layer's state there), instead of the MLP reader's fixed slots. Build the bank by frozen-writer generation and the forward codecs;
 train reading with retrieval.
 Gate: memory-vs-text probe fraction far above R5d5's 5%; invented-passage
 fraction above 50% at x4.
@@ -368,7 +368,9 @@ datasets) and periodic memory-use evaluation.
 
 1. Dense compression, above x4, scaled with input size; logarithmic output sizes
    after distillation (3.3).
-2. Recurrent loops are kept: reads happen at loop boundaries as in R5.
+2. ~~Recurrent loops are kept: reads happen at loop boundaries as in R5.~~
+   Dropped 28 September (owner, training compute efficiency; decision log):
+   reads happen between tokens.
 3. Reads are gated. Retrieved items pass through the per-space superposition operators and
    the recombiner of the knowledge-base stack, which produce the spliced read
    span; raw rep sequences are not spliced unweighted. Gates only modulate mass.
@@ -498,3 +500,11 @@ log your decisions and changes of direction"), newest last.
   looped core passes, owner's preference) follows as a pilot against it at
   matched compute. One KB per dataset; "retrieval bank" and "agentic KB" are the
   same kind of KB with different tasks.
+- **28 Sep, recurrence dropped (owner criterion: training compute efficiency).**
+  Looping 6 of 16 layers costs +37.5% (two passes) to +75% (three) training
+  FLOPs per token, plus a conversion phase for the BGKit decoder before it even
+  matches one pass; its gains are quality per resident parameter and multi-hop
+  within one step, not quality per training FLOP, and the R-series never showed
+  a matched gain. Between-token reads with a mid-layer query keep the overlap of
+  retrieval with computation at no extra cost; multi-hop happens across read
+  sites. The recurrence pilot is removed from the plan.
