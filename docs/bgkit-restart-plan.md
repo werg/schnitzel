@@ -883,3 +883,7 @@ log your decisions and changes of direction"), newest last.
   rows are close to free rows (captured 0.716 vs 0.775 after 20 joint steps) at five
   times the step cost (30-37 s against 6-7 s), because the aggregators run one small
   call per row and level; batching them per level is next.
+- 28 September: a long read phase on its own run (`kb-read-long`), because 30 smoke
+  steps moved the rows only about 1%. It uses 300 transcripts per corpus, 2000 read
+  steps and item lr 3e-2 (10x the smoke's), with row and key drift evaluated every 250
+  steps. The write fit then runs on the drifted rows.
