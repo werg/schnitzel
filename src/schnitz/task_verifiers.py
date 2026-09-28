@@ -8,7 +8,10 @@ parsing failures count as wrong, never as errors.
   canonical JSON; calls may be a JSON list or LFM2's native Python-style list
   (``<|tool_call_start|>[f(a=1), g(b="x")]<|tool_call_end|>``);
 - SQL: both queries executed read-only on the task's SQLite database with a time
-  limit; result rows compared as multisets (order-insensitive, as BIRD scores);
+  limit; result rows compared as multisets (order-insensitive, as BIRD scores); a
+  schema-aliased episode (``verify['alias']``, ``schnitz.sql_alias``) maps both queries
+  back to the original names with the variant's inverse and runs them on the original
+  database, and an answer naming an original identifier that is not an alias fails;
 - code: the candidate written to ``solution.py`` beside the task's pytest file,
   or run on stdin/stdout cases, in a sandboxed subprocess (``run_sandboxed``: its
   own temporary working directory and session, wall-time, CPU, data-segment (heap) and
@@ -145,9 +148,19 @@ def run_sql(db_path: Path, sql: str, timeout: float = 10.0):
         con.close()
 
 
-def sql_match(prediction: str, gold_sql: str, db_path: Path, timeout: float = 10.0) -> bool:
-    """Executing the predicted SQL gives the gold result rows (as a multiset)."""
-    predicted = run_sql(db_path, extract_block(prediction, 'sql'), timeout)
+def sql_match(prediction: str, gold_sql: str, db_path: Path, timeout: float = 10.0,
+              inverse: dict[str, str] | None = None) -> bool:
+    """Executing the predicted SQL gives the gold result rows (as a multiset). With
+    ``inverse`` (an aliased variant: fresh name in lower case -> original name) both
+    queries are renamed back before they run on the original database."""
+    sql = extract_block(prediction, 'sql')
+    if inverse:
+        from schnitz.sql_alias import rename_sql, unmapped_originals
+        if unmapped_originals(sql, inverse):
+            return False             # guessed the original schema instead of reading it
+        sql = rename_sql(sql, inverse, strict=False)
+        gold_sql = rename_sql(gold_sql, inverse, strict=False)
+    predicted = run_sql(db_path, sql, timeout)
     if predicted is None:
         return False
     expected = run_sql(db_path, gold_sql, timeout)
@@ -708,7 +721,8 @@ def check_episode(prediction: str, verify: dict) -> bool:
     if kind == 'calls':
         return call_match(prediction, verify['gold'])
     if kind == 'sql':
-        return sql_match(prediction, verify['gold'], Path(verify['db']))
+        return sql_match(prediction, verify['gold'], Path(verify['db']),
+                         inverse=(verify.get('alias') or {}).get('inverse'))
     if kind == 'code':
         return code_match(prediction, verify['test'], verify['style'])
     if kind == 'knights':

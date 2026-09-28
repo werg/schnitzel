@@ -13,12 +13,18 @@ answer depends on; ``supports`` add the causally available related records.
 Records are created before every query (``created_at`` 1, queries at 2); none is
 built from a teacher answer except worked examples, which come from *other*
 (training) tasks and are marked ``kind: worked_example``.
+
+Spider and BIRD take ``--alias-variants N``: schema-aliased variants of every
+database (``schnitz.sql_alias``; docs/bgkit-restart-plan.md, B9 corpora), so the
+identifiers a query needs come from the KB rather than from the question.
 """
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import csv
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -28,9 +34,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from public_corpus_common import Writer, clean, record_id  # noqa: E402
 
+from schnitz.sql_alias import rename_create, rename_text  # noqa: E402
 from schnitz.task_verifiers import run_sql  # noqa: E402
 
-RAW = Path('/archive/raw')
+RAW = Path(os.environ.get('SCHNITZ_RAW', '/archive/raw'))
 RECORD_CHARS = 1500
 
 
@@ -137,59 +144,138 @@ def _describe(db_dir: Path, table: str) -> dict[str, str]:
     return notes
 
 
-def database_records(domain: str, db_id: str, db_path: Path, *, full_rows: int,
-                     sample_rows: int, value_limit: int) -> dict[str, list[dict]]:
-    """Records of one database, by lower-case table name: schema (with column
-    descriptions), value lists of low-cardinality text columns, and rows (all rows
-    of tables up to ``full_rows`` rows, else a ``sample_rows`` sample)."""
+def database_contents(db_path: Path, *, full_rows: int, sample_rows: int,
+                      value_limit: int) -> list[dict]:
+    """What the records of one database show, read once: per table its CREATE text,
+    columns, BIRD column descriptions, value lists of low-cardinality text columns and
+    rows (all rows of tables up to ``full_rows`` rows, else a ``sample_rows`` sample)."""
     con = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     con.text_factory = _lenient
-    out: dict[str, list[dict]] = {}
+    out = []
     tables = [(n, s) for n, s in con.execute(
         "select name, sql from sqlite_master where type='table' and sql is not null")]
     for table, create in tables:
         notes = _describe(db_path.parent, table)
         columns = [(r[1], r[2]) for r in con.execute(f'pragma table_info("{table}")')]
-        described = [f'- {c} ({t}): {notes[c.lower()]}' for c, t in columns if c.lower() in notes]
-        text = f'Database {db_id}, table {table}:\n{create.strip()}'
-        if described:
-            text += '\nColumn notes:\n' + '\n'.join(described)
-        recs = [record(domain, part, 'schema', db=db_id, table=table)
-                for part in pack(f'Database {db_id}, table {table} (schema):\n',
-                                 text.split('\n')[1:])]
         count = con.execute(f'select count(*) from "{table}"').fetchone()[0]
+        values = []
         for column, kind in columns:
             if 'char' not in (kind or '').lower() and 'text' not in (kind or '').lower():
                 continue
-            values = [v for (v,) in con.execute(
+            found = [v for (v,) in con.execute(
                 f'select distinct "{column}" from "{table}" where "{column}" is not null '
                 f'limit {value_limit + 1}')]
-            if 0 < len(values) <= value_limit:
-                recs += [record(domain, part, 'column_values', db=db_id, table=table, column=column)
-                         for part in pack(f'Database {db_id}, values of {table}.{column}:\n',
-                                          [repr(v) for v in values])]
-        names = ', '.join(c for c, _ in columns)
+            if 0 < len(found) <= value_limit:
+                values.append((column, found))
         limit = full_rows if count <= full_rows else sample_rows
         rows = con.execute(f'select * from "{table}" limit {limit}').fetchall()
         label = 'all rows' if count <= full_rows else f'{len(rows)} of {count} rows'
-        recs += [record(domain, part, 'table_rows', db=db_id, table=table, rows=count)
-                 for part in pack(f'Database {db_id}, table {table} ({label}; columns {names}):\n',
-                                  [repr(tuple(r)) for r in rows])]
-        out[table.lower()] = recs
+        out.append({'table': table, 'create': create, 'columns': columns, 'notes': notes,
+                    'count': count, 'values': values, 'rows': rows, 'label': label})
     con.close()
     return out
 
 
-def _tables_in(sql: str, tables: set[str]) -> list[str]:
+def render_database(domain: str, db_id: str, contents: list[dict],
+                    alias: dict | None = None) -> dict[str, list[dict]]:
+    """Records of one database, by lower-case (original) table name: schema (with column
+    descriptions), value lists and rows. ``alias`` (``--alias-variants``): ``db`` (the
+    variant's handle), ``names`` (lower-case original -> fresh name, ``sql_alias``) and
+    ``variant``; every identifier is renamed and the provenance keeps the originals."""
+    names = alias['names'] if alias else {}
+
+    def name(original: str) -> str:
+        return names.get(original.lower(), original)
+
+    handle = alias['db'] if alias else db_id
+
+    def prov(table: str, column: str | None = None, **extra) -> dict:
+        out = {'db': handle, 'table': name(table)}
+        if column is not None:
+            out['column'] = name(column)
+        out.update(extra)
+        if alias:
+            out.update({'original_db': db_id, 'original_table': table,
+                        **({'original_column': column} if column is not None else {}),
+                        'alias_variant': alias['variant']})
+        return out
+
+    out: dict[str, list[dict]] = {}
+    for info in contents:
+        table, columns, notes = info['table'], info['columns'], info['notes']
+        create = info['create'].strip()
+        if alias:
+            create = rename_create(create, names)
+        described = [f'- {name(c)} ({t}): '
+                     f'{rename_text(notes[c.lower()], names) if alias else notes[c.lower()]}'
+                     for c, t in columns if c.lower() in notes]
+        text = f'Database {handle}, table {name(table)}:\n{create}'
+        if described:
+            text += '\nColumn notes:\n' + '\n'.join(described)
+        recs = [record(domain, part, 'schema', **prov(table))
+                for part in pack(f'Database {handle}, table {name(table)} (schema):\n',
+                                 text.split('\n')[1:])]
+        for column, values in info['values']:
+            recs += [record(domain, part, 'column_values', **prov(table, column))
+                     for part in pack(f'Database {handle}, values of {name(table)}.{name(column)}:\n',
+                                      [repr(v) for v in values])]
+        header = ', '.join(name(c) for c, _ in columns)
+        recs += [record(domain, part, 'table_rows', **prov(table, rows=info['count']))
+                 for part in pack(f'Database {handle}, table {name(table)} ({info["label"]}; '
+                                  f'columns {header}):\n', [repr(tuple(r)) for r in info['rows']])]
+        out[table.lower()] = recs
+    return out
+
+
+def database_records(domain: str, db_id: str, db_path: Path, *, full_rows: int,
+                     sample_rows: int, value_limit: int) -> dict[str, list[dict]]:
+    """Records of one database, by lower-case table name (``render_database``)."""
+    return render_database(domain, db_id, database_contents(
+        db_path, full_rows=full_rows, sample_rows=sample_rows, value_limit=value_limit))
+
+
+def _tables_in(sql: str, tables: Iterable[str]) -> list[str]:
     """Tables named in ``sql``: quoted identifiers (backticks, double quotes, brackets)
-    or bare words, matched case-insensitively."""
+    or bare words, matched case-insensitively; in ``tables`` order (deterministic)."""
     words = {next(g for g in m if g).lower()
              for m in re.findall(r'`([^`]+)`|"([^"]+)"|\[([^\]]+)\]|(\w+)', sql)}
     return [t for t in tables if t in words]
 
 
+def _variants(domain: str, db_id: str, contents: list[dict], count: int, style: str,
+              handle: str, seed: int, handles: set[str]) -> list[dict]:
+    """``count`` aliased variants of one database (``schnitz.sql_alias``): fresh names
+    per variant, the handle, the inverse mapping and the rendered records. ``count`` 0
+    with an opaque handle: one variant renaming only the database id."""
+    from schnitz.sql_alias import alias_db, alias_names, inverse_of
+    tables = {info['table']: [c for c, _ in info['columns']] for info in contents}
+    spelled = {n.lower(): n for t, cs in tables.items() for n in (t, *cs)}
+    out = []
+    for v in range(max(count, 1)):
+        rng = random.Random(f'{seed}:{domain}:{db_id}:{v}')
+        names = alias_names(tables, rng, style) if count else {}
+        db = alias_db(db_id, rng, style, handle, handles, spelled.values())
+        alias = {'db': db, 'names': names, 'variant': v}
+        out.append({**alias, 'inverse': inverse_of(names, spelled),
+                    'records': render_database(domain, db_id, contents, alias)})
+    return out
+
+
 def sql_corpus(output: Path, dataset: str, *, full_rows: int, sample_rows: int,
-               value_limit: int) -> dict:
+               value_limit: int, alias_variants: int = 0, alias_style: str = 'semantic',
+               db_handle: str = 'name', no_handle_fraction: float = 0.0,
+               alias_seed: int = 0) -> dict:
+    """Text-to-SQL episodes over the databases' records. With ``alias_variants`` N > 0
+    every database gets N schema-aliased variants (``schnitz.sql_alias``); each episode
+    uses one (seeded by its id) and the KB holds every variant, so retrieval has to find
+    the right one. A ``no_handle_fraction`` of the episodes instead uses the original
+    database without naming it in the query (the KB then holds the original records
+    too). ``db_handle`` names the database in the query: ``name`` (the variant's
+    aliased id), ``opaque`` (a seeded code) or ``none`` (only without aliasing)."""
+    from schnitz.sql_alias import AliasError, alias_query, rename_text
+    if db_handle == 'none' and alias_variants:
+        raise ValueError('--db-handle none needs unaliased databases; use --no-handle-fraction')
+    aliasing = alias_variants > 0 or db_handle == 'opaque'
     domain = dataset
     if dataset == 'spider':
         base = RAW / 'agentic-20260927/spider/official/spider_data'
@@ -212,7 +298,11 @@ def sql_corpus(output: Path, dataset: str, *, full_rows: int, sample_rows: int,
         gold_key = 'SQL'
     writer = Writer(output, domain)
     cache: dict[tuple[str, str], dict[str, list[dict]]] = {}
+    variants: dict[tuple[str, str], list[dict]] = {}
+    kb_records: dict[tuple[str, str], list[dict]] = {}
+    handles: set[str] = set()
     sizes = {'records': 0, 'chars': 0}
+    uses = {'plain': 0, 'no_handle': 0, 'aliased': 0}
     for split, rows in splits.items():
         for index, row in enumerate(rows):
             gold = row.get(gold_key) or row.get('query') or row.get('SQL')
@@ -222,36 +312,86 @@ def sql_corpus(output: Path, dataset: str, *, full_rows: int, sample_rows: int,
                 writer.filters_for(split).reject('missing_database')
                 continue
             if (split, db_id) not in cache:
-                cache[split, db_id] = database_records(domain, db_id, path, full_rows=full_rows,
-                                                       sample_rows=sample_rows,
-                                                       value_limit=value_limit)
+                contents = database_contents(path, full_rows=full_rows, sample_rows=sample_rows,
+                                             value_limit=value_limit)
+                cache[split, db_id] = render_database(domain, db_id, contents)
                 recs = [r for rs in cache[split, db_id].values() for r in rs]
+                if aliasing:
+                    variants[split, db_id] = _variants(domain, db_id, contents, alias_variants,
+                                                       alias_style, db_handle, alias_seed,
+                                                       handles)
+                    # the KB: every variant (and the original records if some episodes
+                    # use the original database without a handle)
+                    recs = [r for v in variants[split, db_id] for rs in v['records'].values()
+                            for r in rs] + (recs if no_handle_fraction > 0 else [])
+                kb_records[split, db_id] = recs
                 sizes['records'] += len(recs)
                 sizes['chars'] += sum(len(r['text']) for r in recs)
             db = cache[split, db_id]
-            used = _tables_in(gold, set(db))
+            used = _tables_in(gold, db)
             if not used:
                 writer.filters_for(split).reject('no_table_in_gold')
                 continue
+            # the episode's form: plain (the defaults), original without a handle, or a variant
+            pick = random.Random(f'{alias_seed}:{domain}-{split}-{index}')
+            no_handle = db_handle == 'none' or (no_handle_fraction > 0
+                                                and pick.random() < no_handle_fraction)
+            variant = None if no_handle or not aliasing else \
+                variants[split, db_id][pick.randrange(len(variants[split, db_id]))]
+            names = variant['names'] if variant else {}
+            handle = variant['db'] if variant else db_id
+            answer = gold
+            if names:
+                try:
+                    answer = alias_query(gold, names, variant['inverse'])
+                except AliasError as error:
+                    writer.filters_for(split).reject(f'alias_{error.reason}')
+                    continue
+            if variant:
+                db = variant['records']
             required = [r for t in used for r in db[t] if r['kind'] == 'schema']
             # the KB holds every record of the database; an episode's supports list the
             # used tables' records (schema, values, rows) - the rest stay retrievable
             supports = [r for t in used for r in db[t]]
-            everything = [r for rs in db.values() for r in rs]
+            everything = kb_records[split, db_id]
             evidence = clean(row.get('evidence', ''))
             if evidence:
-                note = record(domain, f'Database {db_id}, note: {evidence}', 'evidence', db=db_id)
+                extra = {'original_db': db_id, 'alias_variant': variant['variant']} \
+                    if variant else {}
+                text = rename_text(evidence, names) if names else evidence
+                note = record(domain, f'Database {handle}, note: {text}', 'evidence',
+                              db=handle, **extra)
                 required.append(note)
                 supports.append(note)
-            query = (f'Use the stored notes on database {db_id}. Write one SQLite query that '
-                     f'answers the question. Return only the SQL.\nQuestion: {clean(row["question"])}')
-            verify = {'type': 'sql', 'db': str(path), 'gold': gold}
-            item = task_episode(domain, split, f'{split}-{index}', query, gold.strip(), required,
-                                supports, verify, 'text_to_sql', db_id=db_id,
-                                difficulty=row.get('difficulty'))
+            if no_handle:
+                query = ('Use the stored database notes. Write one SQLite query that answers '
+                         f'the question. Return only the SQL.\nQuestion: {clean(row["question"])}')
+            else:
+                query = (f'Use the stored notes on database {handle}. Write one SQLite query that '
+                         f'answers the question. Return only the SQL.\nQuestion: '
+                         f'{clean(row["question"])}')
+            verify = {'type': 'sql', 'db': str(path), 'gold': answer}
+            if names:
+                verify['alias'] = {'variant': variant['variant'], 'db': handle,
+                                   'inverse': variant['inverse']}
+            extra = {}
+            if aliasing or no_handle:
+                extra = {'original_db_id': db_id,
+                         'alias_variant': variant['variant'] if variant else None,
+                         'alias_style': alias_style if names else None,
+                         'db_handle': 'none' if no_handle else db_handle}
+                uses['no_handle' if no_handle else 'aliased' if variant else 'plain'] += 1
+            item = task_episode(domain, split, f'{split}-{index}', query, answer.strip(), required,
+                                supports, verify, 'text_to_sql', db_id=handle,
+                                difficulty=row.get('difficulty'), **extra)
             writer.add(split, item, everything + [r for r in required if r['kind'] == 'evidence'])
-    return writer.close({'domain': domain, 'full_rows': full_rows, 'sample_rows': sample_rows,
-                         'value_limit': value_limit, 'database_records': sizes})
+    manifest = {'domain': domain, 'full_rows': full_rows, 'sample_rows': sample_rows,
+                'value_limit': value_limit, 'database_records': sizes}
+    if aliasing or db_handle != 'name':
+        manifest['aliasing'] = {'alias_variants': alias_variants, 'alias_style': alias_style,
+                                'db_handle': db_handle, 'no_handle_fraction': no_handle_fraction,
+                                'alias_seed': alias_seed, 'episodes': uses}
+    return writer.close(manifest)
 
 
 # -- answers from stored database contents --------------------------------------
@@ -293,7 +433,7 @@ def spider_memory(output: Path, *, max_chars: int, max_rows: int, max_cells: int
                     or any(v is None for v in cells) or len(answer) > max_answer):
                 writer.filters_for(split).reject('answer_not_short')
                 continue
-            used = _tables_in(row['query'], set(db)) or list(db)
+            used = _tables_in(row['query'], db) or list(db)
             required = [r for t in used for r in db[t]]
             everything = [r for rs in db.values() for r in rs]
             query = (f'Use the stored contents of database {db_id}. Answer the question with '
@@ -536,6 +676,19 @@ def main() -> None:
         s.add_argument('--full-rows', type=int, default=60)
         s.add_argument('--sample-rows', type=int, default=8)
         s.add_argument('--value-limit', type=int, default=40)
+        s.add_argument('--alias-variants', type=int, default=0,
+                       help='schema-aliased variants per database (0: the original names)')
+        s.add_argument('--alias-style', choices=('semantic', 'random'), default='semantic',
+                       help='fresh names: synonyms, abbreviations and conventions, or unrelated '
+                            'words')
+        s.add_argument('--db-handle', choices=('name', 'opaque', 'none'), default='name',
+                       help='the database named in the query: its (aliased) name, an opaque '
+                            'code, or none (unaliased databases only)')
+        s.add_argument('--no-handle-fraction', type=float, default=0.0,
+                       help='share of episodes on the original database without a handle')
+        s.add_argument('--alias-seed', type=int, default=0,
+                       help='seed of the aliases and episode choices (new aliases per '
+                            'regeneration)')
     m = sub.add_parser('spider-memory')
     m.add_argument('--max-chars', type=int, default=60000)
     m.add_argument('--max-rows', type=int, default=5)
@@ -579,7 +732,11 @@ def main() -> None:
         manifest = knights(args.output, args.examples, args.seed)
     else:
         manifest = sql_corpus(args.output, args.dataset, full_rows=args.full_rows,
-                              sample_rows=args.sample_rows, value_limit=args.value_limit)
+                              sample_rows=args.sample_rows, value_limit=args.value_limit,
+                              alias_variants=args.alias_variants, alias_style=args.alias_style,
+                              db_handle=args.db_handle,
+                              no_handle_fraction=args.no_handle_fraction,
+                              alias_seed=args.alias_seed)
     print(json.dumps(manifest, indent=2, default=str)[:3000])
 
 
