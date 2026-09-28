@@ -1050,3 +1050,9 @@ log your decisions and changes of direction"), newest last.
   cited abstract, which is never stored (1917/300), or a held-out citing paper's
   citance (1347/216), with whole citing papers held out. The split is by cited
   paper. Transcripts read one citance and name the rest as `alternatives`.
+- 28 September: the citance-recall corpus is merged: unarXive citrec (CC BY-SA),
+  2217 cited CS papers with 8-32 citances each, abstracts never stored, 3264/516
+  episodes. Its read phase starts when memory allows. It runs after the recall-text
+  and parallel-recall contrast runs, which are building their banks now. Each episode
+  reads with one search whose alternatives are every citance, and an abstract needs
+  several citances. If reads stay single-item, the transcripts get 2-3 searches.
