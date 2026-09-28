@@ -798,3 +798,33 @@ def test_resident_on_cuda_matches_cpu(tmp_path):
     _train_both([two], ids, 3, 1)
     two.restore_live('c')
     assert _live_bytes(two) == reference
+
+
+@RESIDENT
+def test_batched_live_read_matches_per_item(tmp_path, monkeypatch, resident):
+    """A live read of many items gathers the resident state once (one index and one
+    transfer for the call), with the same values and keys as per-item reads, pinned
+    pre-images included; ``device`` returns tensors without a host round trip."""
+    kb = make(tmp_path)
+    ids = kb.append('A', [item(n=n) for n in (1, 3, 2, 4, 2)])
+    go_live(kb, resident)
+    kb.live_step('A', ids[:2], [torch.ones(1, 8), torch.ones(3, 8)], lr=0.1)
+    single = [kb.read('A', [i], live=True)[0] for i in ids]
+    calls = []
+    original = kb._live_states
+    monkeypatch.setattr(kb, '_live_states', lambda *a, **k: calls.append(1) or original(*a, **k))
+    batched = kb.read('A', ids, live=True)
+    monkeypatch.setattr(kb, '_live_states', original)
+    assert len(calls) == (1 if resident else len(ids))     # journaled: memory-mapped rows
+    for a, b in zip(batched, single):
+        assert a.id == b.id and torch.equal(a.values, b.values) and torch.equal(a.key, b.key)
+    if resident:
+        on_device = kb.read('A', ids, live=True, device='cpu')
+        assert all(torch.equal(a.values, b.values) and torch.equal(a.key, b.key)
+                   for a, b in zip(on_device, batched))
+    with kb.pin_live() as snap:
+        before = snap.read('A', ids)
+        kb.live_step('A', ids[1:2], [torch.ones(3, 8)], lr=0.1)
+        after = snap.read('A', ids)
+        assert all(torch.equal(a.values, b.values) for a, b in zip(before, after))
+        assert not torch.equal(kb.read('A', ids, live=True)[1].values, before[1].values)

@@ -34,8 +34,15 @@ mean length of the items read in decoder reps, capped by the per-read budget), a
 the span is de-standardized with the stack's statistics (``mean + std * y``).
 
 The **retrieval loss** (``retrieval_loss``) runs per space over the scored
-candidates plus any target item the search missed (scored from its values, never
-read): -log of the softmax mass on the slot's items.
+candidates plus any target item the search missed and the caller's in-batch
+negatives (each scored from its values, never read; negatives must belong to the
+read's authorized KBs): -log of the softmax mass on the slot's items. ``exclude``
+keeps named items (an episode's own writes) out of a read. In L1b a ``Producer``
+supplies the values of the items a read keeps, recomputed from their sources with
+gradients into the producers; selection stays on the current values' scores.
+
+Live items of a resident KB are gathered once per (KB, space) and call, onto the
+reader's device (``KnowledgeBase.read(..., device=...)``).
 
 Gold mode skips retrieval: the items of the slot's target records, gate 1 (the
 information-matched control, never a training read). Items come from an
@@ -44,8 +51,9 @@ of a step accumulate before one sparse live update per touched (KB, space).
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -96,9 +104,13 @@ class ItemCache:
         missing = [i for i in dict.fromkeys(ids) if (kb.dataset, space, i) not in self.values]
         if missing:
             live = kb.is_live(space) and kb.writable
-            for item in kb.read(space, missing, live=live):
+            # resident live state: one gather straight onto the reader's device
+            device = self.device if live and kb.live_device is not None else None
+            for item in kb.read(space, missing, live=live, device=device):
                 ref = (kb.dataset, space, item.id)
                 values = item.values.float().to(self.device)
+                if device is not None:     # a view of the gathered block: own storage
+                    values = values.clone()
                 self.values[ref] = values.requires_grad_(self.train)
                 self.times[ref] = item.time
         return [(self.values[(kb.dataset, space, i)], self.times[(kb.dataset, space, i)])
@@ -138,6 +150,7 @@ class SpaceRead:
     recall_read: float | None = None  # ... among the items read
     scored: list[Ref] = field(default_factory=list)
     scored_gates: Tensor | None = None   # differentiable gates of every scored candidate
+    recomputed: int = 0           # L1b: items read with the producers' recomputed values
 
 
 @dataclass
@@ -166,6 +179,16 @@ def source_index(kb: KnowledgeBase, space: str) -> dict[str, list[str]]:
     return out
 
 
+def producer_index(kb: KnowledgeBase, space: str) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """(producer, sources) of every current item of ``space``, by item id, in row order."""
+    visible = kb._visible(kb._map(space, 'rows.i64'), kb.cursor)
+    out = {}
+    for row in np.flatnonzero(visible).tolist():
+        meta = kb._meta(space, row)
+        out[kb._row_ids[space][row]] = (meta['producer'], tuple(meta['sources']))
+    return out
+
+
 def _fetch(cache: ItemCache, by_dataset: Mapping[str, KnowledgeBase], space: str,
            refs: Sequence[Ref]) -> list[tuple[Tensor, int]]:
     """``cache.get`` for refs of several KBs, one store read per KB, in ``refs`` order."""
@@ -175,6 +198,14 @@ def _fetch(cache: ItemCache, by_dataset: Mapping[str, KnowledgeBase], space: str
         out.update({(dataset, i): got for i, got in
                     zip(ids, cache.get(by_dataset[dataset], space, ids))})
     return [out[r] for r in refs]
+
+
+class Producer(Protocol):
+    """L1b: the values of read items recomputed from their stored sources, with
+    gradients into the producers (``schnitz.kb.stages.l1.Producers``); None for an
+    item without a recomputable source."""
+
+    def values(self, space: str, refs: Sequence[Ref]) -> list[Tensor | None]: ...
 
 
 class L1Reader(nn.Module):
@@ -204,31 +235,47 @@ class L1Reader(nn.Module):
 
     def read(self, state: Tensor, kbs: Sequence[KnowledgeBase], allowed: Sequence[str],
              query_time: int, cache: ItemCache, *,
-             targets: Mapping[str, Sequence[Ref]] | None = None, gold: bool = False) -> Read:
+             targets: Mapping[str, Sequence[Ref]] | None = None, gold: bool = False,
+             negatives: Mapping[str, Sequence[Ref]] | None = None,
+             exclude: Mapping[str, Collection[Ref]] | None = None,
+             producer: Producer | None = None) -> Read:
         """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
-        they are the read). Every KB must be authorized."""
+        they are the read). Every KB must be authorized, and so must every target and
+        negative item.
+
+        ``negatives`` (per space): extra items scored as negatives in the retrieval
+        loss (in-batch negatives; the caller passes only items of the read's own KBs).
+        ``exclude`` (per space): items this read may not retrieve (an episode's own
+        writes). ``producer`` (L1b): the values of the items read (not of the other
+        scored candidates) come from ``producer.values`` - the producers' recomputation
+        from the items' stored sources - and so do their gates; selection stays on the
+        scores of the current (live) values."""
         c = self.config
         allowed = set(allowed)
         denied = [kb.dataset for kb in kbs if kb.dataset not in allowed]
         if denied:
             raise PermissionError(f'not authorized to read {denied}')
         by_dataset = {kb.dataset: kb for kb in kbs}
+        for what, named in (('target', targets), ('negative', negatives)):
+            for dataset, _ in (r for rs in (named or {}).values() for r in rs):
+                if dataset not in allowed or dataset not in by_dataset:
+                    raise PermissionError(f'{what} item of {dataset!r} is not readable here')
         reads, masses, info, aux, recall_at = {}, {}, {}, [], {}
         read_positions, read_spaces, read_gates = [], [], []
         for s in self.spaces:
             q = self.keys.query_key(s, state)
             wanted = list(dict.fromkeys((targets or {}).get(s, ())))
-            for dataset, _ in wanted:
-                if dataset not in allowed or dataset not in by_dataset:
-                    raise PermissionError(f'target item of {dataset!r} is not readable here')
+            banned = set((exclude or {}).get(s, ()))
             if gold:
-                refs = wanted
+                refs = [r for r in wanted if r not in banned]
             else:
                 live = all(kb.writable and kb.is_live(s) for kb in kbs)
-                hits = search_kbs(kbs, allowed, s, q.detach()[None], c.candidates[s],
-                                  query_time=query_time, live=live)
-                refs = list(zip(hits.datasets[0], hits.ids[0]))
+                hits = search_kbs(kbs, allowed, s, q.detach()[None],
+                                  c.candidates[s] + len(banned), query_time=query_time,
+                                  live=live)
+                refs = [r for r in zip(hits.datasets[0], hits.ids[0])
+                        if r not in banned][:c.candidates[s]]
             got = [(ref, values) for ref, (values, time)
                    in zip(refs, _fetch(cache, by_dataset, s, refs))
                    if time <= query_time]            # causal even for gold items
@@ -237,15 +284,16 @@ class L1Reader(nn.Module):
                 info[s] = SpaceRead([], torch.zeros(0), 0.0, 0, none, none)
                 continue
             refs = [r for r, _ in got]
-            scored, scored_gates = list(refs), None
+            scored, scored_gates, recomputed = list(refs), None, 0
             if gold:
                 gates = torch.ones(len(got), device=q.device)
             else:
                 keys = torch.stack([self.keys.item_key(s, v.to(q.device)) for _, v in got])
                 scores = self.keys.scores(s, q[None], keys)[0]
                 if wanted:
+                    others = [r for r in (negatives or {}).get(s, ()) if r not in banned]
                     loss, at = self._retrieval_loss(s, q, refs, scores, wanted, by_dataset,
-                                                    cache, query_time)
+                                                    cache, query_time, others)
                     if loss is not None:
                         aux.append(loss)
                         recall_at.update({f'{k}_{s}': v for k, v in at.items()})
@@ -255,6 +303,18 @@ class L1Reader(nn.Module):
                 got = [got[i] for i in order]
                 refs = [refs[i] for i in order]
                 gates = scored_gates[order]
+                if producer is not None:
+                    # L1b: the read items' values are the producers' recomputation and
+                    # their gates follow the recomputed keys; an item without a
+                    # recomputable source keeps its current value
+                    fresh = producer.values(s, refs)
+                    recomputed = sum(v is not None for v in fresh)
+                    if recomputed:
+                        got = [(ref, old if v is None else v)
+                               for (ref, old), v in zip(got, fresh)]
+                        keys = torch.stack([self.keys.item_key(s, v.to(q.device))
+                                            for _, v in got])
+                        gates = self.gates(s, self.keys.scores(s, q[None], keys)[0])
             g = gates.detach().float()
             size = torch.tensor([float(v.shape[0]) for _, v in got], device=g.device)
             count = max(1, round(float((g * size).sum() / g.sum().clamp_min(1e-12))))
@@ -269,7 +329,7 @@ class L1Reader(nn.Module):
                 recall = sum(r in set(scored) for r in wanted) / len(wanted)
                 recall_read = sum(r in set(refs) for r in wanted) / len(wanted)
             info[s] = SpaceRead(refs, g.cpu(), float(mass.detach()), count, recall, recall_read,
-                                scored, scored_gates)
+                                scored, scored_gates, recomputed)
         aux_loss = torch.stack(aux).mean() if aux else None
         live = [s for s in self.spaces if s in reads and float(masses[s].detach()) > 0]
         if not live:
@@ -280,14 +340,21 @@ class L1Reader(nn.Module):
         span = self.stack.mean + self.stack.std * y
         return Read(span, info, aux_loss, n, recall_at)
 
-    def _retrieval_loss(self, space, q, refs, scores, wanted, by_dataset, cache, query_time):
-        extra = [r for r in wanted if r not in set(refs)]
+    def _retrieval_loss(self, space, q, refs, scores, wanted, by_dataset, cache, query_time,
+                        negatives: Sequence[Ref] = ()):
+        """Over the scored candidates, plus the targets the search missed (positives)
+        and ``negatives`` not already among them (in-batch negatives), each scored
+        from its current values; items later than the query time are left out."""
+        seen, want = set(refs), set(wanted)
+        extra = [r for r in wanted if r not in seen]
+        extra += [r for r in dict.fromkeys(negatives) if r not in seen and r not in want]
         fetched = _fetch(cache, by_dataset, space, extra) if extra else []
-        missed = [self.keys.item_key(space, v.to(q.device)) for v, time in fetched
-                  if time <= query_time]
-        if missed:
-            scores = torch.cat([scores, self.keys.scores(space, q[None], torch.stack(missed))[0]])
-        positive = torch.tensor([r in set(wanted) for r in refs] + [True] * len(missed),
+        pairs = [(r in want, self.keys.item_key(space, v.to(q.device)))
+                 for r, (v, time) in zip(extra, fetched) if time <= query_time]
+        if pairs:
+            more = self.keys.scores(space, q[None], torch.stack([k for _, k in pairs]))[0]
+            scores = torch.cat([scores, more])
+        positive = torch.tensor([r in want for r in refs] + [p for p, _ in pairs],
                                 device=q.device)
         if not positive.any():
             return None, {}
@@ -305,12 +372,24 @@ class L1Reader(nn.Module):
             ids = current_ids(kb, s)
             keys = []
             for start in range(0, len(ids), batch):
-                items = kb.read(s, ids[start:start + batch], live=True)
-                keys += [self.keys.item_key(s, it.values.float().to(device)).cpu() for it in items]
+                items = kb.read(s, ids[start:start + batch], live=True,
+                                device=device if kb.live_device is not None else None)
+                keys.append(self.item_keys(s, [it.values for it in items]).cpu())
             if ids:
-                kb.set_live_keys(s, ids, torch.stack(keys))
+                kb.set_live_keys(s, ids, torch.cat(keys))
                 count += len(ids)
         return count
+
+    def item_keys(self, space: str, values: Sequence[Tensor]) -> Tensor:
+        """``KeyHeads.item_key`` of many variable-length items in one pass: the head
+        acts per position, so the items are concatenated and mean-pooled per item."""
+        device = next(self.parameters()).device
+        lengths = torch.tensor([v.shape[0] for v in values], device=device)
+        out = self.keys.item[space](torch.cat([v.float().to(device) for v in values]))
+        owner = torch.repeat_interleave(torch.arange(len(values), device=device), lengths)
+        pooled = torch.zeros(len(values), out.shape[1], device=device, dtype=out.dtype)
+        pooled.index_add_(0, owner, out)
+        return nn.functional.normalize(pooled / lengths[:, None].to(out.dtype), dim=-1)
 
 
 def splice(embeds: Tensor, mem_positions: Sequence[int], spans: Sequence[Tensor]

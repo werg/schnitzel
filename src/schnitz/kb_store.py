@@ -102,7 +102,9 @@ from safetensors.torch import load_file, save_file
 from torch import Tensor
 
 SCHEMA = 'schnitz.kb/2'
-PRODUCERS = ('codec', 'rewrite', 'live-update')
+# 'write': an in-context write (``memory_write()`` during a training or inference
+# episode), its source the episode's write site
+PRODUCERS = ('codec', 'rewrite', 'live-update', 'write')
 # rows.i64 columns
 OFFSET, LENGTH, BORN, DEAD, TIME, VERSION, META_OFF, META_LEN = range(8)
 STORED_FILES = ('keys.f32', 'rows.i64', 'mass.f32', 'payload.bf16', 'ids.txt', 'meta.jsonl')
@@ -630,8 +632,11 @@ class KnowledgeBase:
                     return values, key
         return self._live_states(space, [row])[0]
 
-    def _live_states(self, space: str, rows: Sequence[int]) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Current live (values, key) of rows, as CPU copies (one gather when resident)."""
+    def _live_states(self, space: str, rows: Sequence[int],
+                     device: torch.device | None = None) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Current live (values, key) of rows, as CPU copies: with resident state one
+        gather and one transfer for all rows. ``device`` (resident state only) instead
+        returns torch tensors on that device (no host round trip for a GPU consumer)."""
         if not rows:
             return []
         if self._live is not None:
@@ -639,10 +644,13 @@ class KnowledgeBase:
             index = torch.as_tensor(rows, dtype=torch.long)
             length = state['length'].view()[index]
             _, positions = self._index(state['offset'].view()[index], length)
-            values = state['values'].view()[positions.to(self._device)].cpu().numpy()
-            keys = state['keys'].view()[index.to(self._device)].cpu().numpy()
-            split = np.split(values, length.cumsum(0)[:-1].numpy())
-            return list(zip(split, keys))
+            values = state['values'].view()[positions.to(self._device)]
+            keys = state['keys'].view()[index.to(self._device)]
+            if device is not None:
+                values, keys = values.to(device), keys.to(device)
+                return list(zip(values.split(length.tolist()), keys.unbind(0)))
+            split = np.split(values.cpu().numpy(), length.cumsum(0)[:-1].numpy())
+            return list(zip(split, keys.cpu().numpy()))
         table = self._map(space, 'rows.i64')
         values, keys = self._map(space, 'live_values.f32'), self._map(space, 'live_keys.f32')
         return [(np.array(values[table[r, OFFSET]:table[r, OFFSET] + table[r, LENGTH]]),
@@ -656,12 +664,14 @@ class KnowledgeBase:
         return np.ascontiguousarray(self._map(space, LIVE_FIELDS[field])[index])
 
     def _item(self, space: str, row: int, cursor: int, live: bool,
-              generation: int | None = None) -> Item:
+              generation: int | None = None, state: tuple | None = None) -> Item:
+        """``state``: the row's live (values, key), already gathered (batched reads)."""
         r = self._map(space, 'rows.i64')[row]
         start, length = int(r[OFFSET]), int(r[LENGTH])
         if live:
-            values, key = self._live_state(space, row, generation)
-            values, key = torch.from_numpy(values), torch.from_numpy(key)
+            values, key = self._live_state(space, row, generation) if state is None else state
+            if isinstance(values, np.ndarray):
+                values, key = torch.from_numpy(values), torch.from_numpy(key)
         else:
             values = torch.from_numpy(np.array(self._map(space, 'payload.bf16')[start:start + length]))
             values = values.view(torch.bfloat16)
@@ -681,21 +691,37 @@ class KnowledgeBase:
                              'current cursor (use pin_live for a stable view)')
 
     def read(self, space: str, ids: Sequence[str], *, versions: Sequence[int | None] | None = None,
-             live: bool = False, cursor: int | None = None) -> list[Item]:
+             live: bool = False, cursor: int | None = None,
+             device: str | torch.device | None = None) -> list[Item]:
         """Items by id: the current version at ``cursor``, or an explicit (possibly
         superseded) version for measurement. ``live`` returns fp32 live values and live
-        keys (writer only, current cursor)."""
+        keys (writer only, current cursor); with resident live state all named items
+        are gathered at once. ``device`` (live reads of resident state) returns values
+        and keys on that device without a host round trip."""
         with self._lock:
             self._check_space(space)
             if live:
                 self._check_live(space, cursor)
-            return self._read(space, ids, versions, live, self._view(cursor), None)
+            return self._read(space, ids, versions, live, self._view(cursor), None,
+                              None if device is None else torch.device(device))
 
-    def _read(self, space, ids, versions, live, cursor, generation) -> list[Item]:
+    def _read(self, space, ids, versions, live, cursor, generation,
+              device: torch.device | None = None) -> list[Item]:
         self._check_space(space)
         versions = [None] * len(ids) if versions is None else list(versions)
-        return [self._item(space, self._row(space, i, cursor, v), cursor, live, generation)
-                for i, v in zip(ids, versions, strict=True)]
+        rows = [self._row(space, i, cursor, v) for i, v in zip(ids, versions, strict=True)]
+        states: list = [None] * len(rows)
+        if live and self._live is not None:
+            # one gather for the rows without a pinned pre-image (all of them unless a
+            # snapshot of an older generation reads)
+            saved = self._pre.get(space, {}) if generation is not None else {}
+            plain = [j for j, r in enumerate(rows)
+                     if not any(at > generation for at, _, _ in saved.get(r, ()))]
+            for j, got in zip(plain, self._live_states(space, [rows[j] for j in plain],
+                                                        device)):
+                states[j] = got
+        return [self._item(space, r, cursor, live, generation, state)
+                for r, state in zip(rows, states)]
 
     # -- mutations -----------------------------------------------------------------------
 
