@@ -303,7 +303,40 @@ are the levers; the dense per-pair form is kept on purpose.
 - How rewriting levels are scheduled once the store is large.
 - Top-k size for cached teacher distributions, and the distillation corpus.
 
-## 9. Status
+## 9. Implementation work packages (28 September)
+
+Built in parallel while B3 and K1 train, so each stage is ready when its
+inputs are. Training data is regenerated where the format changes (owner:
+"not afraid to regenerate training data").
+
+- **WP1 - Span protocol, B4 and the soft I/O port** (`scripts/train_bgkit_b4.py`).
+  Reserved tokens become `<|bg|>`, `<|rep|>`, `<|/bg|>`, `<|mem|>`, `<|/mem|>`,
+  `<|port|>`, `<|/port|>` with LM-head rows (restart plan 3.2); the two-way stop
+  head is replaced by the `<|rep|>`/`<|/bg|>` rows; a ratio head at `<|bg|>`.
+  Training mixes BGKit general compression at all ratios, interleaved
+  text-span-text sequences, memory tool-call transcripts (WP3) with latent
+  results, and the soft input then output port, with the replay KL.
+- **WP2 - Knowledge-base store** (`src/schnitz/kb_store.py`). Per KB (one per
+  dataset) and space: variable-length items of the space's width, keys, masses,
+  provenance, versions and rewrite lineage; append, supersede and rewrite
+  operations; exact top-k scan per space over memory-mapped keys; live-item mode
+  with per-item optimizer state for sparse in-place updates (L1).
+- **WP3 - Memory-protocol data** (`scripts/prepare_memory_transcripts.py`). Every
+  episode of the R6 corpora and the task corpora rewritten as an LFM2 chat
+  transcript with `memory_search` calls (query text, target record ids), tool
+  results as latent slots filled at training time, and `memory_write` calls;
+  checks that results only contain records that exist before the call and that
+  query text never leaks the answer.
+- **WP4 - Evaluation** (`scripts/evaluate_kb.py`). Superposition metrics (sources
+  per item, items per source, effective items per read), KB-dependence tests
+  (edited, removed and inserted knowledge), and a benchmark runner for
+  LFM2.5-8B-A1B, Ling-3.0-tiny and LFM2-24B-A2B on the task corpora with their
+  verifiers.
+- **WP5 - Stack training after K1**: K2 key and query heads, K3a warm-up of S_s,
+  the L1 read path (retrieve per space, gates from similarity, S_s, R, `<|mem|>`
+  span).
+
+## 10. Status
 
 | Part | State |
 |---|---|
