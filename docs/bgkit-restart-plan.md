@@ -392,3 +392,45 @@ datasets) and periodic memory-use evaluation.
 - Exact k(N) during distillation and the log-law constants afterwards.
 - Positional parametrization of the size-agnostic operator blocks.
 - How the read budget per space is set when every read passes through a combiner.
+
+## 7. Decision log
+
+Decisions taken under the owner's mandate (28 September: "proceed autonomously,
+log your decisions and changes of direction"), newest last.
+
+- **27 Sep, B3 memory.** B3 hit its own 0.5 GPU cap during the gate ramp (replay
+  KL over the full vocabulary). Relaunched from step 5000 with cap 0.62 and
+  expandable segments.
+- **28 Sep, B3 merge.** The merge (step 6700) OOMed: the whole decoder trains in
+  fp32 and every linear keeps its inputs. Decoder layers now recompute their
+  activations in backward after the merge (`--merge-checkpoint`, only for
+  gradient passes without a cache; regression test for identical gradients).
+  Relaunched from step 6500. Replay KL across the merge 0.21-0.24, teacher
+  captured -0.01 to -0.03 at step 7000 and back to pre-merge levels by 8000; no
+  fallback needed.
+- **28 Sep, K&K is a stretch goal.** Single-pass S2 and base are both at chance
+  on 3-5 inhabitants, so K&K is a target for the B9 loop, not a warm-up.
+- **28 Sep, combiner stage 1 findings.** Learned gates never learned (gate BCE
+  about ln 2 for 8000 steps): the gate value fed the combine step, so the task
+  loss (which liked any extra mass) fought the BCE, and the "related = 0" label
+  was not what the task rewarded. On QA the combiner beats its teacher on content
+  (s1 0.84 vs 0.51 nats over shuffled controls); on reconstruction it stays well
+  below (0.56 vs 1.79). With the writer's own spans at full weight, related
+  records alone capture about 0.03 of the answer gain: the earlier 0.77
+  "related only" was format, not content.
+- **28 Sep, gate head redesign.** The head is trained only by its own loss (its
+  output detached from the task gradient). Labels: gold 1; a related record gets
+  sigmoid((delta - 0.05) / 0.02), delta its leave-one-out effect on per-token
+  answer NLL with all records at gate 1, so a record must help by 0.05 nats per
+  token to count as relevant. The head's scores replace the fixed gates (gold 1,
+  related 0) only once its held-out BCE beats the base-rate BCE by 0.01 nats.
+- **28 Sep, combiner stage 2 (`combiner-own.sh`).** From the stage-1 combiner,
+  reading the frozen B3 writer's own spans (snapshot at step 11500), no feedback
+  record, distillation at its floor, 8000 steps. Joint writer training
+  (`--writer-train`) waits until B3 finishes, since a second trainable decoder
+  does not fit beside B3.
+- **28 Sep, B3 stop head.** After the merge the stop decision oscillated between
+  evaluations (bank s0 spans past their end: 2%, 62%, 85% over three evals)
+  while its training loss stayed low, which is the class imbalance of one stop
+  among k emit positions. From step 12000: stop loss weight 0.2 → 0.5 and stop
+  class weight 8 (`--stop-pos-weight`).

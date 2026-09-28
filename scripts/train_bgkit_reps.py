@@ -119,6 +119,7 @@ class Model:
 
         core = load_models(args.experiment, str(args.checkpoint))
         self.checkpoint_merged = args.merge_checkpoint
+        self.stop_pos_weight = getattr(args, 'stop_pos_weight', 1.0)
         self.core, self.decoder, self.tok = core, core.decoder, core.tok
         for param in list(self.decoder.parameters()) + list(core.encoder.parameters()):
             param.requires_grad_(False)
@@ -517,8 +518,11 @@ def _rollout(model: Model, examples, passes: int, sample: float, sequential: int
     counts = [t.shape[0] for t in teacher_feed]
     preds = [writer.rep(h[:-1]) for h in full]
     cos = 1 - F.cosine_similarity(torch.cat(preds), torch.cat(teacher_feed), dim=-1).mean()
+    # one stop position per span against k emit positions: ``stop_pos_weight`` balances
+    # the classes so the stop logit does not hover at the threshold
     stop = F.cross_entropy(writer.stop(torch.cat(full).float()),
-                           span_targets(counts, model.device))
+                           span_targets(counts, model.device),
+                           weight=torch.tensor([1.0, model.stop_pos_weight], device=model.device))
     return teacher_feed, preds, cos, stop
 
 
@@ -730,6 +734,8 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--steps', type=int, default=20000)
     parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--stop-pos-weight', type=float, default=1.0,
+                        help='class weight of the stop position in the emit/stop loss')
     parser.add_argument('--merge-checkpoint', action=argparse.BooleanOptionalAction, default=True,
                         help='after the merge, recompute decoder-layer activations in backward')
     parser.add_argument('--batch-tokens', type=int, default=4096,

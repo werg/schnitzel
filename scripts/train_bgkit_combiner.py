@@ -12,10 +12,17 @@ trained codecs, s0 from the s1 codec). Per R6 episode and a random space s:
 - gates: feedback on the self-record curriculum (owner direction, 27 September):
   1 until ``--feedback-hold``, then linearly to 0 at ``--feedback-end``, so the
   combiner moves from copying the target to building it from the actual
-  sources. Gold 1 and related ``--related-gate`` (fudged) until
-  ``--learned-gates-from``; then a gate head scores every record against the
-  question (frozen S2 decoder state), trained by the task loss and a BCE to the
-  gold labels.
+  sources. Gold 1 and related ``--related-gate`` (fudged) until the gate head is
+  trusted. From ``--learned-gates-from`` a gate head scores every record against
+  the question (frozen decoder state). It is trained only by its own loss (its
+  output is detached from the task gradient): a BCE to utility labels, gold 1 and
+  for a related record sigmoid((delta - ``--utility-margin``) /
+  ``--utility-temperature``), delta the per-token answer NLL increase when that
+  record is removed from a read with every record at gate 1 (exact removal in the
+  numerator-and-mass form); a record without effect gets a low label. Its scores replace the fixed gates only
+  once, at an evaluation, its held-out BCE beats the base-rate BCE (constant
+  prediction of the mean label) by ``--trust-margin`` nats; the decision is kept
+  in the checkpoint (decision log, 28 September).
 
 Losses: cosine to the target reps; functional through the frozen S2 decoder
 reading the combiner span: reconstruction of the joined gold texts and the
@@ -179,31 +186,89 @@ class Combiner:
             examples[i]['records'][j] = pred if train else pred.detach()
         return cos + 0.2 * stop if train else None
 
-    def gates(self, examples, learned: bool, related_gate: float):
+    def gates(self, examples, learned: bool, related_gate: float, trusted: bool):
+        """Per example: the gates used by the combiner and, with ``learned``, the
+        head's scores for the non-feedback records (with their indices)."""
         if learned:
             states = self.query_state([ex['query'] for ex in examples])
-        out, bce = [], []
+        out, scores = [], []
         for i, ex in enumerate(examples):
             fixed = torch.tensor([{'gold': 1.0, 'related': related_gate,
                                    'feedback': ex['feedback']}[k] for k in ex['kinds']],
                                  device=self.model.device)
             if learned:
                 sources = [j for j, k in enumerate(ex['kinds']) if k != 'feedback']
-                scored = self.gate_head(states[i], [ex['records'][j] for j in sources])
-                labels = torch.tensor([ex['kinds'][j] == 'gold' for j in sources],
-                                      dtype=torch.float, device=scored.device)
-                prob = scored.float().clamp(1e-5, 1 - 1e-5)
-                bce.append(-(labels * prob.log() + (1 - labels) * (1 - prob).log()).mean())
-                fixed = fixed.clone()
-                fixed[sources] = scored.float()
+                scored = (self.gate_head(states[i], [ex['records'][j] for j in sources])
+                          if sources else fixed[:0])
+                scores.append((sources, scored))
+                if trusted and sources:
+                    fixed = fixed.clone()
+                    fixed[sources] = scored.detach().float()
             out.append(fixed)
-        return out, (torch.stack(bce).mean() if bce else None)
+        return out, scores
+
+    @torch.no_grad()
+    def utility_labels(self, examples, gates, limit: int) -> list[torch.Tensor | None]:
+        """Gold 1; related sigmoid((delta - margin) / T), delta the per-token answer NLL increase
+        when the record is removed from the read with all records at gate 1.
+        Computed for up to ``limit`` examples."""
+        model, temperature = self.model, self.args.utility_temperature
+        labels: list[torch.Tensor | None] = [None] * len(examples)
+        chosen = [i for i, ex in enumerate(examples) if 'related' in ex['kinds']][:limit]
+        views, spans, owners = [], [], []
+        for i in chosen:
+            # leave-one-out from every record at full weight, independent of the gate
+            # policy (a related record at gate 0 would otherwise show no effect)
+            ex, g = examples[i], gates[i].clone()
+            g[[j for j, k in enumerate(ex['kinds']) if k != 'feedback']] = 1.0
+            variants = [g] + [g.clone().index_fill_(0, torch.tensor([j], device=g.device), 0.0)
+                              for j, k in enumerate(ex['kinds']) if k == 'related']
+            for v in variants:
+                views.append(ex['qa'])
+                spans.append(self.combine(ex, v))
+            owners.append((i, len(variants)))
+        if not views:
+            return labels
+        logits, targets = model.read(views, spans)
+        nll = F.cross_entropy(logits, targets, reduction='none')
+        lengths = [int(v['target'].numel()) + 1 for v in views]  # answer tokens + eos
+        if sum(lengths) != nll.numel():
+            raise RuntimeError('answer token count does not match the read targets')
+        per_view = torch.stack([part.mean() for part in torch.split(nll, lengths)])
+        cursor = 0
+        for i, count in owners:
+            ex = examples[i]
+            base, removed = per_view[cursor], per_view[cursor + 1:cursor + count]
+            cursor += count
+            label = torch.ones(len(ex['kinds']), device=model.device)
+            label[[j for j, k in enumerate(ex['kinds']) if k == 'related']] = \
+                torch.sigmoid((removed - base - self.args.utility_margin) / temperature)
+            labels[i] = label
+        return labels
+
+    def head_loss(self, examples, scores, labels):
+        """BCE of the gate head to the utility labels (examples without related
+        records: gold labels 1)."""
+        losses = []
+        for ex, (sources, scored), label in zip(examples, scores, labels):
+            if not sources:
+                continue
+            if label is None:
+                if 'related' in ex['kinds']:
+                    continue
+                label = torch.ones(len(ex['kinds']), device=scored.device)
+            target = label[sources].float()
+            prob = scored.float().clamp(1e-5, 1 - 1e-5)
+            losses.append(-(target * prob.log() + (1 - target) * (1 - prob).log()).mean())
+        return torch.stack(losses).mean() if losses else None
 
     def combine(self, ex: dict, gates: torch.Tensor) -> torch.Tensor:
         return self.combiners[ex['tag']].combine(ex['records'], ex['target_reps'].shape[0], gates)
 
 
 def _feedback(args, step: int) -> float:
+    if args.feedback_end <= 0:  # no self-record phase (e.g. continuing a trained combiner)
+        return 0.0
     if step < args.feedback_hold:
         return 1.0
     return max(0.0, 1.0 - (step - args.feedback_hold) / max(args.feedback_end - args.feedback_hold, 1))
@@ -219,12 +284,16 @@ def _distill(args, step: int) -> float:
 
 
 def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_gate: float,
-               distill: float = 1.0) -> dict:
+               distill: float = 1.0, trusted: bool = False) -> dict:
     model = comb.model
     with model.core.autocast():
         anchor = comb.own_spans(examples, comb.args.writer_train)
-        gates, bce = comb.gates(examples, learned, related_gate)
+        gates, scores = comb.gates(examples, learned, related_gate, trusted)
         outs = [comb.combine(ex, g) for ex, g in zip(examples, gates)]
+        bce = None
+        if learned:
+            labels = comb.utility_labels(examples, gates, comb.args.utility_examples)
+            bce = comb.head_loss(examples, scores, labels)
         teacher = [ex['target_reps'] for ex in examples]
         cos = 1 - F.cosine_similarity(torch.cat(outs), torch.cat(teacher), dim=-1).mean()
         result, loss = {'cos': cos.item()}, distill * weights['cos'] * cos
@@ -247,8 +316,10 @@ def train_step(comb: Combiner, examples, weights: dict, learned: bool, related_g
 
 
 @torch.no_grad()
-def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> dict:
+def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool,
+             trusted: bool = False) -> dict:
     model, out = comb.model, {}
+    head = {'bce': 0.0, 'base': [], 'labels': [], 'probs': [], 'kinds': []}
     rng = random.Random(1234)
     for tag in args.eval_spaces:
         sums: dict[tuple[str, str], float] = {}
@@ -264,16 +335,26 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> d
             with model.core.autocast():
                 for group in (full, only, rel):
                     comb.own_spans(group, False)
-                g_full, _ = comb.gates(full, learned, args.related_gate)
-                g_rel, _ = comb.gates(rel, learned, args.related_gate)
+                g_full, s_full = comb.gates(full, learned, args.related_gate, trusted)
+                if learned:
+                    labels = comb.utility_labels(full, g_full, len(full))
+                    for ex, (sources, scored), label in zip(full, s_full, labels):
+                        if label is None or not sources:
+                            continue
+                        head['labels'].append(label[sources].float())
+                        head['probs'].append(scored.float())
+                        head['kinds'] += [ex['kinds'][j] for j in sources]
                 spans = {
                     'teacher': [ex['target_reps'] for ex in full],
                     'gold_spans': [torch.cat(ex['records']) for ex in only],
                     'comb_gold': [comb.combine(ex, torch.ones(len(ex['records']),
                                                               device=model.device)) for ex in only],
                     'comb_gold_related': [comb.combine(ex, g) for ex, g in zip(full, g_full)],
-                    'comb_related_only': [comb.combine(ex, g) if ex['records'] else
-                                          ex['target_reps'][:0] for ex, g in zip(rel, g_rel)]}
+                    # related records at full weight: their content, not the gate policy
+                    'comb_related_only': [comb.combine(ex, torch.ones(len(ex['records']),
+                                                                      device=model.device))
+                                          if ex['records'] else ex['target_reps'][:0]
+                                          for ex in rel]}
                 # matched controls: the same kind of span built from the next episode
                 spans['teacher_shuffled'] = spans['teacher'][1:] + spans['teacher'][:1]
                 spans['comb_shuffled'] = spans['comb_gold'][1:] + spans['comb_gold'][:1]
@@ -298,6 +379,19 @@ def evaluate(comb: Combiner, episodes: Episodes, rows, args, learned: bool) -> d
                                 'comb_gold_related': round(nll['comb_shuffled']
                                                            - nll['comb_gold_related'], 4)}}
         out[tag] = result
+    if head['labels']:
+        labels, probs = torch.cat(head['labels']), torch.cat(head['probs']).clamp(1e-5, 1 - 1e-5)
+        mean = labels.mean().clamp(1e-5, 1 - 1e-5)
+        bce = -(labels * probs.log() + (1 - labels) * (1 - probs).log()).mean()
+        base = -(labels * mean.log() + (1 - labels) * (1 - mean).log()).mean()
+        related = torch.tensor([k == 'related' for k in head['kinds']], device=labels.device)
+        out['gate_head'] = {
+            'bce': round(bce.item(), 4), 'base_rate_bce': round(base.item(), 4),
+            'mean_label': round(mean.item(), 4),
+            'gold_gate': round(probs[~related].mean().item(), 4) if (~related).any() else None,
+            'related_gate': round(probs[related].mean().item(), 4) if related.any() else None,
+            'related_label': round(labels[related].mean().item(), 4) if related.any() else None,
+            'trusted': trusted}
     return out
 
 
@@ -313,6 +407,8 @@ def main() -> None:
     parser.add_argument('--eval-episodes', type=Path, required=True)
     parser.add_argument('--eval-cache', type=Path, required=True)
     parser.add_argument('--init-codecs', type=Path)
+    parser.add_argument('--init-combiner', type=Path,
+                        help='start from a finished combiner.pt (combiners and gate head)')
     parser.add_argument('--writer-state', type=Path,
                         help='B3 writer.pt: read the writer\'s own spans instead of teacher reps')
     parser.add_argument('--writer-adapter-rank', type=int, default=16)
@@ -327,6 +423,13 @@ def main() -> None:
     parser.add_argument('--feedback-hold', type=int, default=500)
     parser.add_argument('--feedback-end', type=int, default=4000)
     parser.add_argument('--learned-gates-from', type=int, default=4000)
+    parser.add_argument('--utility-examples', type=int, default=4,
+                        help='examples per step whose related records get leave-one-out labels')
+    parser.add_argument('--utility-margin', type=float, default=0.05,
+                        help='a related record must lower answer NLL by this much (nats/token) '
+                             'to get a label above 0.5')
+    parser.add_argument('--utility-temperature', type=float, default=0.02)
+    parser.add_argument('--trust-margin', type=float, default=0.01)
     parser.add_argument('--distill-floor', type=float, default=0.1)
     parser.add_argument('--distill-decay', type=int, default=2000)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -351,9 +454,12 @@ def main() -> None:
     model = Model(argparse.Namespace(
         cuda_fraction=args.cuda_fraction, experiment=args.experiment, checkpoint=args.checkpoint,
         adapter_rank=args.writer_adapter_rank if args.writer_state else 0,
-        gate_open_start=-1, merge_at=-1))
+        gate_open_start=-1, merge_at=-1, merge_checkpoint=True))
     if args.writer_state:
         model.load_trained(torch.load(args.writer_state, map_location=model.device))
+        if not args.writer_train:  # loading a merged writer unfreezes the decoder
+            for param in list(model.decoder.parameters()) + list(model.writer.parameters()):
+                param.requires_grad_(False)
     comb = Combiner(args, model, bank)
     groups = [{'params': comb.parameters(), 'lr': args.lr}]
     if args.writer_train:
@@ -362,7 +468,11 @@ def main() -> None:
         groups += model.param_groups(writer_args)
     optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
     args.output.mkdir(parents=True, exist_ok=True)
-    state_path, step = args.output / 'combiner.pt', 0
+    state_path, step, trusted = args.output / 'combiner.pt', 0, False
+    if not state_path.exists() and args.init_combiner:
+        state = torch.load(args.init_combiner, map_location=model.device)
+        comb.combiners.load_state_dict(state['combiners'])
+        comb.gate_head.load_state_dict(state['gate_head'])
     if state_path.exists():
         state = torch.load(state_path, map_location=model.device)
         comb.combiners.load_state_dict(state['combiners'])
@@ -371,6 +481,7 @@ def main() -> None:
             model.load_trained(state['writer'])
         optimizer.load_state_dict(state['optimizer'])
         step = state['step']
+        trusted = state.get('gates_trusted', False)
     start = step
     schedule = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda s: min(1.0, (s + start + 1) / args.warmup))
@@ -385,7 +496,8 @@ def main() -> None:
         print(json.dumps(record), flush=True)
 
     if step == 0:
-        log({'step': 0, 'eval': evaluate(comb, evald, eval_rows, args, False)})
+        log({'step': 0, 'eval': evaluate(comb, evald, eval_rows, args,
+                                         args.learned_gates_from <= 0, trusted)})
     window: dict[str, float] = {}
     started = time.time()
     while step < args.steps:
@@ -396,7 +508,7 @@ def main() -> None:
                     for row in rng.sample(train.rows, args.batch_size)]
         optimizer.zero_grad(set_to_none=True)
         distill = _distill(args, step)
-        result = train_step(comb, examples, weights, learned, args.related_gate, distill)
+        result = train_step(comb, examples, weights, learned, args.related_gate, distill, trusted)
         torch.nn.utils.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
                                        1.0)
         optimizer.step()
@@ -407,19 +519,23 @@ def main() -> None:
         if step % args.log_every == 0:
             log({'step': step, **{k: round(v / args.log_every, 4) for k, v in window.items()},
                  'feedback_gate': round(feedback, 3), 'learned_gates': learned,
-                 'distill': round(distill, 3),
+                 'distill': round(distill, 3), 'gates_trusted': trusted,
                  'elapsed_s': round(time.time() - started)})
             window = {}
         if step % args.eval_every == 0 or step == args.steps:
+            result = evaluate(comb, evald, eval_rows, args, step >= args.learned_gates_from, trusted)
+            head = result.get('gate_head')
+            if head and not trusted and head['bce'] < head['base_rate_bce'] - args.trust_margin:
+                trusted = True
+                log({'step': step, 'event': 'gate head beats the base rate; learned gates on'})
             torch.save({'combiners': comb.combiners.state_dict(),
                         'gate_head': comb.gate_head.state_dict(),
                         **({'writer': model.trained_state()} if args.writer_train else {}),
-                        'optimizer': optimizer.state_dict(), 'step': step},
+                        'optimizer': optimizer.state_dict(), 'step': step,
+                        'gates_trusted': trusted},
                        state_path.with_suffix('.pending'))
             state_path.with_suffix('.pending').replace(state_path)
-            log({'step': step, 'eval': evaluate(comb, evald, eval_rows, args,
-                                                step >= args.learned_gates_from)})
-
+            log({'step': step, 'eval': result})
 
 if __name__ == '__main__':
     main()
