@@ -812,3 +812,9 @@ log your decisions and changes of direction"), newest last.
   identity); the trained top-level items become targets, and L2 trains several
   S_s layers mapping the original KB to them. K3 gains a depth-2 warm-up. Depth-0
   items at the same budget are the control.
+- 28 Sep (owner question: S_s see-saw between write and read side). Decided:
+  shared warm-up, then untie into S_s^w and S_s^r; S_s^w frozen or a slow EMA of
+  S_s^r; the leaves carry per-KB adaptation; S_s^r anchored on held-out entries of
+  all KBs; S_s^w changes only in item-preserving consolidation steps (leaves re-fit
+  to the pre-update entries). The owner's alternation stays available as a phase
+  schedule and is the comparison.

@@ -301,6 +301,16 @@ applies to every stage.
      7), recorded as rewrite shares; an item's time is the latest of its
      sources' (invariant 2); mixing only within one KB (invariant 6). Control:
      depth 0 (the items themselves) at the same storage and read budget.
+     *Against write/read see-saw (owner):* one S_s would both define the entries
+     (write-side fields) and combine them at reads, so every read-side update
+     would move all entries of all KBs. After a shared warm-up the operator is
+     untied: S_s^w (write fields) frozen or a slow moving average of S_s^r; the
+     leaves are the fast per-KB parameters; S_s^r (read combine) trains with an
+     anchor (reads of held-out entries of all KBs keep their outputs). S_s^w
+     changes only through consolidation steps that re-fit the leaves so the
+     entries stay put. Plain alternation (read phase, write phase) is kept as a
+     schedule for comparison; item drift, read drift and cross-KB retention are
+     logged.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
