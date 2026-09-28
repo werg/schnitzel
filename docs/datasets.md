@@ -150,9 +150,13 @@ merely in `alternatives` can be scored as a negative among the candidates.
   sentence given, then the following 64 to 192 tokens). Targets end at a sentence
   end when one leaves at least 64 tokens. Sufficient groups are the covers by one
   residue class of windows, so there are `redundancy` covers. The split is by
-  document. Corpora: `tasks-recall-text-r8-20260928` (71,807 records, 3800/464
-  episodes; target tokens median 117, p90 188; about 18 supports per episode) and
-  `-r2-` (18,353 records), each with `memory-recall-text-r{8,2}-20260928v3`.
+  document. Each episode's `neutral` lists the document's other records (neither
+  positives nor negatives of the L1 retrieval loss; a transcript slot adds the
+  episode's other slots' positives). Corpora: `tasks-recall-text-r8-20260928`
+  (71,807 records, 3800/464 episodes; target tokens median 117, p90 188; about 18
+  supports per episode) and `-r2-` (18,353 records), each with
+  `memory-recall-text-r{8,2}-20260928v3`. Only the r8 corpus and transcripts carry
+  `neutral` so far (29 September; the old r8 transcripts are `...v3-noneutral`).
 - **`synth-people`** (`schnitz.synth_world`). This is a seeded fictional world with
   unique natural names, built-in vocabularies of real cities, plausible
   universities, majors, companies and job titles, and mentor and sibling relations.

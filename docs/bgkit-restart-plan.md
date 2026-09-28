@@ -1067,3 +1067,20 @@ log your decisions and changes of direction"), newest last.
   the rest. The r6 QA baseline (frozen, no contrast) keeps improving: content 0.095
   -> 0.145 -> 0.182 nats at steps 250/750/1000 (retrieved 1.591, shuffled 1.773,
   text 1.535).
+- 29 September: neutral items in the retrieval loss. On recall-text, validation
+  search recall stayed at chance and the retrieval loss rose during retrieval-only
+  training. The cause: windows of the target's document that overlap only the cue
+  or sit next to the target share most of their text with the positives, are the
+  most query-similar items, and were scored as negatives. A slot's `neutral`
+  records are now neither positives nor negatives (`L1Reader.read(neutral=)`): they
+  leave the scored candidates and in-batch negatives of its loss, may still be read,
+  and are banked. A neutral item that is also a positive stays positive; on rows a
+  row covering a positive stays positive. Recall-text episodes carry `neutral` =
+  the document's other records. A slot adds the episode's other slots' positives,
+  so it lists the whole document outside its own positives: per slot a median of
+  52 neutral against 14 positives (train, 8706 slots; 7-125). Parallel recall with
+  shared reads gets the same rule for the other slots' positives (other translations
+  of adjacent verses); citance recall gets nothing. `tasks-recall-text-r8-20260928`
+  was regenerated in place, identical apart from `neutral` (same sources.jsonl);
+  `memory-recall-text-r8-20260928v3` too (the old one is `...v3-noneutral`). The r2
+  and parallel transcripts are not regenerated yet.
