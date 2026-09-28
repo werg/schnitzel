@@ -918,3 +918,7 @@ log your decisions and changes of direction"), newest last.
   parallel-version recall, citance recall, r6 QA, and the synthetic redundancy knob.
   How to continue (SQL with aliasing, agent tasks, B9) is decided from their
   retrieved-vs-shuffled results. B3 -> B4 and K1 continue unchanged.
+- 28 September (owner): SQL hardening is deprioritized. The aliasing option is
+  committed as code with tests, but no aliased corpora are generated. The synthetic
+  people world stays as a small, optional redundancy probe (r32 only). Focus goes to
+  the diverse-redundancy probes: parallel-version recall, citance recall, r6 QA.
