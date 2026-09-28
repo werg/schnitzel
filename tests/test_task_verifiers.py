@@ -1,7 +1,8 @@
 import sqlite3
 
-from schnitz.task_verifiers import (call_match, code_match, extract_block, knights_knaves_match,
-                                 sql_match, value_match)
+from schnitz.task_verifiers import (call_match, check_episode, code_match, exact_answer_match,
+                                 extract_block, final_answer, first_call_match,
+                                 knights_knaves_match, sql_match, value_match)
 
 
 def test_call_match_is_an_unordered_multiset():
@@ -61,3 +62,24 @@ def test_value_match_needs_every_value_in_a_short_answer():
     assert not value_match('Paris (3)', rows)
     assert not value_match('Paris 3 Lyon 1.25 ' + 'x ' * 80, rows)
     assert value_match('It is 42.', [[42]])
+
+
+def test_exact_answer_uses_the_stated_final_answer():
+    assert exact_answer_match('Steps...\nTherefore, the final answer is &C &C &C A&.', '&C &C &C A&')
+    assert exact_answer_match('so \\boxed{\\frac{1}{2}} is it', '\\frac{1}{2}')
+    assert exact_answer_match('Answer: `Empty`', 'empty')
+    assert exact_answer_match('Answer: 12.0', '12')
+    assert not exact_answer_match('Answer: 13', '12')
+    assert not exact_answer_match('12 is wrong; the answer is 13', '12')  # the last answer counts
+    assert final_answer('The answers are listed.\nx\n7') == '7'  # no answer marker: last line
+
+
+def test_first_call_and_dispatch():
+    gold = {'name': 'get_user', 'arguments': {'user_id': 'u1'}}
+    assert first_call_match('[{"name": "get_user", "arguments": {"user_id": "u1"}}, '
+                            '{"name": "other", "arguments": {}}]', gold)
+    assert not first_call_match('[{"name": "other", "arguments": {}}]', gold)
+    assert not first_call_match('Sure, what is your user id?', gold)
+    assert check_episode('[get_user(user_id="u1")]', {'type': 'tau_bench', 'calls': [gold]})
+    assert check_episode('It is 6.', {'type': 'values', 'rows': [[6]]})
+    assert not check_episode('Answer: 5', {'type': 'exact', 'answer': '6'})

@@ -12,7 +12,13 @@ parsing failures count as wrong, never as errors.
 - code: the candidate written to ``solution.py`` beside the task's pytest file,
   or run on stdin/stdout cases, in a subprocess with a time limit;
 - Knights and Knaves: every inhabitant's role parsed from the text;
-- answers from memory: every expected value appears in a short answer.
+- answers from memory: every expected value appears in a short answer;
+- exact answers (Reasoning Gym): the final answer (``\\boxed{}``, ``Answer:`` line or
+  last line) equals the expected string after light normalization;
+- agent turns (APIGen-MT): the first predicted call equals the gold first call.
+
+``check_episode`` dispatches on an episode's ``verify`` spec
+(``scripts/prepare_task_corpora.py``).
 """
 from __future__ import annotations
 
@@ -197,3 +203,84 @@ def value_match(prediction: str, rows: list[list], slack: int = 40) -> bool:
         return False
     numbers = {_norm(float(n)) for n in re.findall(r'-?\d+(?:\.\d+)?', text)}
     return all(c in text or c in numbers for c in cells)
+
+
+def first_call_match(prediction: str, gold_call: dict) -> bool:
+    """The first predicted call equals ``gold_call`` (name and canonical arguments).
+    Meaningful only where the gold trajectory's first action is this call."""
+    calls = parse_calls(prediction)
+    if not calls:
+        return False
+    key = _call_key(calls[0])
+    return key is not None and key == _call_key(gold_call)
+
+
+def _boxed(text: str) -> str | None:
+    """Content of the last ``\\boxed{...}`` (nested braces allowed)."""
+    start = text.rfind('\\boxed{')
+    if start < 0:
+        return None
+    depth, begin = 0, start + len('\\boxed{')
+    for index in range(begin - 1, len(text)):
+        depth += {'{': 1, '}': -1}.get(text[index], 0)
+        if depth == 0:
+            return text[begin:index]
+    return None
+
+
+def final_answer(text: str) -> str:
+    """The stated final answer: the last ``\\boxed{}``, else the rest of the line after the
+    last ``answer:`` / ``answer is``, else the last non-empty line."""
+    boxed = _boxed(text)
+    if boxed is not None:
+        return boxed
+    found = re.findall(r'\banswer\b(?:\s+is)?\s*[:=]?\s*(.+)', text, re.IGNORECASE)
+    if found:
+        return found[-1]
+    lines = [line for line in text.strip().splitlines() if line.strip()]
+    return lines[-1] if lines else ''
+
+
+def _norm_answer(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'^\*+|\*+$', '', text).strip()
+    for _ in range(3):  # $...$, `...`, quotes and a trailing full stop, in any nesting
+        text = text.strip().rstrip('.').strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in '$`"\'':
+            text = text[1:-1]
+    return text.strip().lower()
+
+
+def exact_answer_match(prediction: str, answer: str) -> bool:
+    """The final answer (``final_answer``) equals ``answer`` after whitespace, case,
+    quote/backtick/``$`` and trailing-period normalization; numbers compare numerically
+    (relative tolerance 1e-9)."""
+    got, want = _norm_answer(final_answer(prediction)), _norm_answer(str(answer))
+    if got == want:
+        return True
+    try:
+        a, b = float(got.replace(',', '')), float(want.replace(',', ''))
+    except ValueError:
+        return False
+    return abs(a - b) <= 1e-9 * max(1.0, abs(b))
+
+
+def check_episode(prediction: str, verify: dict) -> bool:
+    """Whether ``prediction`` is a correct outcome for an episode's ``verify`` spec.
+    Raises ``ValueError`` for spec types without a pure-Python verifier (synlogic)."""
+    kind = verify['type']
+    if kind == 'calls':
+        return call_match(prediction, verify['gold'])
+    if kind == 'sql':
+        return sql_match(prediction, verify['gold'], Path(verify['db']))
+    if kind == 'code':
+        return code_match(prediction, verify['test'], verify['style'])
+    if kind == 'knights':
+        return knights_knaves_match(prediction, verify['names'], verify['solution'])
+    if kind == 'values':
+        return value_match(prediction, verify['rows'])
+    if kind == 'exact':
+        return exact_answer_match(prediction, verify['answer'])
+    if kind == 'tau_bench':
+        return bool(verify['calls']) and first_call_match(prediction, verify['calls'][0])
+    raise ValueError(f'No verifier for {kind!r}')
