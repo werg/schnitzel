@@ -848,3 +848,8 @@ log your decisions and changes of direction"), newest last.
   (sequential on exported rows by default; optionally a separate job following
   row snapshots). No interleaving inside one trainer; the joint read/write default
   of the entry above applies only if reads are later switched to stack outputs.
+- 28 Sep (owner). Key-space updates on both sides: read phase with free row keys
+  trained by retrieval and gate gradients (index re-keyed from live keys); write
+  side with row keys as the share-weighted combination of their field inputs' keys
+  plus a learned correction; fields reassigned from updated keys; the write fit
+  matches keys and values.

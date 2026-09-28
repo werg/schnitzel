@@ -274,6 +274,13 @@ applies to every stage.
    separate job following row snapshots that the read phase exports as it goes.
    The fit is the L2 stack objective and code. Reads seeing the stack's outputs
    instead of free rows is a later switch.
+   *Key space (owner):* in the read phase each row's key is a free parameter
+   too, moved by the retrieval and gate gradients (the search index is re-keyed
+   from the live row keys on a schedule). On the write side a row's key follows
+   its field: the keys of its field inputs weighted by the operator's weights
+   for them (the normalized shares), plus a learned correction; fields are
+   reassigned from the updated keys. The write fit matches keys as well as
+   values.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
