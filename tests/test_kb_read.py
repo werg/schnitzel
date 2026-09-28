@@ -1,24 +1,18 @@
-"""L1 read path (``schnitz.kb_read``) and trainer passes (``scripts/train_kb_l1.py``);
+"""L1 read path (``schnitz.kb.read``) and trainer passes (``schnitz.kb.stages.l1``);
 CPU, tiny models, no downloads."""
 from __future__ import annotations
 
-import importlib.util
 from pathlib import Path
-import sys
 
 import pytest
 import torch
 
-from schnitz.kb_read import ItemCache, L1Reader, ReadConfig, splice
+from schnitz.kb.read import ItemCache, L1Reader, ReadConfig, splice
+from schnitz.kb.stages import l1
 from schnitz.kb_store import KnowledgeBase, NewItem, Provenance, SpaceSpec
 from schnitz.span_protocol import ProtocolTokens, untie
 from schnitz.span_tokens import SPAN_TOKENS
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'train_kb_l1.py'
-spec = importlib.util.spec_from_file_location('train_kb_l1', SCRIPT)
-l1 = importlib.util.module_from_spec(spec)
-sys.modules['train_kb_l1'] = l1          # dataclasses resolve their module
-spec.loader.exec_module(l1)
 
 SPACES = {'A': SpaceSpec(8, 4, 1.0), 'B': SpaceSpec(12, 4, 0.5)}
 HIDDEN = 32
@@ -147,8 +141,15 @@ def test_retrieval_loss_scores_missed_targets(tmp_path):
     targets = targets_of(kb, ['r0', 'r5', 'r7'])
     read = r.read(torch.randn(HIDDEN), [kb], ['ds'], 3, cache, targets=targets)
     for s, info in read.spaces.items():
-        assert info.recall == sum(t in set(info.refs) for t in targets[s]) / 3
-    read.aux.backward()
+        assert info.recall_read == sum(t in set(info.refs) for t in targets[s]) / 3
+        assert info.recall >= info.recall_read
+        assert len(info.refs) == r.config.keep[s]          # a sparse read
+    (read.aux + read.span.sum()).backward()
+    for s, info in read.spaces.items():   # scored but not read: no value gradient
+        read_ids = {i for _, i in info.refs}
+        for (_, space, item_id), v in cache.values.items():
+            if space == s and item_id not in read_ids:
+                assert v.grad is None or v.grad.abs().sum() == 0
     # every target gets a key gradient from the retrieval loss, retrieved or not
     for s in SPACES:
         for ref in targets[s]:
@@ -311,7 +312,9 @@ def test_chat_drops_query_text_and_uses_current_schema():
     messages, tools = l1.chat(row)
     assert messages[1]['tool_calls'][0]['function']['arguments'] == {}
     assert messages[2]['content'] == SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
-    assert isinstance(messages[3]['content'], str)
+    assert len(messages) == 4             # the write acknowledgement is dropped
+    kept, _ = l1.chat(row, keep_writes=True)
+    assert len(kept) == 5 and isinstance(kept[3]['content'], str)
     assert [t['name'] for t in tools] == ['memory_search', 'memory_write', 'api']
     assert tools[0]['parameters']['properties'] == {}
     text_messages, _ = l1.chat(row, {'r1': 'one', 'r2': 'two'})

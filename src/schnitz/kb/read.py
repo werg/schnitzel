@@ -15,6 +15,9 @@ space's key width (queries are vectors, never text). Per space:
    with the same logits; ``a_s``, ``b_s`` are learnable per space. Gates are computed
    with gradients from the live keys and the query, and only scale mass (MLP-matrix
    gate semantics), so the task loss trains keys and key heads.
+   Reads are sparse (owner, 28 September): of the scored candidates only the top
+   ``keep_s`` by gate logit enter the read (the others have gate exactly 0, which
+   removes them exactly); all candidates are scored by the retrieval loss.
 3. **Superposition operator** ``S_s`` (an ``MLPMatrix`` over the candidates of space s,
    no locality kernel since a neighbourhood is unordered, conditioned on the query)
    produces one per-space read of ``m_s`` positions, ``m_s`` the gate-weighted mean
@@ -58,6 +61,8 @@ from schnitz.mlp_matrix import MLPMatrix
 # fine spaces retrieve few items, coarse spaces many (docs 3); about 8 writer reps'
 # worth of positions per candidate set and space for equal-length items
 DEFAULT_CANDIDATES = {'A': 8, 'B': 16, 'C': 32, 'D': 64}
+# extreme sparsity (owner, 28 September): a read keeps a handful of items per space
+DEFAULT_KEEP = {'A': 2, 'B': 2, 'C': 3, 'D': 4}
 
 Ref = tuple[str, str]    # (dataset, item id) within one space
 
@@ -66,6 +71,7 @@ Ref = tuple[str, str]    # (dataset, item id) within one space
 class ReadConfig:
     spaces: dict[str, SpaceSpec] = field(default_factory=lambda: dict(DEFAULT_SPACES))
     candidates: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_CANDIDATES))
+    keep: dict[str, int] = field(default_factory=lambda: dict(DEFAULT_KEEP))
     hidden: int = 1024            # the decoder's hidden width (query input)
     span_width: int = 1024        # the decoder's input-embedding width (span output)
     target_norm: float = 1.0      # interface norm of span reps
@@ -75,7 +81,7 @@ class ReadConfig:
     gate: str = 'sigmoid'         # or 'softmax'
     max_items: float = 4.0
     min_reps: int = 1
-    max_reps: int = 128
+    max_reps: int = 16
     checkpointing: bool = True
 
 
@@ -174,7 +180,8 @@ class SpaceRead:
     gates: Tensor                 # detached, per candidate
     mass: float
     positions: int
-    recall: float | None = None   # share of target items among the candidates
+    recall: float | None = None   # share of target items among the scored candidates
+    recall_read: float | None = None  # ... among the items read (nonzero gates)
 
 
 @dataclass
@@ -254,19 +261,28 @@ class L1Reader(nn.Module):
                    in zip(refs, _fetch(cache, by_dataset, s, refs))
                    if time <= query_time]           # causal even for gold items
             if not got:
-                info[s] = SpaceRead([], torch.zeros(0), 0.0, 0,
-                                    None if not wanted else 0.0)
+                none = None if not wanted else 0.0
+                info[s] = SpaceRead([], torch.zeros(0), 0.0, 0, none, none)
                 continue
             refs = [r for r, _, _ in got]
+            scored = set(refs)
             keys = torch.stack([k for _, _, k in got])
             if gold:
                 gates = torch.ones(len(got), device=q.device)
             else:
                 logits = self.router.logits(s, q, keys.to(q.device))
-                gates = self._gates(logits)
                 if wanted:
                     aux.append(self._retrieval_loss(s, q, refs, logits, wanted, by_dataset,
                                                     cache, query_time))
+                # sparse read: only the top ``keep`` candidates by gate logit carry mass;
+                # the rest are scored (retrieval loss) but read with gate exactly 0
+                keep = min(c.keep.get(s, len(got)), len(got))
+                top = torch.topk(logits.detach(), keep).indices
+                order = top.sort().values.tolist()
+                got = [got[i] for i in order]
+                refs = [refs[i] for i in order]
+                gates = self._gates(logits)[order] if c.gate == 'sigmoid' \
+                    else torch.softmax(logits[order], 0)
             items = [(s, v.to(q.device), g) for (_, v, _), g in zip(got, gates)]
             g = gates.detach().float()
             size = torch.tensor([float(v.shape[0]) for _, v, _ in got], device=g.device)
@@ -274,10 +290,11 @@ class L1Reader(nn.Module):
             count = max(1, round(mean_len))
             out, mass = self.operators[s](items, count, cond=q[None])
             reads[s], masses[s], lengths[s] = out, mass, mean_len
-            recall = None
+            recall = recall_read = None
             if wanted:
-                recall = sum(r in set(refs) for r in wanted) / len(wanted)
-            info[s] = SpaceRead(refs, g.cpu(), float(mass.detach()), count, recall)
+                recall = sum(r in scored for r in wanted) / len(wanted)
+                recall_read = sum(r in set(refs) for r in wanted) / len(wanted)
+            info[s] = SpaceRead(refs, g.cpu(), float(mass.detach()), count, recall, recall_read)
         aux_loss = torch.stack(aux).mean() if aux else None
         live = [s for s in self.spaces if s in reads and masses[s].detach() > 0]
         if not live:

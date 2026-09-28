@@ -18,7 +18,7 @@ start in one geometry; the trainer starts from them. Item time is the record's
 installed if the state has none; later B4) reads each transcript rendered with the
 LFM2 chat template, ``memory_search()`` calls without arguments (a v1 transcript's
 query text is dropped), loss on assistant tokens only. At every call the read path
-(``schnitz.kb_read``) takes the query-layer state at the call's own closing
+(``schnitz.kb.read``) takes the query-layer state at the call's own closing
 parenthesis, retrieves per space from the episode's KB (authorization: the episode's
 dataset only), gates, combines (S_s, R) and splices the span between ``<|mem|>`` and
 ``<|/mem|>`` of the call's tool message. Queries are exact causal prefixes: the
@@ -37,7 +37,14 @@ matched text control), ``retrieved`` (the L1 read), ``shuffled`` (another episod
 reads), ``gold`` (the target items, gate 1, no retrieval) and ``gold_shuffled``.
 Reported with ``kb_eval.nll_summary`` (captured fractions of the text arm's gain,
 content nats over the shuffled controls), recall and effective items per read.
-Training-only; the decoder parts run in ``sdkb-bgkit``.
+Writes: ``memory_write`` calls (and their acknowledgements) are left out of the L1
+render (``--keep-writes`` keeps them): their text argument is the dropped v0.5 form,
+writes are single-pass latent spans trained in B4 (owner, 28 September), and L1 does
+not train writes.
+
+Entry point (until ``scripts/train.py <stage>`` exists): ``python -m
+schnitz.kb.stages.l1 build|train ...``. Training-only; the decoder parts run in
+``sdkb-bgkit``.
 """
 from __future__ import annotations
 
@@ -56,13 +63,20 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from schnitz.kb_eval import distribution, effective_count, nll_summary  # noqa: E402
-from schnitz.kb_read import (DEFAULT_CANDIDATES, ItemCache, KeyHeads, L1Reader,  # noqa: E402
-                             ReadConfig, source_index, splice)
-from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance  # noqa: E402
-from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS  # noqa: E402
+from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyHeads,
+                             L1Reader, ReadConfig, source_index, splice)
+from schnitz.kb_eval import distribution, effective_count, nll_summary
+from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
+from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
+
+# The decoder wrapper, K1 stack and length schedule still live in scripts/; the shared
+# modules (schnitz.kb.decoder, schnitz.kb.stack) replace these imports at merge.
+SCRIPTS = Path(__file__).resolve().parents[4] / 'scripts'
+
+
+def _scripts() -> None:
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
 
 MEM, MEM_END = SPAN_TOKENS['mem'][0], SPAN_TOKENS['mem_end'][0]
 MEM_ID = SPAN_TOKENS['mem'][1]
@@ -119,12 +133,25 @@ def query_time(row: dict) -> int:
     return int(prov.get('source_query_time', prov.get('query_time', 2)))
 
 
-def chat(row: dict, texts: dict[str, str] | None = None) -> tuple[list[dict], list[dict]]:
+def _is_write(m: dict) -> bool:
+    content = m.get('content')
+    if isinstance(content, dict) and 'write_result' in content:
+        return True
+    calls = m.get('tool_calls') or []
+    return bool(calls) and all(tc['function']['name'] == 'memory_write' for tc in calls) \
+        and not m.get('content')
+
+
+def chat(row: dict, texts: dict[str, str] | None = None,
+         keep_writes: bool = False) -> tuple[list[dict], list[dict]]:
     """Messages and tools for the chat template: memory_search calls without arguments
     (the current schema), slots as empty ``<|mem|><|/mem|>`` pairs, or with ``texts``
-    the slot records' text (the oracle text arm); other dict contents as JSON."""
+    the slot records' text (the oracle text arm); other dict contents as JSON. Write
+    calls and their acknowledgements are dropped unless ``keep_writes``."""
     messages = []
     for m in row['messages']:
+        if not keep_writes and _is_write(m):
+            continue
         m = dict(m)
         content = m.get('content')
         if isinstance(content, dict) and 'slot' in content:
@@ -161,10 +188,11 @@ def _render(tok, messages, tools):
     return list(out['input_ids']), list(out['assistant_masks'])
 
 
-def layout(row: dict, tok, texts: dict[str, str] | None = None) -> Episode:
+def layout(row: dict, tok, texts: dict[str, str] | None = None,
+           keep_writes: bool = False) -> Episode:
     """Token layout of a transcript. The query position of a call is the token holding
     its closing parenthesis (so calls in one block have their own positions)."""
-    messages, tools = chat(row, texts)
+    messages, tools = chat(row, texts, keep_writes)
     ids, mask = _render(tok, messages, tools)
     slots = slots_of(row)
     calls, mems = [], []
@@ -311,6 +339,7 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
 # -- model loading (GPU container) ------------------------------------------------------
 def load_model(args):
     """The frozen decoder (and writer) from S2 plus ``--reader-state``; protocol installed."""
+    _scripts()
     from train_bgkit_reps import Model
     model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
                                      checkpoint=args.checkpoint,
@@ -334,6 +363,7 @@ def load_model(args):
 
 def load_stack(path: Path | None, target_norm: float, device, seed: int):
     """K1 codecs and recombiner (``train_kb_codecs.Stack``): trained, or random init."""
+    _scripts()
     from train_kb_codecs import Stack
     dims = {'state': 512, 'hidden': 256, 'layers': 3}
     if path is not None and (path.parent / 'config.json').exists():
@@ -407,6 +437,7 @@ def initial_heads(path: Path, hidden: int, seed: int) -> KeyHeads:
 
 @torch.no_grad()
 def build(args) -> None:
+    _scripts()
     from cache_bgkit_teacher import length_factors
     rows = []
     for split, limit in (('train', args.limit), ('validation', args.eval_limit)):
@@ -525,6 +556,7 @@ def _read_stats(reads, sink: dict) -> None:
         for s, info in read.spaces.items():
             if info.recall is not None:
                 sink.setdefault(f'recall_{s}', []).append(info.recall)
+                sink.setdefault(f'recall_read_{s}', []).append(info.recall_read)
             if len(info.gates):
                 sink.setdefault(f'eff_{s}', []).append(effective_count(info.gates.tolist())['entropy'])
                 sink.setdefault(f'mass_{s}', []).append(info.mass)
@@ -559,7 +591,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args) -> dict:
 
 
 @torch.no_grad()
-def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) -> dict:
+def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
+             keep_writes: bool = False) -> dict:
     cache = ItemCache(ctx.frozen.device, train=False)
     sums = {a: 0.0 for a in ('noctx', 'full', 'retrieved', 'shuffled', 'gold', 'gold_shuffled')}
     tokens = 0
@@ -575,7 +608,7 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) 
         tokens += n
         empty = [torch.zeros(0, ctx.reader.config.span_width) for _ in ep.mems]
         sums['noctx'] += run_episode(ctx, ep, cache, 'fixed', empty)[0].item()
-        text_ep = layout(ep.row, tok, texts)
+        text_ep = layout(ep.row, tok, texts, keep_writes)
         if int(text_ep.targets.numel()) != n:
             raise ValueError('the text arm changes the target tokens')
         sums['full'] += run_episode(ctx, text_ep, cache, 'fixed', [])[0].item()
@@ -594,6 +627,10 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) 
     return report
 
 
+def _pairs(text: str) -> dict[str, int]:
+    return {k: int(v) for k, v in (p.split('=') for p in text.split(',') if p)}
+
+
 def train(args) -> None:
     model = load_model(args)
     lm = model.decoder.base_lm
@@ -601,10 +638,10 @@ def train(args) -> None:
         from schnitz.bgkit_span import checkpoint_layers
         checkpoint_layers(lm.model.layers)
     frozen = Frozen(lm, args.query_layer, model.core.autocast)
-    candidates = dict(DEFAULT_CANDIDATES, **{k: int(v) for k, v in
-                                             (p.split('=') for p in args.candidates.split(',') if p)})
+    candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
+    keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
     stack, _, dims = load_stack(args.codecs, model.target_norm, 'cpu', args.seed)
-    config = ReadConfig(candidates=candidates, hidden=lm.config.hidden_size,
+    config = ReadConfig(candidates=candidates, keep=keep, hidden=lm.config.hidden_size,
                         span_width=lm.get_input_embeddings().weight.shape[1],
                         target_norm=model.target_norm, state=dims['state'],
                         op_hidden=dims['hidden'], layers=dims['layers'], gate=args.gate,
@@ -651,7 +688,7 @@ def train(args) -> None:
         if not slots_of(row) or row['kb'] not in kbs:
             reason = 'no_reads_or_kb'
         else:
-            ep = layout(row, tok)
+            ep = layout(row, tok, keep_writes=args.keep_writes)
             if ep.ids.numel() > args.max_tokens:
                 reason = 'too_long'
             elif not ctx.covered(ep):
@@ -701,7 +738,7 @@ def train(args) -> None:
                     kb.drop_live_checkpoint(old)
 
     if step == 0 and args.eval_every:
-        log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+        log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
     order: list[int] = []
     window: dict[str, float] = {}
     started = time.time()
@@ -726,57 +763,71 @@ def train(args) -> None:
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
             save()
             reader.eval()
-            log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+            log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest='command', required=True)
-    for name in ('build', 'train'):
-        p = sub.add_parser(name)
-        p.add_argument('--transcripts', type=Path, nargs='+', required=True,
-                       help='memory transcript directories (v1 or v2)')
-        p.add_argument('--checkpoint', type=Path, required=True)
-        p.add_argument('--experiment', default='bgkit2_s2_showcase')
-        p.add_argument('--reader-state', type=Path, required=True,
-                       help='B3 writer.pt (merged decoder); later B4')
-        p.add_argument('--codecs', type=Path, help='K1 stack.pt; random init when omitted')
-        p.add_argument('--limit', type=int, help='train transcripts per directory')
-        p.add_argument('--eval-limit', type=int, default=256,
-                       help='validation transcripts per directory')
-        p.add_argument('--query-layer', type=int, default=8)
-        p.add_argument('--cuda-fraction', type=float, default=0.15)
-        p.add_argument('--seed', type=int, default=0)
-        p.add_argument('--output', type=Path, required=True)
-    b = sub.choices['build']
-    b.add_argument('--span-source', choices=('writer', 'teacher'), default='writer')
-    b.add_argument('--cache', type=Path, help='B1 teacher cache (span source teacher)')
-    b.add_argument('--batch-size', type=int, default=32)
-    b.add_argument('--distractors', type=int, default=0,
-                   help='extra records per KB beyond those the transcripts name')
-    t = sub.choices['train']
-    t.add_argument('--banks', type=Path, required=True, help='output of build')
+def add_args(parser: argparse.ArgumentParser) -> None:
+    """Arguments of both actions (``build`` and ``train``) on one parser."""
+    parser.add_argument('action', choices=('build', 'train'))
+    parser.add_argument('--transcripts', type=Path, nargs='+', required=True,
+                        help='memory transcript directories (v1 or v2)')
+    parser.add_argument('--checkpoint', type=Path, required=True)
+    parser.add_argument('--experiment', default='bgkit2_s2_showcase')
+    parser.add_argument('--reader-state', type=Path, required=True,
+                        help='B3 writer.pt (merged decoder); later B4')
+    parser.add_argument('--codecs', type=Path, help='K1 stack.pt; random init when omitted')
+    parser.add_argument('--limit', type=int, help='train transcripts per directory')
+    parser.add_argument('--eval-limit', type=int, default=256,
+                        help='validation transcripts per directory')
+    parser.add_argument('--query-layer', type=int, default=8)
+    parser.add_argument('--cuda-fraction', type=float, default=0.15)
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--batch-size', type=int, help='build: records (32); train: episodes (8)')
+    build_args = parser.add_argument_group('build')
+    build_args.add_argument('--span-source', choices=('writer', 'teacher'), default='writer')
+    build_args.add_argument('--cache', type=Path, help='B1 teacher cache (span source teacher)')
+    build_args.add_argument('--distractors', type=int, default=0,
+                            help='extra records per KB beyond those the transcripts name')
+    t = parser.add_argument_group('train')
+    t.add_argument('--banks', type=Path, help='output of build')
     t.add_argument('--steps', type=int, default=20000)
-    t.add_argument('--batch-size', type=int, default=8)
     t.add_argument('--lr', type=float, default=3e-4)
     t.add_argument('--item-lr', type=float, default=3e-3)
     t.add_argument('--key-lr', type=float, default=3e-3)
     t.add_argument('--retrieval-weight', type=float, default=0.5)
     t.add_argument('--clip', type=float, default=1.0)
-    t.add_argument('--candidates', default='', help='e.g. A=8,B=16,C=32,D=64')
+    t.add_argument('--candidates', default='', help='scored per space, e.g. A=8,B=16,C=32,D=64')
+    t.add_argument('--keep', default='', help='read per space (nonzero gates), e.g. A=2,D=4')
     t.add_argument('--gate', choices=('sigmoid', 'softmax'), default='sigmoid')
     t.add_argument('--max-items', type=float, default=4.0)
-    t.add_argument('--max-reps', type=int, default=128)
+    t.add_argument('--max-reps', type=int, default=16, help='span budget per read')
     t.add_argument('--max-tokens', type=int, default=3072)
+    t.add_argument('--keep-writes', action='store_true')
     t.add_argument('--eval-every', type=int, default=500)
     t.add_argument('--eval-items', type=int, default=128)
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--decoder-checkpoint', action='store_true',
                    help='recompute frozen decoder layers in backward')
     t.add_argument('--no-operator-checkpoint', action='store_true')
-    args = parser.parse_args()
-    build(args) if args.command == 'build' else train(args)
+
+
+def run(args) -> None:
+    if args.action == 'build':
+        args.batch_size = args.batch_size or 32
+        build(args)
+    else:
+        if args.banks is None:
+            raise SystemExit('train needs --banks')
+        args.batch_size = args.batch_size or 8
+        train(args)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_args(parser)
+    run(parser.parse_args())
 
 
 if __name__ == '__main__':
