@@ -529,6 +529,24 @@ class Model:
         return dec.base_lm.lm_head(chosen if index is None else chosen[index]).float()
 
 
+
+def frozen_reader(checkpoint, experiment: str, reader_state=None,
+                  cuda_fraction: float = 0.2) -> Model:
+    """The frozen decoder (and writer) of the stack stages: S2, or the merged decoder
+    of a writer-stage state (``reader_state``), with no trainable parameters."""
+    import argparse
+    model = Model(argparse.Namespace(cuda_fraction=cuda_fraction, experiment=experiment,
+                                     checkpoint=checkpoint, adapter_rank=16 if reader_state else 0,
+                                     gate_open_start=-1, merge_at=-1, merge_checkpoint=False))
+    if reader_state:
+        model.load_trained(torch.load(reader_state, map_location=model.device))
+    for param in list(model.decoder.parameters()) + list(model.writer.parameters()):
+        param.requires_grad_(False)
+    if model.protocol is not None:
+        for param in model.protocol.parameters():
+            param.requires_grad_(False)
+    return model
+
 def _batches(items, rng: random.Random, batch_size: int, budget: int):
     while True:
         pool = rng.sample(items, min(len(items), 64 * batch_size))

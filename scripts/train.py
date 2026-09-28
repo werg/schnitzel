@@ -15,7 +15,8 @@ import sys
 STAGES = {
     'writer': 'schnitz.kb.stages.writer',   # B2, B3, B4 (+ soft I/O port)
     'k1': 'schnitz.kb.stages.k1',           # autoencoding through the spaces
-    'l1': 'schnitz.kb.stages.l1',           # live items end to end (and K2: --retrieval-only)
+    'k3': 'schnitz.kb.stages.k3',           # superposition-operator warm-up (K3a/K3b)
+    'l1': 'schnitz.kb.stages.l1',           # live items end to end (K2: --retrieval-only)
 }
 
 

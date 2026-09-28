@@ -433,13 +433,10 @@ def test_checkpoint_restore_is_bit_identical(tmp_path):
             kb.live_step('A', touched, grads, lr=0.05, weight_decay=0.01)
             if step % 3 == 0:
                 kb.set_live_keys('A', touched[:1], torch.randn(1, 4, generator=gen))
-            if step % 2 == 0:   # key Adam moments are live state too
-                kb.live_key_step('A', touched, torch.randn(len(touched), 4, generator=gen),
-                                 lr=0.05)
 
     train(5, 1)
     info = kb.checkpoint_live('step5')
-    assert info == {'tag': 'step5', 'cursor': 2, 'live_updates': 10}
+    assert info == {'tag': 'step5', 'cursor': 2, 'live_updates': 7}
     at_checkpoint = _live_bytes(kb)
     with pytest.raises(FileExistsError):
         kb.checkpoint_live('step5')
@@ -448,7 +445,7 @@ def test_checkpoint_restore_is_bit_identical(tmp_path):
     train(6, 2)
     reference, updates = _live_bytes(kb), kb.live_updates
     kb.restore_live('step5')
-    assert _live_bytes(kb) == at_checkpoint and kb.live_updates == 10
+    assert _live_bytes(kb) == at_checkpoint and kb.live_updates == 7
     train(6, 2)
     assert _live_bytes(kb) == reference and kb.live_updates == updates
     # the restore survives a reopen, and so does the checkpoint list
@@ -596,35 +593,3 @@ def test_compact_drops_superseded_rows_and_keeps_lineage(tmp_path):
     assert again.source_composition()[outs[1]] == pytest.approx({'s1': 0.25, 's2': 0.75})
     assert again.source_composition()[ids[3]] == {'s3': 1.0}
     assert len(again._history()) == len(history) + 1 and again.verify()['A'] == 1
-
-
-def test_live_key_adam_matches_torch_and_moves_live_search(tmp_path):
-    kb = make(tmp_path)
-    items = [item(n=n) for n in (2, 1, 3)]
-    ids = kb.append('A', items[:1])
-    kb.enable_live('A')
-    ids += kb.append('A', items[1:])       # appended in live mode: key moments start at zero
-    params = [torch.nn.Parameter(i.key.clone()) for i in items]
-    opts = [torch.optim.Adam([p], lr=0.05, betas=(0.8, 0.95), eps=1e-6, foreach=False)
-            for p in params]
-    for touched in ([0, 1, 2], [2], [0, 2]):
-        grads = torch.randn(len(touched), 4)
-        for j, g in zip(touched, grads):
-            params[j].grad = g.clone()
-            opts[j].step()
-        kb.live_key_step('A', [ids[j] for j in touched], grads, lr=0.05, betas=(0.8, 0.95),
-                         eps=1e-6)
-    kb.close()
-    kb = KnowledgeBase(tmp_path / 'kb', writable=True)    # persisted through the journal
-    for j, got in enumerate(kb.read('A', ids, live=True)):
-        torch.testing.assert_close(got.key, params[j].detach(), rtol=1e-6, atol=1e-7)
-        row = kb._rows['A'][ids[j]][-1]
-        assert kb._map('A', 'live_kstep.i64')[row] == int(opts[j].state[params[j]]['step'])
-    for got, stored in zip(kb.read('A', ids), items):      # stored keys never change
-        torch.testing.assert_close(got.key, stored.key)
-    hits = kb.search('A', params[1].detach()[None], 1, live=True)
-    assert hits.ids[0] == [ids[1]]
-    with pytest.raises(ValueError):
-        kb.live_key_step('A', ids[:1], torch.full((1, 4), float('nan')), lr=0.1)
-    with pytest.raises(ValueError):
-        kb.live_key_step('B', [], torch.zeros(0, 6), lr=0.1)       # B is not live

@@ -26,8 +26,7 @@ Layout, one directory per KB::
     <space>/rows.i64            (items, 8)          offset, length, born, dead, time, ...
     <space>/mass.f32 payload.bf16 ids.txt meta.jsonl
     <space>/segments.jsonl      one line per commit: file ranges, killed rows, checksums
-    <space>/live_*              live mode: fp32 values, Adam m and v, per-item step, keys,
-                                key Adam m and v and per-item key step (live_k*)
+    <space>/live_*              live mode: fp32 values, Adam m and v, per-item step, keys
     history.jsonl               after export or compaction: metadata of dropped rows
     live_checkpoints/<tag>/     live-state checkpoints (checkpoint_live)
 
@@ -93,9 +92,7 @@ PRODUCERS = ('codec', 'rewrite', 'live-update')
 # rows.i64 columns
 OFFSET, LENGTH, BORN, DEAD, TIME, VERSION, META_OFF, META_LEN = range(8)
 STORED_FILES = ('keys.f32', 'rows.i64', 'mass.f32', 'payload.bf16', 'ids.txt', 'meta.jsonl')
-LIVE_FILES = ('live_values.f32', 'live_m.f32', 'live_v.f32', 'live_step.i64', 'live_keys.f32',
-              'live_km.f32', 'live_kv.f32', 'live_kstep.i64')
-ROW_LIVE_FILES = ('live_step.i64', 'live_keys.f32', 'live_km.f32', 'live_kv.f32', 'live_kstep.i64')
+LIVE_FILES = ('live_values.f32', 'live_m.f32', 'live_v.f32', 'live_step.i64', 'live_keys.f32')
 CHECKPOINTS = 'live_checkpoints'
 _TAG = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 _CHUNK = 1 << 24
@@ -410,9 +407,7 @@ class KnowledgeBase:
         if space in manifest['live_spaces']:
             sizes.update({'live_values.f32': p * w * 4, 'live_m.f32': p * w * 4,
                           'live_v.f32': p * w * 4, 'live_step.i64': n * 8,
-                          'live_keys.f32': n * s['key_width'] * 4,
-                          'live_km.f32': n * s['key_width'] * 4,
-                          'live_kv.f32': n * s['key_width'] * 4, 'live_kstep.i64': n * 8})
+                          'live_keys.f32': n * s['key_width'] * 4})
         return sizes
 
     def _map(self, space: str, file: str) -> np.ndarray:
@@ -429,9 +424,7 @@ class KnowledgeBase:
                         'live_values.f32': (np.float32, (p, w)),
                         'live_m.f32': (np.float32, (p, w)), 'live_v.f32': (np.float32, (p, w)),
                         'live_step.i64': (np.int64, (n,)),
-                        'live_keys.f32': (np.float32, (n, kw)),
-                        'live_km.f32': (np.float32, (n, kw)), 'live_kv.f32': (np.float32, (n, kw)),
-                        'live_kstep.i64': (np.int64, (n,))}[file]
+                        'live_keys.f32': (np.float32, (n, kw))}[file]
         if shape[0] == 0:
             array = np.zeros(shape, dtype)
         else:
@@ -659,10 +652,6 @@ class KnowledgeBase:
                 _write_at(root / file, p * spec.width * 4, blob)
             _write_at(root / 'live_step.i64', n * 8, bytes(8 * len(items)))
             _write_at(root / 'live_keys.f32', n * spec.key_width * 4, data['keys.f32'])
-            key_zeros = bytes(4 * spec.key_width * len(items))
-            _write_at(root / 'live_km.f32', n * spec.key_width * 4, key_zeros)
-            _write_at(root / 'live_kv.f32', n * spec.key_width * 4, key_zeros)
-            _write_at(root / 'live_kstep.i64', n * 8, bytes(8 * len(items)))
         if kill:
             dead = self._map(space, 'rows.i64')
             dead[list(kill), DEAD] = cursor
@@ -972,10 +961,7 @@ class KnowledgeBase:
                          s['items'] * s['key_width'] * 4)
             for file, size in (('live_m.f32', s['positions'] * s['width'] * 4),
                                ('live_v.f32', s['positions'] * s['width'] * 4),
-                               ('live_step.i64', s['items'] * 8),
-                               ('live_km.f32', s['items'] * s['key_width'] * 4),
-                               ('live_kv.f32', s['items'] * s['key_width'] * 4),
-                               ('live_kstep.i64', s['items'] * 8)):
+                               ('live_step.i64', s['items'] * 8)):
                 os.truncate(root / file, size)   # sparse zeros
             manifest = dict(self._manifest, live_spaces=self._manifest['live_spaces'] + [space])
             _atomic_json(self.root / 'manifest.json', manifest)
@@ -1015,33 +1001,21 @@ class KnowledgeBase:
             g = torch.cat([x.detach().float().cpu() for x in grads])
             steps = torch.from_numpy(np.array(self._map(space, 'live_step.i64')[rows])) + 1
             per_position = torch.repeat_interleave(steps, torch.as_tensor(table[rows, LENGTH]))
-            _adam(p, m, v, g, steps, per_position, lr, betas, eps, weight_decay)
+            b1, b2 = betas
+            # grouped by step count so each group uses torch's exact scalar arithmetic
+            for step in steps.unique().tolist():
+                sel = per_position == step
+                pp, mm, vv, gg = p[sel], m[sel], v[sel], g[sel]
+                if weight_decay:
+                    pp.mul_(1 - lr * weight_decay)
+                mm.lerp_(gg, 1 - b1)
+                vv.mul_(b2).addcmul_(gg, gg, value=1 - b2)
+                bias1, bias2 = 1 - b1 ** step, 1 - b2 ** step
+                denom = (vv.sqrt() / (bias2 ** 0.5)).add_(eps)
+                pp.addcdiv_(mm, denom, value=-lr / bias1)
+                p[sel], m[sel], v[sel] = pp, mm, vv
             self._journal(space, {'values': p, 'm': m, 'v': v}, positions,
                           {'step': steps}, np.asarray(rows))
-
-    def live_key_step(self, space: str, ids: Sequence[str], grads: Tensor, *, lr: float,
-                      betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
-                      weight_decay: float = 0.0) -> None:
-        """One Adam(W) step on the live keys of the named items only (``grads`` is
-        (items, key_width)), each key with its own Adam moments and step count (like
-        ``live_step`` for values). Live searches after the step see the new keys; stored
-        keys are unchanged."""
-        with self._lock:
-            self._check_space(space)
-            rows, _ = self._live_rows(space, ids)
-            if grads.shape != (len(rows), self.spaces[space].key_width) \
-                    or not torch.isfinite(grads).all():
-                raise ValueError('key gradients are finite (items, key_width)')
-            if not rows:
-                return
-            p = torch.from_numpy(np.array(self._map(space, 'live_keys.f32')[rows]))
-            m = torch.from_numpy(np.array(self._map(space, 'live_km.f32')[rows]))
-            v = torch.from_numpy(np.array(self._map(space, 'live_kv.f32')[rows]))
-            steps = torch.from_numpy(np.array(self._map(space, 'live_kstep.i64')[rows])) + 1
-            _adam(p, m, v, grads.detach().float().cpu(), steps, steps, lr, betas, eps,
-                  weight_decay)
-            self._journal(space, {}, np.zeros(0, np.int64),
-                          {'keys': p, 'km': m, 'kv': v, 'kstep': steps}, np.asarray(rows))
 
     def set_live_keys(self, space: str, ids: Sequence[str], keys: Tensor) -> None:
         """Replace the live keys of items (e.g. from the trained key head); stored keys
@@ -1088,8 +1062,7 @@ class KnowledgeBase:
                 values, key = self._live_state(space, row, None)
                 saved.setdefault(row, []).append((update, values, key))
         targets = {'p.values': 'live_values.f32', 'p.m': 'live_m.f32', 'p.v': 'live_v.f32',
-                   'r.step': 'live_step.i64', 'r.keys': 'live_keys.f32', 'r.km': 'live_km.f32',
-                   'r.kv': 'live_kv.f32', 'r.kstep': 'live_kstep.i64'}
+                   'r.step': 'live_step.i64', 'r.keys': 'live_keys.f32'}
         for name, tensor in tensors.items():
             if name in targets:
                 array = self._map(space, targets[name])
@@ -1309,8 +1282,8 @@ class KnowledgeBase:
                                                           table[r, OFFSET] + table[r, LENGTH])
                                                 for r in rows])
                     for file, index in (('live_values.f32', positions), ('live_m.f32', positions),
-                                        ('live_v.f32', positions),
-                                        *((f, rows) for f in ROW_LIVE_FILES)):
+                                        ('live_v.f32', positions), ('live_step.i64', rows),
+                                        ('live_keys.f32', rows)):
                         with (pending / space / file).open('ab') as handle:
                             handle.write(np.ascontiguousarray(self._map(space, file)[index]).tobytes())
                             handle.flush()
@@ -1416,24 +1389,6 @@ class KnowledgeBase:
                                                            self.cursor).sum()),
                               'live': self.is_live(space)}
             return out
-
-
-def _adam(p: Tensor, m: Tensor, v: Tensor, g: Tensor, steps: Tensor, per_row: Tensor,
-          lr: float, betas: tuple[float, float], eps: float, weight_decay: float) -> None:
-    """Adam(W) in place on rows of ``p``, ``m``, ``v`` whose step counts are ``per_row``,
-    grouped by step count so each group uses torch's exact scalar arithmetic."""
-    b1, b2 = betas
-    for step in steps.unique().tolist():
-        sel = per_row == step
-        pp, mm, vv, gg = p[sel], m[sel], v[sel], g[sel]
-        if weight_decay:
-            pp.mul_(1 - lr * weight_decay)
-        mm.lerp_(gg, 1 - b1)
-        vv.mul_(b2).addcmul_(gg, gg, value=1 - b2)
-        bias1, bias2 = 1 - b1 ** step, 1 - b2 ** step
-        denom = (vv.sqrt() / (bias2 ** 0.5)).add_(eps)
-        pp.addcdiv_(mm, denom, value=-lr / bias1)
-        p[sel], m[sel], v[sel] = pp, mm, vv
 
 
 def search_kbs(kbs: Sequence[KnowledgeBase], allowed: Iterable[str], space: str,

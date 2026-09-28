@@ -8,29 +8,129 @@ from __future__ import annotations
 import math
 
 import torch
+from torch import nn
 
+from schnitz.kb_store import DEFAULT_SPACES
 from schnitz.mlp_matrix import MLPMatrix
 
-# space: (positions per span rep, width); the widths times the ratios sum to 960
-SPACES = {'A': (1.0, 384), 'B': (0.5, 512), 'C': (0.25, 768), 'D': (0.125, 1024)}
+# space: (positions per span rep, width); the widths times the ratios sum to 960.
+# One definition for the store and every stage: ``kb_store.DEFAULT_SPACES``.
+SPACES = {name: (spec.ratio, spec.width) for name, spec in DEFAULT_SPACES.items()}
+KEY_WIDTH = {name: spec.key_width for name, spec in DEFAULT_SPACES.items()}
 
 
 class Stack(torch.nn.Module):
+    """Forward codecs (span -> items per space) and the recombiner R (items -> span).
+
+    Spans are standardized per dimension with corpus statistics (``mean``, ``std``,
+    set by ``set_statistics``): decoder-space spans share a dominant common
+    direction (the corpus-mean span alone has cosine 0.82 to a typical S2 span), so
+    unstandardized objectives barely see the content that tells spans apart. The
+    codecs read (x - mean) / std, R produces y and the span is mean + std * y;
+    ``standardize`` gives the space in which reconstruction losses are measured."""
+
     def __init__(self, target_norm: float, state: int, hidden: int, layers: int,
-                 checkpointing: bool):
+                 checkpointing: bool, width: int = 1024):
         super().__init__()
         common = dict(state=state, hidden=hidden, layers=layers,
                       checkpoint_layers=checkpointing)
         self.codecs = torch.nn.ModuleDict({
-            name: MLPMatrix({'span': 1024}, width, out_norm=math.sqrt(width), **common)
-            for name, (_, width) in SPACES.items()})
-        self.recombiner = MLPMatrix({name: width for name, (_, width) in SPACES.items()}, 1024,
-                                    out_norm=target_norm, **common)
+            name: MLPMatrix({'span': width}, w, out_norm=math.sqrt(w), **common)
+            for name, (_, w) in SPACES.items()})
+        self.recombiner = MLPMatrix({name: w for name, (_, w) in SPACES.items()}, width,
+                                    out_norm=math.sqrt(width), **common)
+        self.register_buffer('mean', torch.zeros(width))
+        self.register_buffer('std', torch.ones(width))
+
+    @torch.no_grad()
+    def set_statistics(self, spans: list[torch.Tensor]) -> None:
+        x = torch.cat([s.float() for s in spans]).to(self.mean.device)
+        self.mean.copy_(x.mean(0))
+        self.std.copy_(x.std(0).clamp_min(1e-6))
+
+    def standardize(self, span: torch.Tensor) -> torch.Tensor:
+        return (span.float() - self.mean) / self.std
 
     def encode(self, span: torch.Tensor) -> dict[str, torch.Tensor]:
-        n = span.shape[0]
-        return {name: self.codecs[name]([('span', span, 1.0)], max(1, math.ceil(ratio * n)))[0]
+        n, x = span.shape[0], self.standardize(span)
+        return {name: self.codecs[name]([('span', x, 1.0)], max(1, math.ceil(ratio * n)))[0]
                 for name, (ratio, _) in SPACES.items()}
 
-    def decode(self, items: dict[str, torch.Tensor], keep: dict[str, float], count: int):
+    def decode_standardized(self, items: dict[str, torch.Tensor], keep: dict[str, float],
+                            count: int) -> torch.Tensor:
         return self.recombiner([(name, items[name], keep[name]) for name in SPACES], count)[0]
+
+    def decode(self, items: dict[str, torch.Tensor], keep: dict[str, float], count: int):
+        return self.mean + self.std * self.decode_standardized(items, keep, count)
+
+
+def read_count(positions: list[int], spaces: list[str], gates: torch.Tensor,
+               budget: int | None = None, target: int | None = None) -> int:
+    """How many decoder reps the recombiner produces (owner rule, section 5.2).
+
+    With ``target`` (pretraining: K1, K3) the target's own count. At read time the
+    gate-mass-weighted mean of the retrieved items' lengths in decoder reps (an item
+    of m positions in a space of ratio r stands for m / r reps), capped by the
+    per-read ``budget``."""
+    if target is not None:
+        return int(target)
+    reps = torch.tensor([m / SPACES[s][0] for m, s in zip(positions, spaces)],
+                        dtype=torch.float, device=gates.device)
+    mass = gates.detach().float().clamp_min(0)
+    if float(mass.sum()) <= 0:
+        return 1
+    count = max(1, round(float((mass * reps).sum() / mass.sum())))
+    return min(count, budget) if budget else count
+
+
+class SuperpositionOperator(nn.Module):
+    """S_s: rewrites a neighbourhood of items in one space into ``count`` positions of
+    an item for a target key (section 4). K3a conditions on the target key only;
+    K3b (``neighbour_keys``) also gives each neighbour item's key to the operator at
+    each of its positions (zero-initialized, so K3b continues K3a exactly)."""
+
+    def __init__(self, space: str, state: int = 512, hidden: int = 256, layers: int = 3,
+                 checkpoint_layers: bool = False):
+        super().__init__()
+        width, key = SPACES[space][1], KEY_WIDTH[space]
+        self.space = space
+        self.op = MLPMatrix({'item': width}, width, state=state, hidden=hidden, layers=layers,
+                            cond=key, out_norm=math.sqrt(width), extra=key,
+                            checkpoint_layers=checkpoint_layers)
+
+    def forward(self, neighbours: list[tuple[torch.Tensor, torch.Tensor | float, torch.Tensor]],
+                target_key: torch.Tensor, count: int, neighbour_keys: bool = False):
+        """``neighbours``: (values (m, width), gate, key (key_width,)). Returns the
+        rewritten item (count, width) and the neighbourhood's total mass."""
+        items = [('item', values, gate, key if neighbour_keys else None)
+                 for values, gate, key in neighbours]
+        return self.op(items, count, cond=target_key[None])
+
+
+class KeyHeads(nn.Module):
+    """Per-space item keys (from an item's values) and query keys (from the decoder's
+    middle-layer state at a ``memory_search()`` call), unit-normalized; scores are
+    cosine times a learned scale per space."""
+
+    def __init__(self, query_width: int, hidden: int = 512):
+        super().__init__()
+        self.item = nn.ModuleDict({
+            name: nn.Sequential(nn.LayerNorm(width), nn.Linear(width, hidden), nn.SiLU(),
+                                nn.Linear(hidden, KEY_WIDTH[name]))
+            for name, (_, width) in SPACES.items()})
+        self.query = nn.ModuleDict({
+            name: nn.Sequential(nn.LayerNorm(query_width), nn.Linear(query_width, hidden),
+                                nn.SiLU(), nn.Linear(hidden, KEY_WIDTH[name]))
+            for name in SPACES})
+        self.log_scale = nn.ParameterDict({name: nn.Parameter(torch.tensor(math.log(10.0)))
+                                           for name in SPACES})
+
+    def item_key(self, space: str, values: torch.Tensor) -> torch.Tensor:
+        """``values`` (m, width) or (B, m, width) -> unit key(s); mean over positions."""
+        return nn.functional.normalize(self.item[space](values.float()).mean(-2), dim=-1)
+
+    def query_key(self, space: str, state: torch.Tensor) -> torch.Tensor:
+        return nn.functional.normalize(self.query[space](state.float()), dim=-1)
+
+    def scores(self, space: str, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        return queries @ keys.t() * self.log_scale[space].exp()

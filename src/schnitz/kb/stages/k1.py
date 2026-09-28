@@ -32,7 +32,8 @@ import torch
 import torch.nn.functional as F
 
 from schnitz.kb_eval import nll_summary
-from schnitz.kb.decoder import Model, TeacherCache, _batches, _heldout, _kl
+from schnitz.kb.decoder import Model, TeacherCache, frozen_reader, _batches, _heldout
+from schnitz.kb.losses import reconstruction_losses
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.stack import SPACES, Stack
 
@@ -56,16 +57,9 @@ def train_step(model: Model, stack: Stack, examples, weights: dict, rng: random.
     with model.core.autocast():
         outs = [stack.decode(stack.encode(ex['span']), _keep(rng, dropout), ex['span'].shape[0])
                 for ex in examples]
-        spans = [ex['span'] for ex in examples]
-        cos = 1 - F.cosine_similarity(torch.cat(outs), torch.cat(spans), dim=-1).mean()
-        logits, targets = model.read(examples, outs)
-        nll = F.cross_entropy(logits, targets)
-        with torch.no_grad():
-            t_logits, _ = model.read(examples, spans)
-        kl = _kl(logits, t_logits)
-    loss = weights['cos'] * cos + weights['nll'] * nll + weights['kl'] * kl
+        loss, parts = reconstruction_losses(model, stack, examples, outs, weights)
     loss.backward()
-    return {'loss': loss.item(), 'cos': cos.item(), 'nll': nll.item(), 'kl': kl.item()}
+    return {'loss': loss.item(), **parts}
 
 
 @torch.no_grad()
@@ -136,13 +130,8 @@ def run(args) -> None:
     train = [item for item in cache.items if not _heldout(item[2])]
     heldout = sorted((item for item in cache.items if _heldout(item[2]) and item[3] <= 512),
                      key=lambda item: item[2])[:args.eval_items]
-    model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
-                                     checkpoint=args.checkpoint, adapter_rank=16 if args.reader_state else 0,
-                                     gate_open_start=-1, merge_at=-1, merge_checkpoint=False))
-    if args.reader_state:
-        model.load_trained(torch.load(args.reader_state, map_location=model.device))
-    for param in list(model.decoder.parameters()) + list(model.writer.parameters()):
-        param.requires_grad_(False)
+    model = frozen_reader(args.checkpoint, args.experiment, args.reader_state,
+                          args.cuda_fraction)
     stack = Stack(model.target_norm, args.state, args.hidden, args.layers, args.checkpointing)
     stack.to(model.device)
     out = Run(args.output)
@@ -150,6 +139,9 @@ def run(args) -> None:
     if state is not None:
         stack.load_state_dict(state['stack'])
         step = state['step']
+    else:  # corpus statistics for the stack's standardized space
+        sample = random.Random(1).sample(train, min(len(train), 2000))
+        stack.set_statistics([cache.reps(item[0], item[1], 's0') for item in sample])
     optimizer, schedule = warmup_optimizer(stack.parameters(), args.warmup, step, lr=args.lr)
     if state is not None:
         optimizer.load_state_dict(state['optimizer'])
