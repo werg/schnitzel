@@ -26,6 +26,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--transcripts', type=Path, nargs='+', required=True)
     parser.add_argument('--splits', default='train,validation')
     parser.add_argument('--limit', type=int, help='first N transcripts per split and directory')
+    parser.add_argument('--with-writes', action='store_true',
+                        help="only the records of transcripts that have write sites (B4c's)")
     parser.add_argument('--level', default='s1')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--batch-size', type=int, default=32)
@@ -34,7 +36,8 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
 @torch.no_grad()
 def run(args) -> None:
-    records = record_sources(args.transcripts, {s: args.limit for s in args.splits.split(',')})
+    records = record_sources(args.transcripts, {s: args.limit for s in args.splits.split(',')},
+                             with_writes=args.with_writes)
     model = frozen_reader(args.checkpoint, args.experiment, args.writer_state, args.cuda_fraction)
     state = torch.load(args.writer_state, map_location='cpu', weights_only=False)
     meta = {'writer_state': str(args.writer_state), 'step': int(state.get('step', -1))}
