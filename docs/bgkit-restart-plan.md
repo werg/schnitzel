@@ -554,3 +554,17 @@ log your decisions and changes of direction"), newest last.
   `memory_write` calls in LFM2's native tool-call format; results are tool
   messages carrying the latent span between `<|mem|>` and `<|/mem|>`; the key comes
   from the call's hidden state. `<|read|>` is dropped (restart plan 3.2).
+- 28 Sep (WP1, B4 built). The protocol rows are initialized from what B3 already
+  learned: `<|bg|>` from the writer's marker, the `<|rep|>`/`<|/bg|>` output rows
+  and bias from the stop head, the delimiters from the embeddings of "Memory:",
+  "Question:" and a newline. The embedding and LM head are untied (an exact copy)
+  so the protocol rows train at `--protocol-lr` 1e-3 while the decoder stays at
+  1e-5. B4 continues B3 from its final state with the same streams, adding
+  ratio-stated prompts (half), memory delimiters in every read, and QA questions
+  through the soft input port ramped to half of the questions. The replay reference
+  is still frozen S2.
+- 28 Sep (WP2, KB store merged). Raw memmaps per space rather than safetensors
+  shards, so the keys of a space are one contiguous matrix for exact scans; key
+  width 256 for every space (the design had none; K2 may change it). Snapshot
+  cursors as in the v0.8 bank; live items keep fp32 values and Adam moments beside
+  the frozen bf16 payload and are exported as a new frozen KB.
