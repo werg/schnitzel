@@ -49,9 +49,11 @@ def test_each_item_weighs_its_gate_whatever_its_length():
     layer = op.layers[0]
     original = layer.forward
 
-    def spy(h, sources, source_pos, relative, weights, target_pos, cond, locality=None):
+    def spy(h, sources, source_pos, relative, weights, target_pos, cond, locality=None,
+            extra=None):
         seen['weights'] = weights
-        return original(h, sources, source_pos, relative, weights, target_pos, cond, locality)
+        return original(h, sources, source_pos, relative, weights, target_pos, cond, locality,
+                        extra)
 
     layer.forward = spy
     op([('a', torch.randn(8, 6), 1.0), ('b', torch.randn(2, 10), 0.5)], 3)

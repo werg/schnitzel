@@ -34,6 +34,11 @@ different scales (decoder-space spans have a per-dimension RMS near 0.025, the
 positional Fourier features near 1); without the normalization the content term
 of z_ij starts some 30 times weaker than the position terms and the operator
 settles on a position-only code.
+
+Items may carry per-item extra features (``extra`` > 0), e.g. the item's key for a
+superposition operator that sees its neighbours' keys (K3b). They enter z_ij
+through their own normalization and a projection that starts at zero, so an
+operator trained without them (K3a) continues unchanged when they are switched on.
 """
 from __future__ import annotations
 
@@ -48,8 +53,11 @@ from schnitz.bgkit_span import fourier, interface_rms
 
 class MatrixLayer(nn.Module):
     def __init__(self, sources: dict[str, int], state: int, hidden: int, feats: int,
-                 cond: int, relative: bool):
+                 cond: int, relative: bool, extra: int = 0):
         super().__init__()
+        self.extra = nn.Linear(extra, hidden, bias=False) if extra else None
+        if self.extra is not None:
+            nn.init.zeros_(self.extra.weight)
         self.source = nn.ModuleDict({kind: nn.Linear(width, hidden) for kind, width in sources.items()})
         self.source_position = nn.Linear(feats, hidden, bias=False)
         self.target_norm = nn.LayerNorm(state)
@@ -65,7 +73,9 @@ class MatrixLayer(nn.Module):
                                  nn.Linear(2 * state, state))
 
     def forward(self, h, sources, source_pos_feats, relative_feats, weights, target_pos_feats,
-                cond, locality=None):
+                cond, locality=None, extra=None):
+        if self.extra is not None and extra is not None:
+            sources = sources + self.extra(extra)
         target = self.target(self.target_norm(h)) + self.target_position(target_pos_feats)
         if self.condition is not None and cond is not None:
             target = target + self.condition(cond)
@@ -89,33 +99,37 @@ class MLPMatrix(nn.Module):
     """``sources``: input kinds and their widths; ``width``: output width.
 
     ``forward(items, count, cond=None)`` takes ``items`` as a list of
-    ``(kind, x (n, width_kind), gate)`` and returns ``(count, width)`` outputs and
+    ``(kind, x (n, width_kind), gate)`` or ``(kind, x, gate, extra (extra,))`` and returns ``(count, width)`` outputs and
     the total input mass (sum of gates)."""
 
     def __init__(self, sources: dict[str, int], width: int, *, state: int = 512,
                  hidden: int = 256, layers: int = 3, frequencies: int = 8, cond: int = 0,
                  relative: bool = True, out_norm: float | None = None,
-                 checkpoint_layers: bool = False):
+                 checkpoint_layers: bool = False, extra: int = 0):
         super().__init__()
+        self.extra_width = extra
+        self.extra_norm = nn.LayerNorm(extra) if extra else None
         feats = 2 * frequencies + 1
         self.frequencies, self.out_norm, self.cond = frequencies, out_norm, cond
         self.checkpoint_layers = checkpoint_layers
         self.input_norm = nn.ModuleDict({kind: nn.LayerNorm(width) for kind, width in sources.items()})
         self.init = nn.Sequential(nn.Linear(2 * feats + cond, state), nn.SiLU(),
                                   nn.Linear(state, state))
-        self.layers = nn.ModuleList(MatrixLayer(sources, state, hidden, feats, cond, relative)
+        self.layers = nn.ModuleList(MatrixLayer(sources, state, hidden, feats, cond, relative,
+                                                extra)
                                     for _ in range(layers))
         self.head = nn.Sequential(nn.LayerNorm(state), nn.Linear(state, width))
 
     def forward(self, items: list[tuple[str, torch.Tensor, torch.Tensor | float]], count: int,
                 cond: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        items = [(it[0], it[1], it[2], it[3] if len(it) > 3 else None) for it in items]
         device = items[0][1].device
         gates = torch.stack([torch.as_tensor(g, dtype=torch.float, device=device).clamp_min(0)
-                             for _, _, g in items])
-        lengths = torch.tensor([x.shape[0] for _, x, _ in items], device=device, dtype=torch.float)
+                             for _, _, g, _ in items])
+        lengths = torch.tensor([x.shape[0] for _, x, _, _ in items], device=device, dtype=torch.float)
         weights = torch.cat([(g / n).expand(int(n)) for g, n in zip(gates, lengths)])
         positions = torch.cat([(torch.arange(x.shape[0], device=device) + 0.5) / x.shape[0]
-                               for _, x, _ in items])
+                               for _, x, _, _ in items])
         targets = (torch.arange(count, device=device) + 0.5) / count
         f = self.frequencies
         source_pos = fourier(positions, f)
@@ -125,9 +139,9 @@ class MLPMatrix(nn.Module):
         locality = None
         if self.layers[0].bandwidth is not None:
             item_spacing = torch.cat([torch.full((x.shape[0],), 1.0 / x.shape[0], device=device)
-                                      for _, x, _ in items])
+                                      for _, x, _, _ in items])
             spacing = torch.clamp(item_spacing[None], min=1.0 / count).expand(count, -1)
-            kinds = [kind for kind, x, _ in items for _ in range(x.shape[0])]
+            kinds = [kind for kind, x, _, _ in items for _ in range(x.shape[0])]
             locality = (delta, spacing, kinds)
         # size feature: input length (items with a nonzero gate) per output position
         n_eff = float((lengths * (gates > 0)).sum().clamp_min(1))
@@ -139,10 +153,16 @@ class MLPMatrix(nn.Module):
             cond = cond.float().expand(count, self.cond)
             start.append(cond)
         h = self.init(torch.cat(start, dim=-1))
-        normed = [(kind, self.input_norm[kind](x.float())) for kind, x, _ in items]
+        normed = [(kind, self.input_norm[kind](x.float())) for kind, x, _, _ in items]
+        extra = None
+        if self.extra_norm is not None:  # per-item features, zero where an item has none
+            extra = torch.cat([
+                (self.extra_norm(e.float()) if e is not None
+                 else torch.zeros(self.extra_width, device=device))[None].expand(x.shape[0], -1)
+                for _, x, _, e in items])
         for layer in self.layers:
             sources = torch.cat([layer.source[kind](x) for kind, x in normed])
-            args = (h, sources, source_pos, relative, weights, target_pos, cond, locality)
+            args = (h, sources, source_pos, relative, weights, target_pos, cond, locality, extra)
             if self.checkpoint_layers and torch.is_grad_enabled():
                 h = checkpoint(layer, *args, use_reentrant=False)
             else:
