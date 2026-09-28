@@ -479,7 +479,13 @@ class StackFit:
 
         def correction(space, item_id, raw):
             return self.corrections[f'{name}/{space}'][self.index[name][space][item_id]]
-        return head_leaf_key(self.heads, correction)
+
+        def corrections(space, ids, raws):
+            from schnitz.kb.superpose import to_device
+            rows = to_device(torch.tensor([self.index[name][space][i] for i in ids]),
+                             self.device)
+            return self.corrections[f'{name}/{space}'][rows]
+        return head_leaf_key(self.heads, correction, corrections)
 
     def values_fn(self, name: str):
         def values(space, ids):
@@ -519,13 +525,14 @@ class StackFit:
         view, key = self.views[name], self.leaf_key(name)
 
         def leaf(space, ids):
+            from schnitz.kb.superpose import leaf_keys, to_device
             g = view.graphs[space]
-            out = []
-            for i in ids:
-                value, raw = self.stored[name][space][i]
-                out.append((value, key(space, i, value, raw),
-                            torch.tensor(float(g.mass[g.index[i]]), device=self.device)))
-            return out
+            pairs = [self.stored[name][space][i] for i in ids]
+            values = [v for v, _ in pairs]
+            keys = leaf_keys(key, space, ids, values, [r for _, r in pairs])
+            masses = to_device(torch.tensor([float(g.mass[g.index[i]]) for i in ids]),
+                               self.device).unbind(0)
+            return list(zip(values, keys, masses))
         return leaf
 
     def loss(self, picks: dict[str, list[tuple[str, int]]], weights,
@@ -560,26 +567,34 @@ class StackFit:
     def measure(self, picks: dict[str, list[tuple[str, int]]], views=None) -> dict:
         """Reproduction per space (1 - cosine, relative MSE, key cosine) of the rows,
         computed fresh."""
-        from schnitz.kb.producer import item_losses
         views = views or self.views
         out: dict[str, list[float]] = {}
         for view in views.values():
             view.clear()
         for space, rows in picks.items():
+            by_kb: dict[str, list[int]] = {}
             for name, n in rows:
+                g = views[name].graphs[space]
+                if self.targets[name].rows[space][n] in g.top_index:
+                    by_kb.setdefault(name, []).append(n)
+            for name, ns in by_kb.items():
                 t, view = self.targets[name], views[name]
                 g = view.graphs[space]
-                row = t.rows[space][n]
-                if row not in g.top_index:
-                    continue
-                value, key, _ = view.item(space, g.depth, g.top_index[row])
-                got = item_losses({space: value}, {space: t.values[space][n]})
-                out.setdefault(f'cos_{space}', []).append(got[f'cos_{space}'].item())
-                out.setdefault(f'mse_{space}', []).append(got[f'mse_{space}'].item())
-                out.setdefault(f'keycos_{space}', []).append(float(F.cosine_similarity(
-                    key.cpu(), t.keys[space][n], dim=-1)))
+                got_rows = view.items(space, g.depth, [g.top_index[t.rows[space][n]]
+                                                       for n in ns])
+                for n, (value, key, _) in zip(ns, got_rows):
+                    self._measure_one(out, space, t, n, value, key)
         return {k: round(sum(v) / len(v), 5) for k, v in sorted(out.items())} | \
             {'rows': sum(len(r) for r in picks.values())}
+
+    @staticmethod
+    def _measure_one(out: dict, space: str, t, n: int, value: torch.Tensor, key: torch.Tensor) -> None:
+        from schnitz.kb.producer import item_losses
+        got = item_losses({space: value}, {space: t.values[space][n]})
+        out.setdefault(f'cos_{space}', []).append(got[f'cos_{space}'].item())
+        out.setdefault(f'mse_{space}', []).append(got[f'mse_{space}'].item())
+        out.setdefault(f'keycos_{space}', []).append(float(F.cosine_similarity(
+            key.cpu(), t.keys[space][n], dim=-1)))
 
     def write_stats(self) -> dict:
         """Per KB and space: share entropy, row load distribution, churn, tau."""
@@ -1107,6 +1122,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                              '--export-rows-every) and reload when a newer one appears')
     parser.add_argument('--follow-every', type=int, default=50,
                         help='stack: steps between checks for a newer snapshot')
+    parser.add_argument('--unbatched', action='store_true',
+                        help='stack: aggregators row by row (reference path)')
+    parser.add_argument('--max-pairs', type=int,
+                        help='stack: position pairs per batched aggregator pass (262144)')
     parser.add_argument('--balance-weight', type=float, default=0.01,
                         help='stack: balance loss on the rows\' loads (against collapse)')
     parser.add_argument('--stack-eval-banks', type=Path,

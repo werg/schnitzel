@@ -116,3 +116,44 @@ def test_content_is_not_drowned_by_position_at_small_input_scale():
     assert (small - unit).norm() < 0.05 * unit.norm()  # up to the LayerNorm epsilon
     other = op([('span', 0.025 * torch.randn(10, 64), 1.0)], 5)[0]
     assert (small - other).norm() > 0.1 * small.norm()
+
+
+def _groups(extra: bool, cond: int):
+    torch.manual_seed(1)
+    groups = []
+    for n, m in enumerate((1, 5, 3, 7)):
+        items = []
+        for i in range(1 + n):
+            kind = 'a' if (n + i) % 2 else 'b'
+            x = torch.randn(1 + (3 * i + n) % 5, 6 if kind == 'a' else 10, requires_grad=True)
+            gate = torch.tensor(0.0 if (n, i) == (2, 1) else 0.3 + 0.2 * i, requires_grad=True)
+            item = (kind, x, gate) + ((torch.randn(4) if i % 2 == 0 else None,) if extra else ())
+            items.append(item)
+        groups.append((items, m, torch.randn(1, cond) if cond else None))
+    return groups
+
+
+def test_forward_many_equals_forward_per_group_values_and_gradients():
+    for kwargs in ({}, {'relative': False}, {'cond': 5, 'extra': 4},
+                   {'cond': 5, 'extra': 4, 'checkpoint_layers': True}):
+        op = _operator(**kwargs)
+        for p in op.parameters():       # the zero-initialized extra projection must matter
+            p.data.add_(0.01 * torch.randn_like(p))
+        groups = _groups('extra' in kwargs, kwargs.get('cond', 0))
+        leaves = list(op.parameters()) + [it[1] for g in groups for it in g[0]] + \
+            [it[2] for g in groups for it in g[0]]
+        for max_pairs in (None, 40):
+            many = op.forward_many(groups, max_pairs=max_pairs)
+            loss_many = sum((o ** 2).sum() + m for o, m in many)
+            grads_many = torch.autograd.grad(loss_many, leaves, allow_unused=True)
+            single = [op(items, m, cond) for items, m, cond in groups]
+            for (a, ma), (b, mb) in zip(many, single):
+                assert a.shape == b.shape
+                assert torch.allclose(a, b, atol=1e-5), (kwargs, (a - b).abs().max())
+                assert torch.isclose(ma, mb)
+            loss_single = sum((o ** 2).sum() + m for o, m in single)
+            grads_single = torch.autograd.grad(loss_single, leaves, allow_unused=True)
+            for a, b in zip(grads_many, grads_single):
+                assert (a is None) == (b is None)
+                if a is not None:
+                    assert torch.allclose(a, b, atol=1e-4, rtol=1e-4), (kwargs, (a - b).abs().max())

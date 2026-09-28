@@ -1291,6 +1291,10 @@ def superpose_config(args, base: dict | None = None):
         value = getattr(args, name, None)
         if value is not None:
             setattr(config, name, value)
+    if getattr(args, 'unbatched', False):
+        config.batched = False
+    if getattr(args, 'max_pairs', None):
+        config.max_pairs = args.max_pairs
     config.seed = getattr(args, 'seed', config.seed)
     return config
 
@@ -1720,6 +1724,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                           'every checkpoint)')
     sup.add_argument('--max-positives', type=int,
                      help='--rows-from-stack: covering rows kept as retrieval positives (8)')
+    sup.add_argument('--unbatched', action='store_true',
+                     help='aggregators row by row (the reference path; default: all rows of a '
+                     'level in one pass)')
+    sup.add_argument('--max-pairs', type=int,
+                     help='(output, input) position pairs per batched aggregator pass (262144)')
     t = parser.add_argument_group('train')
     t.add_argument('--banks', type=Path, help='output of build (or of rows)')
     t.add_argument('--steps', type=int, default=20000)

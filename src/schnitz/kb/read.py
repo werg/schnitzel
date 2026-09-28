@@ -199,18 +199,27 @@ class KeyOptimizer:
         if self.lr <= 0 or not ids:
             return 0
         b1, b2 = self.betas
-        new = []
-        for item_id, key, grad in zip(ids, keys, grads):
-            name = f'{kb.dataset}/{space}/{item_id}'
-            m, v, t = self.state.get(name, (torch.zeros_like(key), torch.zeros_like(key), 0))
-            g = grad.to(key.device, key.dtype)
-            m, v, t = m.to(key.device) * b1 + (1 - b1) * g, \
-                v.to(key.device) * b2 + (1 - b2) * g * g, t + 1
-            update = self.lr * (m / (1 - b1 ** t)) / ((v / (1 - b2 ** t)).sqrt() + self.eps)
-            new.append(nn.functional.normalize(key - update, dim=-1) if self.normalize
-                       else key - update)
-            self.state[name] = (m.cpu(), v.cpu(), t)
-        kb.set_live_keys(space, list(ids), torch.stack(new).float().cpu())
+        # all keys of the call at once (row-wise the same arithmetic as one key at a time)
+        key = torch.stack([k for k in keys])
+        g = torch.stack([gr for gr in grads]).to(key.device, key.dtype)
+        names = [f'{kb.dataset}/{space}/{i}' for i in ids]
+        zero = torch.zeros(key.shape[1], dtype=key.dtype)
+        old = [self.state.get(n, (zero, zero, 0)) for n in names]
+        m = torch.stack([o[0] for o in old]).to(key.device, key.dtype)
+        v = torch.stack([o[1] for o in old]).to(key.device, key.dtype)
+        t = torch.tensor([o[2] + 1 for o in old], dtype=torch.float64)
+        c1 = (1 - b1 ** t).to(key.device, key.dtype)[:, None]
+        c2 = (1 - b2 ** t).to(key.device, key.dtype)[:, None]
+        m = m * b1 + (1 - b1) * g
+        v = v * b2 + (1 - b2) * g * g
+        update = self.lr * (m / c1) / ((v / c2).sqrt() + self.eps)
+        new = key - update
+        if self.normalize:
+            new = nn.functional.normalize(new, dim=-1)
+        m_cpu, v_cpu = m.cpu().unbind(0), v.cpu().unbind(0)
+        for name, mi, vi, ti in zip(names, m_cpu, v_cpu, t.tolist()):
+            self.state[name] = (mi.clone(), vi.clone(), int(ti))
+        kb.set_live_keys(space, list(ids), new.float().cpu())
         return len(ids)
 
     def state_dict(self) -> dict:

@@ -150,8 +150,8 @@ def test_lazy_rows_equal_the_full_stack_when_caches_are_fresh(tmp_path):
         levels = sp.aggregate(g, ops, leaves)
         for j in range(len(g.row_ids)):
             value, key, mass = view.item(s, g.depth, j)
-            torch.testing.assert_close(value, levels[-1][j][0], rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(key, levels[-1][j][1], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(value, levels[-1][j][0], rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(key, levels[-1][j][1], rtol=1e-4, atol=1e-5)
             assert float(mass) == pytest.approx(float(levels[-1][j][2]), rel=1e-5)
             cache = ItemCache(train=True)
 
@@ -159,7 +159,10 @@ def test_lazy_rows_equal_the_full_stack_when_caches_are_fresh(tmp_path):
                 return [(v, nn.functional.normalize(k, dim=-1), torch.tensor(1.0)) for (v, _), k
                         in zip(cache.get(kb, space, ids), cache.keys(kb, space, ids))]
             grad_v, grad_k, _ = view.grad_value(s, g.depth, j, leaf)   # sampled deep path
-            assert torch.equal(grad_v.detach(), value) and torch.equal(grad_k.detach(), key)
+            # the recomputation is batched differently from the cached pass: equal up to
+            # summation order
+            torch.testing.assert_close(grad_v.detach(), value, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(grad_k.detach(), key, rtol=1e-5, atol=1e-5)
 
 
 def test_field_key_is_the_share_weighted_mean_without_correction():
@@ -184,7 +187,7 @@ def test_gradients_reach_leaves_aggregators_and_key_heads(tmp_path):
     read = r.read(torch.randn(HIDDEN), [kb], ['ds'], 5, cache)
     (read.span.square().sum()).backward()
     stats = cache.backward()
-    assert stats['rows'] > 0 and stats['drift'] == 0.0
+    assert stats['rows'] > 0 and stats['drift'] < 1e-5
     assert any(v.grad is not None and v.grad.abs().sum() > 0 for v in cache.values.values())
     assert any(k.grad is not None and k.grad.abs().sum() > 0 for k in cache.key_leaves.values())
     for s in SPACES:
@@ -395,7 +398,7 @@ def test_train_step_with_rows_from_the_stack_and_the_phases(tmp_path):
     assert torch.equal(op_weight, start_op)
     out = l1.train_step(ctx, [ep], opt, args, 1, phase='l1a',
                         trainable=l1.set_phase(sets, l1.phase_set('l1a', args)))
-    assert out['superpose']['rows'] > 0 and out['superpose']['drift'] == 0.0
+    assert out['superpose']['rows'] > 0 and out['superpose']['drift'] < 1e-5
     assert out['items'] > 0 and not torch.equal(op_weight, start_op)
     assert any(not torch.equal(a, b) for a, b in zip(live(), start))
     report = l1.superposition_metrics(ctx, {})
@@ -572,3 +575,39 @@ def test_stack_fit_learns_the_rows_and_reports_sweeps(tmp_path):
     stats = fit.write_stats()['ds']['A']
     assert stats['share_entropy'] >= 0 and stats['row_load']['n'] > 0
     fit.close()
+
+
+def test_batched_rows_equal_row_by_row_values_and_gradients(tmp_path):
+    kb = leaf_kb(tmp_path)
+    cfg = config(max_pairs=200)          # several chunks per pass
+    view, ops = view_of(kb, cfg, tmp_path)
+    with torch.no_grad():                 # zero-initialized paths must matter here
+        for p in ops.parameters():
+            p.add_(0.02 * torch.randn_like(p))
+    for s, g in view.graphs.items():
+        cache = ItemCache(train=True)
+
+        def leaf(space, ids):
+            return [(v, nn.functional.normalize(k, dim=-1), torch.tensor(1.0)) for (v, _), k
+                    in zip(cache.get(kb, space, ids), cache.keys(kb, space, ids))]
+        results = []
+        for batched in (True, False):
+            view.config.batched = batched
+            view.clear()
+            rows = list(range(len(g.row_ids)))
+            got = view.grad_values(s, g.depth, rows, leaf, deep=1.0)
+            loss = sum((v ** 2).sum() + (k * torch.arange(k.shape[0])).sum() + m
+                       for v, k, m in got)
+            params = list(ops.parameters())
+            ids = g.ids
+            leaves = [v for v, _ in cache.get(kb, s, ids)] + cache.keys(kb, s, ids)
+            grads = torch.autograd.grad(loss, params + leaves, allow_unused=True)
+            results.append(([t.detach() for triple in got for t in triple], grads))
+        view.config.batched = True
+        (va, ga), (vb, gb) = results
+        for a, b in zip(va, vb):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+        for a, b in zip(ga, gb):
+            assert (a is None) == (b is None)
+            if a is not None:       # up to summation order, relative to the tensor's scale
+                assert float((a - b).abs().max()) <= 1e-4 * float(b.abs().max()) + 1e-5

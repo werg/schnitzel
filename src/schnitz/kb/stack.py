@@ -107,6 +107,14 @@ class SuperpositionOperator(nn.Module):
                  for values, gate, key in neighbours]
         return self.op(items, count, cond=target_key[None])
 
+    def forward_many(self, groups, neighbour_keys: bool = False, max_pairs: int | None = None):
+        """``forward`` of many (neighbours, target_key, count) groups in one pass
+        (``MLPMatrix.forward_many``). Returns [(item, mass)]."""
+        return self.op.forward_many(
+            [([('item', v, g, k if neighbour_keys else None) for v, g, k in neighbours],
+              count, target_key[None]) for neighbours, target_key, count in groups],
+            max_pairs=max_pairs)
+
 
 class KeyHeads(nn.Module):
     """Per-space item keys (from an item's values) and query keys (from the decoder's
