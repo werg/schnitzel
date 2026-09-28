@@ -744,3 +744,20 @@ log your decisions and changes of direction"), newest last.
   smoke without content; free replay costs about 1.5 s per source (L1b step 50-130 s at
   batch 4); `schnitz.kb.producer` (L2) and `l1.Producers` replay the same producers
   separately and could share one path.
+- 28 Sep (gap found by the B9 smoke; B4d added). The B3 decoder never emits
+  `memory_search()` on its own (B9 had to force the first call; at B4d's first
+  eval it opens 0 of 44 held-out tool calls where the teacher does), and from L1
+  on the decoder is frozen. Call behaviour is therefore trained in B4: B4d trains
+  whole memory transcripts on their assistant turns (calls included; the close of
+  an empty write span masked, since B4c trains write content), 15% of B4's steps
+  from the start, slots filled from span caches once they exist. The bank stream
+  drops to 10% of steps.
+- 28 Sep (L2 and B9 merged). L2 (`train.py l2 export|train`): the producer path
+  (`schnitz.kb.producer`: writer span, codecs, S_s along rewrite lineage) trained to
+  reproduce exported L1a items, with a functional KL through R and the frozen
+  decoder. B9 (`train.py b9`, `schnitz.kb.experience`): rounds of attempt
+  (generation with real reads), verifier score, SFT on the teacher trajectory
+  against the round's KB, single-pass `memory_write()`; one persistent KB per
+  dataset with supersession, gold records at a receding weight, held-out lineage
+  filter, removed/swapped-record controls. Not yet: gradient into earlier rounds'
+  writes (needs L1b), agent-environment episodes, a round-improvement term, RL.

@@ -100,3 +100,26 @@ def splice_slots(ids: list[int], slots: list[list]) -> list[tuple[int, list]]:
     if len(opens) > len(slots):
         raise ValueError(f'{len(opens)} memory slots in the prefix, {len(slots)} in the row')
     return list(zip(opens, slots[len(slots) - len(opens):]))
+
+
+def transcript_slots(row: dict) -> list[dict]:
+    """Every search slot of a transcript, in the order of their ``<|mem|>`` pairs."""
+    return [m['content']['slot'] for m in row['messages']
+            if isinstance(m.get('content'), dict) and 'slot' in m['content']]
+
+
+def sft_ids(tok, row: dict, max_tokens: int) -> tuple[list[int], list[int]]:
+    """A whole transcript for supervised training of the memory protocol (B4d): token
+    ids and loss mask (assistant turns, memory calls included). Write spans are empty
+    here (B4c trains their content), so the close ``<|/bg|>`` right after ``<|bg|>`` is
+    taken out of the loss; the decision to open one stays in. Cut from the left to
+    ``max_tokens``, keeping the first token."""
+    ids, mask = render_ids(tok, row['messages'], row['tools'])
+    bg, bg_end = SPAN_TOKENS['bg'][1], SPAN_TOKENS['bg_end'][1]
+    for i in range(1, len(ids)):
+        if ids[i] == bg_end and ids[i - 1] == bg:
+            mask[i] = 0
+    if len(ids) > max_tokens:
+        cut = len(ids) - max_tokens + 1
+        ids, mask = ids[:1] + ids[cut:], mask[:1] + mask[cut:]
+    return ids, mask
