@@ -100,17 +100,27 @@ not yet in place, and lands in B4 (before L1, whose mid-sequence reads need it):
 | `<|bg|>` | marker + ratio code | the model opens a compression or KB-write span itself (ratio from the prompt, else a ratio head at this position) |
 | `<|rep|>` | none (the rep is the input) | emit another rep |
 | `<|/bg|>` | end-of-span embedding, appended after the last rep | close the span (replaces the two-way stop head) |
-| `<|read|>` | none | request a KB read (fixed schedule first) |
-| `<|mem|>` … `<|/mem|>` | open and close a read span inserted from the KB | none (inserted by the harness) |
+| `<|mem|>` … `<|/mem|>` | open and close the latent payload inside a `memory_search` tool result | none (inserted by the harness) |
 | `<|port|>` … `<|/port|>` | open and close a soft I/O port span | port output |
 
 All are taken from the 379 unused `<|reserved_N|>` tokens (`<|reserved_6|>` is
-BGKit's splice sentinel and stays as it is). Read spans are marked apart from the
-model's own writes. Training adds interleaved sequences (text, span, text) so the
-model learns to resume after `<|/bg|>` and `<|/mem|>`, with next-token loss on
-`<|/bg|>` at the right count. Until B4, writes end their sequence (nothing is
-trained after a span) and reads use BGKit's prompt template, which only fits reads
-at the start of a prompt.
+BGKit's splice sentinel and stays as it is).
+
+KB access uses LFM2's native tool-call protocol, as in trajectory memory v0.5: a
+read is a visible call `<|tool_call_start|>[memory_search(query="…")]<|tool_call_end|>`
+at its causal position; the search key comes from the call's hidden state (a
+middle layer), the text argument is a readable hint; the result is a normal
+`<|im_start|>tool` message whose content is the latent span between `<|mem|>` and
+`<|/mem|>`, so KB content is marked apart from the model's own writes. A write is a
+`memory_write(...)` call: first with the reusable content as a text argument that
+the writer encodes (v0.5), then with a latent argument, a `<|bg|>` … `<|/bg|>`
+span generated inside the call. Memory use thus has the same form as tool use in
+the agent trajectory corpora. The current restart code places reads in BGKit's
+prompt template ("Context: <span> <question>" in the user turn), a training
+shortcut until B4. Training adds interleaved sequences (text, span, text) so the
+model learns to resume after `<|/bg|>` and after tool results, with next-token
+loss on `<|/bg|>` at the right count. Until B4, writes end their sequence (nothing
+is trained after a span).
 
 ### 3.3 Dense, size-scaled compression (owner decision, 27 September)
 General compression capability is trained at all ratios x1–x128 (x1 and x4
@@ -538,3 +548,9 @@ log your decisions and changes of direction"), newest last.
   LM-head rows (`<|bg|>`, `<|rep|>`, `<|/bg|>`, `<|read|>`, `<|mem|>`/`<|/mem|>`,
   `<|port|>`/`<|/port|>`, from unused reserved tokens) and interleaved
   text-span-text training (restart plan 3.2).
+- **28 Sep, KB access as tool calls (owner correction).** The previous entry
+  introduced a bespoke `<|read|>` token and `<|mem|>` read spans, drifting from
+  trajectory memory v0.5. Corrected: reads are `memory_search` calls and writes
+  `memory_write` calls in LFM2's native tool-call format; results are tool
+  messages carrying the latent span between `<|mem|>` and `<|/mem|>`; the key comes
+  from the call's hidden state. `<|read|>` is dropped (restart plan 3.2).

@@ -218,12 +218,14 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
    gradients from reads (sparse updates, optimizer state per item), a fast loop
    to real superposition. Jointly trained: items, S_s (as the read-time
    combiner), R, key and query heads.
-   - *Reads:* between tokens. The query is formed from a middle layer's state
-     at the read position, so retrieval overlaps the rest of that token's forward
-     pass; the result enters as a `<|mem|>` … `<|/mem|>` span after that position
-     (restart plan 3.2), the next token is predicted from `<|/mem|>`, and
-     everything earlier keeps its cache (causal). Reads every chunk of tokens; issuing a
-     query a few tokens before it is needed hides retrieval latency.
+   - *Reads* are `memory_search` tool calls in LFM2's native format (trajectory
+     memory v0.5; restart plan 3.2): the query is formed from a middle layer's
+     state at the call, so retrieval can start while the call finishes; the
+     result is a tool message whose content is the latent span between `<|mem|>`
+     and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
+     `memory_write` calls. A parameter store is consulted often, so SFT and
+     B9 data carry many calls per trajectory (several queries per site, query
+     diversity per B5); each call costs its few envelope tokens plus the span.
    - *Routing through gates:* each space retrieves a generous candidate set and
      every candidate's gate comes from its query-key similarity; gates scale mass
      exactly, so the task loss trains keys and query heads (the routing half of
@@ -267,8 +269,8 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
 - **Store contracts.** Per-space variable-width items with masses, keys and
   rewrite lineage extend the mutable-bank (v0.8) and scale-out (v0.9) contracts;
   exact-scan index first, ANN measured separately (invariant 8).
-- **Writes during trajectories** (B9) need a defined trigger: at episode or
-  round ends first, learned write sites later.
+- **Writes during trajectories** (B9) are `memory_write` calls: supervised at
+  episode or round ends first, learned write sites later.
 
 ## 6. Relation to other plan stages
 
