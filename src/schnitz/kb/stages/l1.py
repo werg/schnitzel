@@ -643,7 +643,7 @@ def train(args) -> None:
     usage: dict = {}
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'reader.pt'
-    kbs = open_live(args.banks, args.output, model.device, args.sync_every)
+    kbs = open_live(args.banks, args.output, args.live_device, args.sync_every)
     if not state_path.exists():
         for kb in kbs.values():         # a crash before the first save restarts from the banks
             if kb.live_updates:
@@ -818,6 +818,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                    help='L1a items in place; L1b (through the sources) is not built')
     t.add_argument('--max-reps', type=int, default=16, help='span budget per read')
     t.add_argument('--max-tokens', type=int, default=3072)
+    t.add_argument('--live-device', default='cpu',
+                   help='where the resident live state lives (cpu: per-item reads are cheap; '
+                        'CPU and GPU share memory on Spark)')
     t.add_argument('--sync-every', type=int, default=500,
                    help='resident live state: sync to disk every N updates (resume is exact '
                         'through the live checkpoints taken with each reader checkpoint)')
