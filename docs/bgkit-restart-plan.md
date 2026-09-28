@@ -614,3 +614,11 @@ log your decisions and changes of direction"), newest last.
   read intensity. Retrieval tasks are the starting point for this continual-
   learning system. Consequences: small read spans and candidate counts, and a
   standing experiment on quality against KB size at a fixed per-sample read budget.
+- 28 Sep (WP3 v3, `memory-<name>-20260928v3`). Transcripts follow the single-pass write:
+  a write site is `memory_write()` without arguments with the `<|bg|>` … `<|/bg|>` span
+  generated in the same assistant turn (reps without token loss; the open and close
+  decisions with loss). The v2 write text is kept only as `write_sites[i].teacher_text`,
+  the B4 distillation target, and is never rendered. The label-side placement of the
+  `action_*` searches (before the agent's own next action) is accepted by the owner: it
+  demonstrates when to call, like tool-call placement in SFT, and the call carries no
+  content.
