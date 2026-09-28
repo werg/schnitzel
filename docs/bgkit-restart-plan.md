@@ -831,3 +831,7 @@ log your decisions and changes of direction"), newest last.
   becomes aggregator pretraining with recovery by reading (covering entries -> R ->
   the member record); the target-key K3a/K3b and my depth-2 variant of it are
   superseded and will be replaced on the field code.
+- 28 Sep (owner). No long-term split between write and read side: after a short
+  read-side warm-up, leaves, aggregators, R and key heads train jointly; anchor,
+  consolidation and phase alternation are off by default, remedies only if the
+  logged drift and retention metrics show see-saw.

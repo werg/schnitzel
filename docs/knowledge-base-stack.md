@@ -306,17 +306,17 @@ applies to every stage.
      7), recorded as rewrite shares; an item's time is the latest of its
      sources' (invariant 2); mixing only within one KB (invariant 6). Control:
      depth 0 (the items themselves) at the same storage and read budget.
-     *One operator per side (owner, 28 September):* S_s is write-side only: its
-     fields build the superposed entries and re-superpose them when knowledge is
-     added. A read retrieves the top entries per space and R reads them directly
-     (gates from retrieval times stored mass), conditioned on the query key; a
-     per-query S_s combine before R would redo work R does and, sharing weights
-     with the write side, would move every entry with each read-side update. So
-     entries change only through their leaves and through item-preserving
-     consolidation of the write fields (leaves re-fit to the pre-update entries);
-     R and the key heads are anchored on held-out entries of all KBs. A per-space
-     read combine stays as an ablation, and read/write phase alternation as a
-     schedule; item drift, read drift and cross-KB retention are logged.
+     *One set of aggregators, trained jointly (owner, 28 September):* S_s is
+     write-side only: its fields build the superposed entries and re-superpose
+     them when knowledge is added. A read retrieves the top entries per space and
+     R reads them directly (gates from retrieval times stored mass), conditioned
+     on the query key; no aggregator runs at reads. Training: a short read-side
+     warm-up (R and key heads on fixed entries), then leaves, aggregators, R and
+     heads trained jointly from the same task loss. A read anchor, item-preserving
+     consolidation and read/write phase alternation exist as remedies, off by
+     default, switched on only if item drift, read drift on a fixed probe set or
+     cross-KB retention show see-saw (logged every eval). A per-space read combine
+     stays as an ablation.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
