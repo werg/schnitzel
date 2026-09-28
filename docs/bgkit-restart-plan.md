@@ -859,3 +859,6 @@ log your decisions and changes of direction"), newest last.
   an input helps and away from those it hurts (zero-sum per input, invariant 7).
   Keys = key head + free per-item correction; balance loss on row load. The
   learned per-pair content score I had proposed is not added.
+- 28 Sep (owner). Superposition field size is an empirical, tuned hyperparameter
+  (as large as memory allows); training samples field sizes from a range so the
+  model is robust to it and to KB density; evals sweep sizes with memory and time.

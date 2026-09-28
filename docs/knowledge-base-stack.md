@@ -290,6 +290,13 @@ applies to every stage.
    responsibilities summing to one and makes the competition zero-sum. Input
    keys are the key head's output plus a free per-item correction; a balance
    loss on row load prevents collapse onto a few rows.
+   *Field size is empirical (owner):* larger fields should speed up learning,
+   at a cost in memory and time (a top row depends on up to f^L leaves). It is a
+   tuned hyperparameter, and the model is trained to be robust to it: field
+   sizes are sampled from a range per space during training (the operator
+   already sees its input-to-output size), evaluations sweep fixed sizes with
+   their memory and time per step, and KBs of different density (rows
+   subsampled) are evaluated, since every KB differs in density anyway.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
@@ -435,6 +442,8 @@ are the levers; the dense per-pair form is kept on purpose.
 ## 8. Open questions
 
 - Space count, widths and position ratios (the table above is a starting point).
+- Field sizes per space and level: as large as affordable; tuned by sweeps, with
+  training robust to the size (section 5.1 step 5).
 - Neighbourhood sizes per space, and M/N in rewrite-then-recover.
 - (Decided 28 September: R receives the query key; no per-query S_s at reads.)
 - How rewriting levels are scheduled once the store is large.
