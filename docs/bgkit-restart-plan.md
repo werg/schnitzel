@@ -1056,3 +1056,14 @@ log your decisions and changes of direction"), newest last.
   and parallel-recall contrast runs, which are building their banks now. Each episode
   reads with one search whose alternatives are every citance, and an abstract needs
   several citances. If reads stay single-item, the transcripts get 2-3 searches.
+- 29 September: read-phase curriculum gets a content warm start (`--gold-reads`,
+  `--gold-anneal`). On recall-text the headroom is large: no context 3.07 nats, text
+  context 0.39. But at step 175 retrieval found almost nothing (recall@1 0-0.005 per
+  space) and the contrast sat at its margin (content 0.0004 nats), so R never saw
+  useful content. Even gold reads were worth only 0.01 nats before training. Both
+  contrast runs restart as `read-gold`: 75% of training episodes read their slots'
+  own items, annealed to 0 over 1500 steps, 3000 steps in all. R, the null prefix and
+  the rows learn to carry content first, while the retrieval loss trains the keys on
+  the rest. The r6 QA baseline (frozen, no contrast) keeps improving: content 0.095
+  -> 0.145 -> 0.182 nats at steps 250/750/1000 (retrieved 1.591, shuffled 1.773,
+  text 1.535).
