@@ -595,6 +595,24 @@ class Model:
 
 
 
+class Neighbours:
+    """The exact-cosine neighbour table of ``scripts/bgkit_neighbors.py`` over the
+    teacher cache's records: ``of(item, k)`` gives the k nearest other records."""
+
+    def __init__(self, path: Path, cache: TeacherCache):
+        data = torch.load(path, weights_only=False)
+        self.table, ids = data['neighbors'], data['record_ids']
+        index = {record_id: i for i, record_id in enumerate(ids)}
+        by_id = {item[2]: item for item in cache.items}
+        self.items = [by_id.get(record_id) for record_id in ids]
+        self.row = {record_id: index[record_id] for record_id in by_id if record_id in index}
+
+    def of(self, item, k: int) -> list:
+        row = self.row.get(item[2])
+        if row is None:
+            return []
+        return [self.items[j] for j in self.table[row, :k].tolist() if self.items[j] is not None]
+
 def frozen_reader(checkpoint, experiment: str, reader_state=None,
                   cuda_fraction: float = 0.2) -> Model:
     """The frozen decoder (and writer) of the stack stages: S2, or the merged decoder

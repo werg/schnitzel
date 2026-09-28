@@ -100,18 +100,27 @@ rewrite: S_s(neighbourhood | target keys) ──▶ items in space s, written ba
 
 - **Spaces** differ in granularity and width. An item's position count scales
   linearly with the source span, m_s = ceil(r_s · n), and all spaces together are
-  about the size of the input (sum of r_s · d_s ≈ 1024 per input rep): the stack
+  about the size of the input (sum of r_s · d_s = 1024 per input rep): the stack
   as a whole does not compress, but each space alone is a bottleneck, so no
-  single space can carry a record and the recombiner must combine spaces.
-  Starting point (to be tuned):
+  single space can carry a record and the recombiner must combine spaces. Every
+  space holds the same amount of information per input rep (owner, 28
+  September): width grows exactly as positions shrink, so a coarse item carries
+  as much as the fine positions it stands for.
 
   | Space | r_s (positions per input rep) | width d_s | r_s · d_s |
   |---|---|---|---|
-  | A (fine) | 1 | 384 | 384 |
+  | A (fine) | 1 | 256 | 256 |
   | B | 1/2 | 512 | 256 |
-  | C | 1/4 | 768 | 192 |
-  | D (coarse) | 1/8 | 1024 | 128 |
-  | total | | | 960 |
+  | C | 1/4 | 1024 | 256 |
+  | D (coarse) | 1/8 | 2048 | 256 |
+  | total | | | 1024 |
+
+  K1 trains every space to carry content of its own: space dropout per space
+  (the fine space dropped most often) and a term reconstructing from one random
+  space alone. Reconstruction alone gives coarse spaces no advantage; they pay
+  off where one item must stand for a wide input at a low read cost, so the
+  training regimes include such inputs (long and multi-record spans in K1/K3,
+  sparse read budgets and directly trained items in L1).
 
   Retrieval neighbourhoods grow with coarseness: fine spaces retrieve few items,
   coarse spaces many.

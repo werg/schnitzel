@@ -761,6 +761,16 @@ log your decisions and changes of direction"), newest last.
   dataset with supersession, gold records at a receding weight, held-out lineage
   filter, removed/swapped-record controls. Not yet: gradient into earlier rounds'
   writes (needs L1b), agent-environment episodes, a round-improvement term, RL.
+- 28 Sep (owner; spaces rebalanced, K1 restarted a fourth time). The widths
+  384/512/768/1024 (my earlier choice) let information per rep fall with
+  coarseness (384/256/192/128 values per rep); K1 at step 2000 captured 0.60 with
+  all spaces, 0.54 with A alone, and lost nothing without C or D: the coarse spaces
+  were redundant copies. Now every space holds 256 values per rep (widths
+  256/512/1024/2048, 1024 in all, the input size); K1 adds a term reconstructing
+  from one random space alone (weight 0.5) and per-space dropout (A 0.5, B 0.3,
+  C/D 0.25). The previous run is kept as `kb-k1-widths384`. Still to add: K1/K3
+  inputs whose breadth favours coarse items (long and multi-record spans); L1's
+  sparse read budget and directly trained items supply that pressure too.
 - 28 Sep (one producer path). `schnitz.kb.producer` is now the only implementation of
   the producers: `Writer` (in-place writes and the codecs' items), `write_spans` (feeds
   `teacher`, `self`, `free`), `WriteLog` and `Producers` (selective replay at the

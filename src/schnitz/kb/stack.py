@@ -13,7 +13,8 @@ from torch import nn
 from schnitz.kb_store import DEFAULT_SPACES
 from schnitz.mlp_matrix import MLPMatrix
 
-# space: (positions per span rep, width); the widths times the ratios sum to 960.
+# space: (positions per span rep, width); width x ratio is 256 in every space (equal
+# information per space), 1024 in all.
 # One definition for the store and every stage: ``kb_store.DEFAULT_SPACES``.
 SPACES = {name: (spec.ratio, spec.width) for name, spec in DEFAULT_SPACES.items()}
 KEY_WIDTH = {name: spec.key_width for name, spec in DEFAULT_SPACES.items()}

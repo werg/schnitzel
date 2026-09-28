@@ -191,7 +191,7 @@ def test_reads_are_authorized_per_dataset_kb(tmp_path):
     with pytest.raises(PermissionError):            # an episode of another dataset
         exp.kb_of({'episode_id': 'e', 'kb': 'secret'})
     with pytest.raises(PermissionError):            # the store refuses another dataset's item
-        kb.append('A', [NewItem(torch.randn(1, 384), torch.randn(256),
+        kb.append('A', [NewItem(torch.randn(1, 256), torch.randn(256),
                                 Provenance(('x',), 'codec', 0, 'secret'), 1.0, 1)])
     view, _ = exp.view({'episode_id': 'e', 'kb': 'ds'}, 'train', 0)
     assert view.dataset == 'ds'

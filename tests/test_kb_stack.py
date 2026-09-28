@@ -10,7 +10,8 @@ from schnitz.mlp_matrix import MLPMatrix
 def test_spaces_come_from_the_store_definition():
     from schnitz.kb_store import DEFAULT_SPACES
     assert SPACES == {n: (s.ratio, s.width) for n, s in DEFAULT_SPACES.items()}
-    assert sum(r * w for r, w in SPACES.values()) == 960
+    assert {r * w for r, w in SPACES.values()} == {256}
+    assert sum(r * w for r, w in SPACES.values()) == 1024
 
 
 def test_read_count_rule():
@@ -101,3 +102,21 @@ def test_stack_standardizes_spans_with_corpus_statistics():
     out = stack.decode(items, {s: 1.0 for s in SPACES}, 9)
     assert out.shape == (9, 24)
     assert torch.allclose(stack.standardize(out) * stack.std + stack.mean, out, atol=1e-5)
+
+
+def test_k1_multi_record_input_concatenates_neighbours_within_the_token_budget():
+    from types import SimpleNamespace
+
+    from schnitz.kb.stages.k1 import _multi_example
+    texts = ['aaaa', 'bb', 'cccccc', 'dd']
+    items = [(0, i, f'r{i}', len(t), i) for i, t in enumerate(texts)]
+    cache = SimpleNamespace(texts=texts, reps=lambda shard, row, tag: torch.full((row + 1, 3),
+                                                                                  float(row)))
+    model = SimpleNamespace(device='cpu',
+                            text_ids=lambda text: torch.tensor([ord(c) for c in text]))
+    neighbours = SimpleNamespace(of=lambda item, k: items[1:1 + k])
+    ex = _multi_example(cache, model, neighbours, items[0], k=3, max_tokens=12)
+    assert ex['records'] == 2                       # 'cccccc' would exceed the budget
+    sep = [ord('\n')] * 2
+    assert ex['ids'].tolist() == [ord('a')] * 4 + sep + [ord('b')] * 2
+    assert ex['span'].shape[0] == 1 + 2 and ex['span'][1:].eq(1.0).all()

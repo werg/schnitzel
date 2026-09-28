@@ -33,28 +33,12 @@ import random
 import torch
 import torch.nn.functional as F
 
-from schnitz.kb.decoder import Model, TeacherCache, _batches, _heldout, frozen_reader
+from schnitz.kb.decoder import Model, Neighbours, TeacherCache, _batches, _heldout, frozen_reader
 from schnitz.kb.losses import reconstruction_losses
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.stack import SPACES, KeyHeads, Stack, SuperpositionOperator, read_count
 from schnitz.kb.stages.k1 import _example
 from schnitz.kb_eval import nll_summary
-
-
-class Neighbours:
-    def __init__(self, path: Path, cache: TeacherCache):
-        data = torch.load(path, weights_only=False)
-        self.table, ids = data['neighbors'], data['record_ids']
-        index = {record_id: i for i, record_id in enumerate(ids)}
-        by_id = {item[2]: item for item in cache.items}
-        self.items = [by_id.get(record_id) for record_id in ids]
-        self.row = {record_id: index[record_id] for record_id in by_id if record_id in index}
-
-    def of(self, item, k: int) -> list:
-        row = self.row.get(item[2])
-        if row is None:
-            return []
-        return [self.items[j] for j in self.table[row, :k].tolist() if self.items[j] is not None]
 
 
 class K3(torch.nn.Module):

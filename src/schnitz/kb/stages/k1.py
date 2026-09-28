@@ -32,7 +32,7 @@ import torch
 import torch.nn.functional as F
 
 from schnitz.kb_eval import nll_summary
-from schnitz.kb.decoder import Model, TeacherCache, frozen_reader, _batches, _heldout
+from schnitz.kb.decoder import Model, Neighbours, TeacherCache, frozen_reader, _batches, _heldout
 from schnitz.kb.losses import reconstruction_losses
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.stack import SPACES, Stack
@@ -45,32 +45,73 @@ def _example(cache: TeacherCache, model: Model, item) -> dict:
             'span': cache.reps(shard, row, 's0').to(model.device).float()}
 
 
-def _keep(rng: random.Random, p: float) -> dict[str, float]:
-    keep = {name: 0.0 if rng.random() < p else 1.0 for name in SPACES}
+def _multi_example(cache: TeacherCache, model: Model, neighbours: Neighbours, item, k: int,
+                   max_tokens: int) -> dict:
+    """A long input of several related records: the record and up to ``k`` of its
+    nearest neighbours while their texts fit ``max_tokens``; the span is the records'
+    spans in order, the target their texts separated by a blank line. Coarse items
+    then have to stand for a wide input."""
+    parts = [_example(cache, model, item)]
+    tokens = int(parts[0]['ids'].shape[0])
+    for other in neighbours.of(item, k):
+        if tokens + other[3] + 2 > max_tokens:
+            break
+        parts.append(_example(cache, model, other))
+        tokens += int(parts[-1]['ids'].shape[0]) + 2
+    sep = model.text_ids('\n\n')
+    ids = torch.cat([x for i, p in enumerate(parts) for x in ((sep, p['ids']) if i else (p['ids'],))])
+    return {'ids': ids, 'target': ids, 'task': 'reconstruct', 'records': len(parts),
+            'span': torch.cat([p['span'] for p in parts])}
+
+
+def _dropout(spec: str) -> dict[str, float]:
+    """``0.25`` (every space) or ``A=0.5,B=0.25,...`` (per space; missing: 0.25)."""
+    if '=' not in spec:
+        return {name: float(spec) for name in SPACES}
+    given = {k: float(v) for k, v in (pair.split('=') for pair in spec.split(','))}
+    return {name: given.get(name, 0.25) for name in SPACES}
+
+
+def _keep(rng: random.Random, p: dict[str, float]) -> dict[str, float]:
+    keep = {name: 0.0 if rng.random() < p[name] else 1.0 for name in SPACES}
     if not any(keep.values()):
         keep[rng.choice(list(SPACES))] = 1.0
     return keep
 
 
 def train_step(model: Model, stack: Stack, examples, weights: dict, rng: random.Random,
-               dropout: float) -> dict:
+               dropout: dict[str, float]) -> dict:
+    """Reconstruction through all spaces with space dropout; with ``single`` weight
+    also through one random space alone (the same items), so every space carries
+    content of its own instead of leaving it to the widest."""
     with model.core.autocast():
-        outs = [stack.decode(stack.encode(ex['span']), _keep(rng, dropout), ex['span'].shape[0])
-                for ex in examples]
+        encoded = [stack.encode(ex['span']) for ex in examples]
+        outs = [stack.decode(e, _keep(rng, dropout), ex['span'].shape[0])
+                for e, ex in zip(encoded, examples)]
         loss, parts = reconstruction_losses(model, stack, examples, outs, weights)
+        if weights.get('single', 0) > 0:
+            alone = [rng.choice(list(SPACES)) for _ in examples]
+            singles = [stack.decode(e, {n: float(n == s) for n in SPACES}, ex['span'].shape[0])
+                       for e, ex, s in zip(encoded, examples, alone)]
+            single, sparts = reconstruction_losses(model, stack, examples, singles, weights)
+            loss = loss + weights['single'] * single
+            parts.update({f'single_{k}': v for k, v in sparts.items()})
     loss.backward()
     return {'loss': loss.item(), **parts}
 
 
 @torch.no_grad()
-def evaluate(model: Model, stack: Stack, cache: TeacherCache, items, batch_size: int) -> dict:
+def evaluate(model: Model, stack: Stack, cache: TeacherCache, items, batch_size: int,
+             build=None) -> dict:
+    """``build(item)`` makes an example (default: one record)."""
+    build = build or (lambda item: _example(cache, model, item))
     all_on = {name: 1.0 for name in SPACES}
     arms = ['span', 'stack', 'stack_shuffled', 'span_shuffled'] + \
         [f'without_{s}' for s in SPACES] + [f'only_{s}' for s in SPACES]
     sums: dict[str, float] = {}
     tokens = 0
     for start in range(0, len(items), batch_size):
-        examples = [_example(cache, model, item) for item in items[start:start + batch_size]]
+        examples = [build(item) for item in items[start:start + batch_size]]
         with model.core.autocast():
             encoded = [stack.encode(ex['span']) for ex in examples]
             counts = [ex['span'].shape[0] for ex in examples]
@@ -108,7 +149,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--state', type=int, default=512)
     parser.add_argument('--hidden', type=int, default=256)
     parser.add_argument('--layers', type=int, default=3)
-    parser.add_argument('--space-dropout', type=float, default=0.25)
+    parser.add_argument('--space-dropout', default='0.25',
+                        help='drop probability, one value or per space (A=0.5,B=0.25,...)')
+    parser.add_argument('--neighbors', type=Path,
+                        help='neighbour table (scripts/bgkit_neighbors.py) for multi-record inputs')
+    parser.add_argument('--multi-record', type=float, default=0.0,
+                        help='share of steps whose inputs are several related records in one span')
+    parser.add_argument('--multi-k', type=int, default=4, help='neighbours per multi-record input')
+    parser.add_argument('--multi-max-tokens', type=int, default=1536)
+    parser.add_argument('--multi-batch', type=int, default=8)
     parser.add_argument('--checkpointing', action='store_true',
                         help='recompute operator layers in backward')
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -150,14 +199,29 @@ def run(args) -> None:
                           heldout_items=len(heldout)))
     log = out.log
 
+    neighbours = Neighbours(args.neighbors, cache) if args.multi_record > 0 else None
+
+    def multi(item):
+        return _multi_example(cache, model, neighbours, item, args.multi_k, args.multi_max_tokens)
+
+    def run_eval():
+        result = evaluate(model, stack, cache, heldout, 16)
+        if neighbours is not None:  # the same held-out records with their neighbours
+            result['multi'] = evaluate(model, stack, cache, heldout[:args.eval_items // 2], 4,
+                                       build=multi)
+        return result
+
     if step == 0:
-        log({'step': 0, 'eval': evaluate(model, stack, cache, heldout, 16)})
+        log({'step': 0, 'eval': run_eval()})
     window = Window()
     batches = _batches(train, rng, args.batch_size, args.batch_tokens)
     while step < args.steps:
-        examples = [_example(cache, model, item) for item in next(batches)]
+        if neighbours is not None and rng.random() < args.multi_record:
+            examples = [multi(item) for item in rng.sample(train, args.multi_batch)]
+        else:
+            examples = [_example(cache, model, item) for item in next(batches)]
         optimizer.zero_grad(set_to_none=True)
-        result = train_step(model, stack, examples, weights, rng, args.space_dropout)
+        result = train_step(model, stack, examples, weights, rng, _dropout(args.space_dropout))
         torch.nn.utils.clip_grad_norm_(stack.parameters(), 1.0)
         optimizer.step()
         schedule.step()
@@ -168,7 +232,7 @@ def run(args) -> None:
         if step % args.eval_every == 0 or step == args.steps:
             out.save('stack.pt', {'stack': stack.state_dict(), 'optimizer': optimizer.state_dict(),
                                   'step': step})
-            log({'step': step, 'eval': evaluate(model, stack, cache, heldout, 16)})
+            log({'step': step, 'eval': run_eval()})
 
 
 def main() -> None:

@@ -82,7 +82,7 @@ def test_future_items_do_not_change_the_read(tmp_path):
 
 def test_unread_candidates_and_gate_zero_spaces_change_nothing(tmp_path):
     r = reader()
-    reads = {'A': torch.randn(3, 384), 'B': torch.randn(2, 512)}
+    reads = {'A': torch.randn(3, SPACES['A'].width), 'B': torch.randn(2, 512)}
     alone, _ = r.stack.recombiner([('A', reads['A'], 1.0)], 5)
     gated, _ = r.stack.recombiner([('A', reads['A'], 1.0), ('B', reads['B'], 0.0)], 5)
     torch.testing.assert_close(alone, gated, atol=1e-6, rtol=1e-6)
