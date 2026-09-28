@@ -10,15 +10,25 @@ restart plan's reading of "spaces" as BGKit compression ratios.
 The knowledge base (KB) is meant to hold knowledge that would otherwise live in
 the parameters of a much larger language model, so that the KB plus a small
 decoder can replace that model in a modular way. It trades disk storage and some
-latency for resident memory: a very large, dynamic mixture of experts whose
-"experts" are stored items, selected per query.
+latency for resident memory. The items are parameters (trained, or extracted
+from text) that act **only in context**: a read places a short latent span in
+the decoder's context, which the decoder reads like any other input. They are not
+expert outputs mixed into the hidden states (owner, 28 September).
+
+**Extreme sparsity, breadth over intensity.** Reads are frequent and as cheap as
+possible: each read touches a handful of items out of a very large KB and costs a
+short span. Capability is meant to come from the breadth of the KB, not from
+how much is read per sample; the experiment tests how far that goes (quality
+against KB size at a fixed per-sample read budget). Retrieval tasks are the
+starting point for training this kind of continual-learning system, not its
+purpose.
 
 For that, stored items must not be isolated copies of source documents.
 Retrieval-augmented QA works fine with localized records (retrieve the right
 passage, read it), and our training tasks started there, which biases intuition
 towards "find the gold record". A parameter store needs the opposite: every
 item carries parts of many sources, every source is spread over many items, and
-a query is answered by combining many items densely. **Superposition is an
+the few items one read touches each carry many sources. **Superposition is an
 explicit goal**, and objectives are chosen to require it.
 
 Earlier SDKB runs showed how hard it is to get an end-to-end lift from learned
@@ -224,13 +234,16 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
      call, so retrieval can start while the call finishes; the
      result is a tool message whose content is the latent span between `<|mem|>`
      and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
-     `memory_write` calls. A parameter store is consulted often, so SFT and
+     `memory_write()` calls in which the model generates the `<|bg|>` span
+     itself, in the same pass; per-space heads on that pass give the items and
+     keys (no text argument, no second encoding pass; owner, 28 September). A parameter store is consulted often, so SFT and
      B9 data carry many calls per trajectory (several queries per site, query
      diversity per B5); each call costs its few envelope tokens plus the span.
-   - *Routing through gates:* each space retrieves a generous candidate set and
-     every candidate's gate comes from its query-key similarity; gates scale mass
-     exactly, so the task loss trains keys and query heads (the routing half of
-     a mixture of experts).
+   - *Routing through gates:* each space scores a candidate set and every
+     candidate's gate comes from its query-key similarity, sparse so that a read
+     keeps only a handful of items; gates scale mass
+     exactly, so the task loss trains keys and query heads (learned routing,
+     not expert mixing: the read result stays in context).
    - *Tasks:* reconstruction and QA over the R6 KBs, trajectory SFT over the task
      KBs, continuation of KB-domain text.
    - *Superposition pressure:* the storage budget and recursive rewriting passes
@@ -260,9 +273,13 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
   the output must follow the KB, not the decoder's weights; removing a domain's
   items must remove the capability; inserting new knowledge must keep old
   knowledge.
-- **Context cost of spliced reads.** A 30-rep span every 64 tokens lengthens a
-  sequence by about 47%; injecting read results into the hidden states, like
-  expert outputs, is the later alternative.
+- **Context cost of reads.** Reads stay in context (owner, 28 September), so
+  their cost is span length times frequency: a 30-rep span every 64 tokens
+  lengthens a sequence by about 47%. Read spans are therefore kept short (a few
+  reps per read, the recombiner's count a trained choice under a budget), and a
+  read's gates are sparse (a handful of items with nonzero mass out of the
+  candidate set). The standing breadth experiment measures quality against KB
+  size at a fixed per-sample read budget.
 - **Gradients into producers.** In L1 items are detached from the writer; L2
   reconnects producers by distillation. Where task gradients must reach a
   producer directly (B9 across rounds), selective producer replay applies

@@ -32,12 +32,11 @@ MEMORY_TOOLS = [
      'description': 'Search the knowledge base for what the task needs next. The result is a '
                     'memory span the model reads directly.',
      'parameters': {'type': 'object', 'properties': {}, 'required': []}},
+    # a write has no text argument either: the model generates the <|bg|> span itself
     {'name': 'memory_write',
-     'description': 'Store reusable information in the knowledge base for later tasks.',
-     'parameters': {'type': 'object',
-                    'properties': {'content': {'type': 'string',
-                                               'description': 'the information to store'}},
-                    'required': ['content']}},
+     'description': 'Store what is worth keeping in the knowledge base. The model writes it '
+                    'directly as a memory span.',
+     'parameters': {'type': 'object', 'properties': {}, 'required': []}},
 ]
 
 
