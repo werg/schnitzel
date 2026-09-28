@@ -568,3 +568,9 @@ log your decisions and changes of direction"), newest last.
   width 256 for every space (the design had none; K2 may change it). Snapshot
   cursors as in the v0.8 bank; live items keep fp32 values and Adam moments beside
   the frozen bf16 payload and are exported as a new frozen KB.
+- 28 Sep (WP3 merged). Memory-protocol transcripts for all 22 corpora; every
+  assistant message carries loss including the memory calls, tool results never.
+  Queries are templates plus keyphrases and may name a record's header (table
+  name, passage title) that the causal prefix lacks; allowed for now since headers
+  are public metadata of the KB, to be revisited with the local-LLM query rewriter
+  (`--query-hook`) before L1 measures retrieval from generated queries.
