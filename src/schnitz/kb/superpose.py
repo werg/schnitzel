@@ -12,8 +12,10 @@ level's outputs stand for the rows. Reads retrieve rows by the query key and the
 query-conditioned recombiner R turns them into the span (``schnitz.kb.read``); no
 aggregator runs at a query's or a source record's key.
 
-- **Fields.** Each input joins the fields of its c nearest rows (``--overlap``), with
-  shares ``softmax((cos - 1) / T)`` normalized per input: an input's shares sum to one
+- **Fields.** Each input's candidates are its c nearest rows (``--overlap``; redrawn
+  at every rebuild), and its shares over them are ``softmax(tau cos(k_input, k_row))``,
+  differentiable in both keys and in tau (learnable per level), recomputed at every
+  combine (the stored shares are those of the last rebuild): an input's shares sum to one
   and its mass is split over its rows, never duplicated or dropped (invariant 7); a
   row's mass is the share-weighted sum of its inputs' masses, so each level carries
   the KB's total mass (invariant 5). A row whose field would be empty takes its nearest

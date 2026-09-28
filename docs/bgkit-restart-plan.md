@@ -862,3 +862,24 @@ log your decisions and changes of direction"), newest last.
 - 28 Sep (owner). Superposition field size is an empirical, tuned hyperparameter
   (as large as memory allows); training samples field sizes from a range so the
   model is robust to it and to KB density; evals sweep sizes with memory and time.
+- 28 Sep, superposed KB implementation choices. (1) Rows are placed by
+  farthest-point sampling over the leaves' keys (spread over the occupied key space;
+  a k-means would be a later refinement) and start as the share-weighted mean of
+  their field, keys as the field's normalized mean key, so depth 0 over rows starts
+  as a plain compaction. (2) Level-1 shares are softmax(tau cos) over each input's c
+  nearest rows with a learnable tau per level (init 10), normalized per input; an
+  empty row joins its nearest input's candidates. (3) Level-1 overlap follows the
+  sampled field size (round(f x rows / leaves)); higher levels use c. (4) Stack rows
+  emit the target rows' position counts. (5) The deep gradient below the read level
+  is a straight-through sample (`--deep-grad`, 0.25; 1.0 exact, tested); level
+  outputs are cached `--cache-every` steps. (6) `ReadConfig.read_combine` defaults to
+  `s_s` so stored configs, B9 and L2 reproduce; `l1 train` defaults to `r`. (7)
+  Learned row keys switch on automatically on rows banks. (8) With `--rows-from-stack`
+  the leaves' key corrections live in the leaves' live keys (per-key Adam, not
+  normalized), and the fitted item-key heads are installed after `--init-reader`.
+  (9) `--reassign-every` is the graph period (`--graph-every`). (10) `train.py k3`
+  is an alias of `l2 train --producer stack`. Smoke (bird + spider, K1 codecs): the
+  stack fits the rows (held-out 1 - cos 0.09-0.28 after 30 steps) and reads of its
+  rows are close to free rows (captured 0.716 vs 0.775 after 20 joint steps) at five
+  times the step cost (30-37 s against 6-7 s), because the aggregators run one small
+  call per row and level; batching them per level is next.

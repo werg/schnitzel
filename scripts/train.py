@@ -20,15 +20,22 @@ STAGES = {
     'l2': 'schnitz.kb.stages.l2',           # producers reproduce the L1a items
     'b9': 'schnitz.kb.stages.b9',           # learning by experience over rounds
 }
+# K3 (the write fit to read-phase rows) is the L2 stack mode
+ALIASES = {'k3': ('l2', ['train', '--producer', 'stack'])}
 
 
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] not in STAGES:
-        raise SystemExit(f'usage: train.py {{{",".join(STAGES)}}} [arguments]')
-    stage = importlib.import_module(STAGES[sys.argv[1]])
+    names = list(STAGES) + list(ALIASES)
+    if len(sys.argv) < 2 or sys.argv[1] not in names:
+        raise SystemExit(f'usage: train.py {{{",".join(names)}}} [arguments]')
+    name, argv = sys.argv[1], sys.argv[2:]
+    if name in ALIASES:
+        name, prefix = ALIASES[name]
+        argv = prefix + argv
+    stage = importlib.import_module(STAGES[name])
     parser = argparse.ArgumentParser(prog=f'train.py {sys.argv[1]}', description=stage.__doc__)
     stage.add_args(parser)
-    stage.run(parser.parse_args(sys.argv[2:]))
+    stage.run(parser.parse_args(argv))
 
 
 if __name__ == '__main__':

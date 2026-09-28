@@ -1050,8 +1050,10 @@ def item_drift(ctx: Context, sample: int = 256) -> dict:
     """Per space: mean relative distance of the (live) items from their stored payloads
     (for a rows KB: the rows' drift from their codec-derived initialization), and
     ``key_<s>`` the keys' drift (1 - cosine of the live to the stored key), over up to
-    ``sample`` items per KB."""
+    ``sample`` items per KB. With ``--rows-from-stack`` the leaves' live keys hold the
+    key-head corrections, so ``corr_<s>`` reports their mean norm instead."""
     from schnitz.kb.read import current_ids
+    corrections = bool(ctx.views)
     rel: dict[str, list[float]] = {}
     for kb in ctx.kbs.values():
         for s in kb.spaces:
@@ -1063,8 +1065,11 @@ def item_drift(ctx: Context, sample: int = 256) -> dict:
             for live, stored in zip(kb.read(s, ids, live=True), kb.read(s, ids)):
                 a, b = live.values.float(), stored.values.float()
                 rel.setdefault(s, []).append(float((a - b).norm() / b.norm().clamp_min(1e-12)))
-                rel.setdefault(f'key_{s}', []).append(1 - float(F.cosine_similarity(
-                    live.key.float(), stored.key.float(), dim=-1)))
+                if corrections:
+                    rel.setdefault(f'corr_{s}', []).append(float(live.key.float().norm()))
+                else:
+                    rel.setdefault(f'key_{s}', []).append(1 - float(F.cosine_similarity(
+                        live.key.float(), stored.key.float(), dim=-1)))
     return {s: round(sum(v) / len(v), 5) for s, v in rel.items()}
 
 
