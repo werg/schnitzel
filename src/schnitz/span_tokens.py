@@ -5,7 +5,8 @@ Span markers are LFM2 reserved tokens given new meaning; ``<|reserved_6|>`` stay
 BGKit's splice sentinel. The ids below are those of the LFM2/LFM2.5 tokenizer
 family that our decoder uses (checked against LFM2.5-350M).
 
-KB access uses LFM2's native tool calling: a read is a ``memory_search`` call, a
+KB access uses LFM2's native tool calling: a read is a ``memory_search()`` call
+without arguments (the query is a vector, the hidden state at the call), a
 write a ``memory_write`` call, and a read result is an ordinary ``tool`` message
 whose content is a latent span between ``<|mem|>`` and ``<|/mem|>``.
 """
@@ -25,13 +26,12 @@ SENTINEL = ('<|reserved_6|>', 16)         # BGKit's splice sentinel (unchanged)
 
 # Tool schemas in the form LFM2's chat template accepts (``tools=`` argument).
 MEMORY_TOOLS = [
+    # a read has no text argument: the query is the decoder's hidden state at the call,
+    # projected by one key head per KB space (docs/knowledge-base-stack.md)
     {'name': 'memory_search',
-     'description': 'Search the knowledge base. The result is a memory span the model reads '
-                    'directly; the query is a short description of what is needed.',
-     'parameters': {'type': 'object',
-                    'properties': {'query': {'type': 'string',
-                                             'description': 'what to look up'}},
-                    'required': ['query']}},
+     'description': 'Search the knowledge base for what the task needs next. The result is a '
+                    'memory span the model reads directly.',
+     'parameters': {'type': 'object', 'properties': {}, 'required': []}},
     {'name': 'memory_write',
      'description': 'Store reusable information in the knowledge base for later tasks.',
      'parameters': {'type': 'object',

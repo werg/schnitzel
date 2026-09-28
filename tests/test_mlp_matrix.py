@@ -101,3 +101,16 @@ def test_locality_kernel_lets_a_target_read_its_aligned_source():
         p.requires_grad_(False)
     flat = MLPMatrix({'a': 4}, 4, state=8, hidden=8, layers=1, frequencies=2, relative=False)
     assert flat.layers[0].bandwidth is None
+
+
+def test_content_is_not_drowned_by_position_at_small_input_scale():
+    """Decoder-space spans have a per-dimension RMS near 0.025; at initialization
+    the output must still depend on the content about as much as on its scale-free
+    form (the input normalization makes the operator scale invariant)."""
+    torch.manual_seed(0)
+    op = MLPMatrix({'span': 64}, 16, state=32, hidden=16, layers=2)
+    x = torch.randn(10, 64)
+    small, unit = op([('span', 0.025 * x, 1.0)], 5)[0], op([('span', x, 1.0)], 5)[0]
+    assert (small - unit).norm() < 0.05 * unit.norm()  # up to the LayerNorm epsilon
+    other = op([('span', 0.025 * torch.randn(10, 64), 1.0)], 5)[0]
+    assert (small - other).norm() > 0.1 * small.norm()

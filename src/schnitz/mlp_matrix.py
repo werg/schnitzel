@@ -28,6 +28,12 @@ but the returned mass, and each item's total mass is its gate, spread evenly ove
 its positions, so a long item does not outweigh a short one by length alone.
 Items carry no order feature, so the output does not depend on the order of the
 input items; positions are within-item.
+
+Every input kind passes a LayerNorm before its projection. Inputs arrive at very
+different scales (decoder-space spans have a per-dimension RMS near 0.025, the
+positional Fourier features near 1); without the normalization the content term
+of z_ij starts some 30 times weaker than the position terms and the operator
+settles on a position-only code.
 """
 from __future__ import annotations
 
@@ -94,6 +100,7 @@ class MLPMatrix(nn.Module):
         feats = 2 * frequencies + 1
         self.frequencies, self.out_norm, self.cond = frequencies, out_norm, cond
         self.checkpoint_layers = checkpoint_layers
+        self.input_norm = nn.ModuleDict({kind: nn.LayerNorm(width) for kind, width in sources.items()})
         self.init = nn.Sequential(nn.Linear(2 * feats + cond, state), nn.SiLU(),
                                   nn.Linear(state, state))
         self.layers = nn.ModuleList(MatrixLayer(sources, state, hidden, feats, cond, relative)
@@ -132,8 +139,9 @@ class MLPMatrix(nn.Module):
             cond = cond.float().expand(count, self.cond)
             start.append(cond)
         h = self.init(torch.cat(start, dim=-1))
+        normed = [(kind, self.input_norm[kind](x.float())) for kind, x, _ in items]
         for layer in self.layers:
-            sources = torch.cat([layer.source[kind](x.float()) for kind, x, _ in items])
+            sources = torch.cat([layer.source[kind](x) for kind, x in normed])
             args = (h, sources, source_pos, relative, weights, target_pos, cond, locality)
             if self.checkpoint_layers and torch.is_grad_enabled():
                 h = checkpoint(layer, *args, use_reentrant=False)

@@ -107,9 +107,9 @@ All are taken from the 379 unused `<|reserved_N|>` tokens (`<|reserved_6|>` is
 BGKit's splice sentinel and stays as it is).
 
 KB access uses LFM2's native tool-call protocol, as in trajectory memory v0.5: a
-read is a visible call `<|tool_call_start|>[memory_search(query="…")]<|tool_call_end|>`
-at its causal position; the search key comes from the call's hidden state (a
-middle layer), the text argument is a readable hint; the result is a normal
+read is a visible call `<|tool_call_start|>[memory_search()]<|tool_call_end|>`
+at its causal position, without arguments: the query is a vector, the call's
+hidden state (a middle layer) projected by one key head per KB space; the result is a normal
 `<|im_start|>tool` message whose content is the latent span between `<|mem|>` and
 `<|/mem|>`, so KB content is marked apart from the model's own writes. A write is a
 `memory_write(...)` call: first with the reusable content as a text argument that
@@ -579,3 +579,11 @@ log your decisions and changes of direction"), newest last.
   LFM2-24B-A2B downloaded to `/archive/hf-models` (root disk too full); 8B-A1B
   (thinking, first pass at 100 per task) and Ling after B3 ends, 24B when B3 or K1
   frees memory. Ling runs on a transformers 4.57 overlay for its remote code.
+- 28 Sep (owner). Queries are vectors, not text: `memory_search()` takes no
+  argument; one key head per space projects the call's middle-layer state. A text
+  query would cost generated tokens before retrieval, be trained on template
+  wording, and could carry target information into the key (header names);
+  retrieved record ids are logged for readability instead. A short latent query
+  span (several vectors, as a write span) is the fallback if one vector per space
+  proves too narrow in L1. `memory_write` keeps its text argument until writes
+  become latent (B4). Transcripts regenerated without query text.

@@ -218,9 +218,10 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
    gradients from reads (sparse updates, optimizer state per item), a fast loop
    to real superposition. Jointly trained: items, S_s (as the read-time
    combiner), R, key and query heads.
-   - *Reads* are `memory_search` tool calls in LFM2's native format (trajectory
-     memory v0.5; restart plan 3.2): the query is formed from a middle layer's
-     state at the call, so retrieval can start while the call finishes; the
+   - *Reads* are `memory_search()` tool calls without arguments in LFM2's native
+     format (trajectory memory v0.5; restart plan 3.2): the query is a vector,
+     not text: one key head per space projects a middle layer's state at the
+     call, so retrieval can start while the call finishes; the
      result is a tool message whose content is the latent span between `<|mem|>`
      and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
      `memory_write` calls. A parameter store is consulted often, so SFT and
@@ -323,10 +324,10 @@ inputs are. Training data is regenerated where the format changes (owner:
   with per-item optimizer state for sparse in-place updates (L1).
 - **WP3 - Memory-protocol data** (`scripts/prepare_memory_transcripts.py`). Every
   episode of the R6 corpora and the task corpora rewritten as an LFM2 chat
-  transcript with `memory_search` calls (query text, target record ids), tool
-  results as latent slots filled at training time, and `memory_write` calls;
-  checks that results only contain records that exist before the call and that
-  query text never leaks the answer.
+  transcript with argument-free `memory_search()` calls (target record ids per
+  call), tool results as latent slots filled at training time, and
+  `memory_write` calls; checks that results only contain records that exist
+  before the call and that nothing from the answer or later turns precedes it.
 - **WP4 - Evaluation**. Superposition metrics (sources per item, items per
   source, effective items per read, retention), KB-dependence tests (edited,
   removed and inserted knowledge) and content-over-shuffled helpers are built in
