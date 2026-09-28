@@ -895,3 +895,11 @@ log your decisions and changes of direction"), newest last.
   values, dev databases held out) as `kb-read-values`. The SQL tasks get schema
   aliasing, and L1 gets a content-contrast term against shuffled reads and an
   optional null prefix (in progress).
+- 28 September: the long read phase moves again, to the r6-mixed QA passages
+  (`kb-read-qa`, 1000 transcripts). Spider-memory had little headroom (0.35 nats
+  between no context and full context), while r6 QA reads were strongly
+  content-dependent in B3 (teacher captured 0.53 right vs -0.45 shuffled).
+  Contamination is not a concern at 350M, which knows little long-tail knowledge, so
+  real corpora serve. A synthetic fictional-people world (32 vs 4 records per fact)
+  is being built as a controlled redundancy knob; high redundancy is expected to be
+  key to learning content use.
