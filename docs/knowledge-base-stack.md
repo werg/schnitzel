@@ -281,6 +281,15 @@ applies to every stage.
    for them (the normalized shares), plus a learned correction; fields are
    reassigned from the updated keys. The write fit matches keys as well as
    values.
+   The field shares themselves depend on keys: an input sends to each of its
+   candidate rows (top-k by key, re-drawn on a schedule) a share softmax(tau
+   cos(input key, row key)) over those rows, and the row's operator receives it
+   with gate mass x share. So the write fit (and the task loss, straight
+   through) pulls an input's key toward rows its content helps reproduce and
+   away from rows it hurts, and row keys likewise; per-input normalization keeps
+   responsibilities summing to one and makes the competition zero-sum. Input
+   keys are the key head's output plus a free per-item correction; a balance
+   loss on row load prevents collapse onto a few rows.
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own

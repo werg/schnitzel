@@ -853,3 +853,9 @@ log your decisions and changes of direction"), newest last.
   side with row keys as the share-weighted combination of their field inputs' keys
   plus a learned correction; fields reassigned from updated keys; the write fit
   matches keys and values.
+- 28 Sep (owner). Write-side keys are learned through key-dependent field shares:
+  share(j->i) = softmax over input j's candidate rows of tau cos(k_j, k_i), gate =
+  mass x share, so fit and task gradients move input and row keys toward the rows
+  an input helps and away from those it hurts (zero-sum per input, invariant 7).
+  Keys = key head + free per-item correction; balance loss on row load. The
+  learned per-pair content score I had proposed is not added.
