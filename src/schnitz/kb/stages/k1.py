@@ -31,6 +31,7 @@ import random
 import torch
 import torch.nn.functional as F
 
+from schnitz.kb_eval import nll_summary
 from schnitz.kb.decoder import Model, TeacherCache, _batches, _heldout, _kl
 from schnitz.kb.loop import Run, Window, warmup_optimizer
 from schnitz.kb.stack import SPACES, Stack
@@ -95,12 +96,8 @@ def evaluate(model: Model, stack: Stack, cache: TeacherCache, items, batch_size:
         for name, (logits, targets) in reads.items():
             sums[name] = sums.get(name, 0.0) + F.cross_entropy(logits, targets, reduction='sum').item()
         tokens += int(reads['noctx'][1].numel())
-    nll = {name: value / tokens for name, value in sums.items()}
-    gain = max(nll['noctx'] - nll['full'], 1e-9)
-    return {'nll': {k: round(v, 4) for k, v in nll.items()},
-            'captured': {k: round((nll['noctx'] - nll[k]) / gain, 4) for k in arms},
-            'content_nats': {'span': round(nll['span_shuffled'] - nll['span'], 4),
-                             'stack': round(nll['stack_shuffled'] - nll['stack'], 4)}}
+    return nll_summary(sums, tokens, arms,
+                       {'span': 'span_shuffled', 'stack': 'stack_shuffled'}, gain=False)
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:

@@ -248,3 +248,30 @@ def test_nll_summary_matches_the_k1_report():
     assert report['content_nats'] == {'span': 1.3, 'stack': 0.2}
     assert content_nats(1.5, 2.8) == pytest.approx(1.3)
     assert captured_fraction(2.0, 2.0, 2.0) == 0.0  # no gain: floored denominator, no division error
+
+
+def test_nll_summary_reproduces_the_k1_evaluation_record_exactly():
+    """``nll_summary(..., gain=False)`` equals the record ``train_kb_codecs.evaluate``
+    computes inline (copied below) on fake summed NLLs, including no or negative
+    full-text gain, with the same keys in the same order."""
+    import random
+    spaces = 'ABCD'
+    arms = ['span', 'stack', 'stack_shuffled', 'span_shuffled'] + \
+        [f'without_{s}' for s in spaces] + [f'only_{s}' for s in spaces]
+    rng = random.Random(0)
+    for tokens, full_gain in ((4096, 0.7), (777, 0.0), (1000, -0.2), (3, 1e-12)):
+        sums = {'noctx': 3.5 * tokens, 'full': (3.5 - full_gain) * tokens}
+        sums.update({name: rng.uniform(1.0, 4.0) * tokens for name in arms})
+
+        # train_kb_codecs.evaluate, after its accumulation loop
+        nll = {name: value / tokens for name, value in sums.items()}
+        gain = max(nll['noctx'] - nll['full'], 1e-9)
+        legacy = {'nll': {k: round(v, 4) for k, v in nll.items()},
+                  'captured': {k: round((nll['noctx'] - nll[k]) / gain, 4) for k in arms},
+                  'content_nats': {'span': round(nll['span_shuffled'] - nll['span'], 4),
+                                   'stack': round(nll['stack_shuffled'] - nll['stack'], 4)}}
+        report = nll_summary(sums, tokens, arms, {'span': 'span_shuffled', 'stack': 'stack_shuffled'},
+                             gain=False)
+        assert json.dumps(report) == json.dumps(legacy)
+        with_gain = nll_summary(sums, tokens, arms, {'span': 'span_shuffled'})
+        assert with_gain['gain'] == round(nll['noctx'] - nll['full'], 4)
