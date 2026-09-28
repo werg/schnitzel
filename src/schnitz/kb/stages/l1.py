@@ -112,7 +112,7 @@ from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, prod
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
                              L1Reader, ReadConfig, current_ids, producer_index, source_index,
                              splice)
-from schnitz.kb.stack import KeyHeads
+from schnitz.kb.stack import SPACES, KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.memory_transcripts import render_ids, render_text
@@ -1167,7 +1167,7 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             before = {ref: cache.tops[ref].detach().clone() for ref in touched}
         if phase != 'r':
             t0 = time.time()
-            out['superpose'] = cache.backward()
+            out['superpose'] = cache.backward(getattr(args, 'write_balance', 0.0), usage)
             out['superpose']['backward_s'] = round(time.time() - t0, 3)
     if producer is not None:
         t0 = time.time()
@@ -1498,6 +1498,10 @@ def superpose_config(args, base: dict | None = None):
         value = getattr(args, name, None)
         if value is not None:
             setattr(config, name, value)
+    if getattr(args, 'unbatched', False):
+        config.batched = False
+    if getattr(args, 'max_pairs', None):
+        config.max_pairs = args.max_pairs
     config.seed = getattr(args, 'seed', config.seed)
     return config
 
@@ -1575,6 +1579,10 @@ def load_write_stack(path: Path, dims: dict, args):
     return ops, config, run_config, state
 
 
+ITEM_LR = 3e-3          # live items of a leaf bank (L1a, K2) and leaves under the stack
+ROWS_ITEM_LR = 1e-2     # free rows in the read phase (smoke: 3e-2 overfits after 100 steps)
+
+
 def train(args) -> None:
     model = load_model(args)
     lm = model.decoder.base_lm
@@ -1606,6 +1614,9 @@ def train(args) -> None:
                         max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
                         read_combine=args.read_combine)
     banks_manifest = json.loads((args.banks / 'banks.json').read_text())
+    if args.item_lr is None:     # the read phase moves free rows faster than leaf items
+        args.item_lr = ROWS_ITEM_LR if 'rows' in banks_manifest and not args.rows_from_stack \
+            else ITEM_LR
     config.learned_keys = args.keys == 'learned' or (args.keys == 'auto'
                                                      and 'rows' in banks_manifest)
     # learned keys are unit keys; with --rows-from-stack the live keys are the leaves' key
@@ -1730,9 +1741,27 @@ def train(args) -> None:
     producers = load_producers(args, ctx, writer, log, model) if 'l1b' in phases else None
     args.write_level_index = LEVELS.index(args.write_level)
 
-    def rebuild() -> dict:
+    # level-1 field sizes: the nominal size, or with a range (``--field A=4:16``) one drawn
+    # log-uniformly every ``--refield-every`` steps from (seed, step), so resume is exact
+    nominal = {s: superpose.field_size(s) for s in SPACES} if superpose else {}
+    ranged = bool(views) and any(lo < hi for lo, hi in
+                                 (superpose.field_range(s) for s in SPACES))
+    fields_now = dict(nominal)
+
+    def rebuild(fields: dict | None = None) -> dict:
         """Fields from the leaves' and rows' current keys (``--rows-from-stack``)."""
-        return {name: view.rebuild(step) for name, view in views.items()}
+        chosen = fields or fields_now
+        return {name: view.rebuild(step, fields={s: f for s, f in chosen.items()
+                                                 if s in view.rows})
+                for name, view in views.items()}
+
+    def refield() -> None:
+        nonlocal fields_now
+        draw = random.Random(f'{args.seed}:field:{step}')
+        fields_now = {s: superpose.sample_field(s, draw) for s in SPACES}
+        for view in views.values():
+            view.refield({s: f for s, f in fields_now.items() if s in view.graphs}, step)
+            view.rekey()
 
     budgets = rebuild() if views else None
 
@@ -1874,6 +1903,11 @@ def train(args) -> None:
             rekey()
         if views and superpose.graph_every and step % superpose.graph_every == 0:
             rebuild()
+        elif ranged and args.refield_every and step % args.refield_every == 0:
+            refield()
+        if ranged:
+            for s, f in fields_now.items():
+                window.setdefault(f'field_{s}', []).append(f)
         if anchor is not None and args.anchor_every and step % args.anchor_every == 0:
             anchor.refresh(step)
         if step % args.log_every == 0:
@@ -1887,7 +1921,7 @@ def train(args) -> None:
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
             rekey()
             if views:
-                rebuild()
+                rebuild(nominal)       # evaluations at the nominal field size
             save()
             reader.eval()
             log_record({'step': step, 'eval': run_eval()})
@@ -1946,11 +1980,23 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                           'every checkpoint)')
     sup.add_argument('--max-positives', type=int,
                      help='--rows-from-stack: covering rows kept as retrieval positives (8)')
+    sup.add_argument('--refield-every', type=int, default=10,
+                     help='--rows-from-stack with a --field range: draw new level-1 field '
+                     'sizes every N steps (10)')
+    sup.add_argument('--write-balance', type=float, default=0.01,
+                     help='--rows-from-stack: balance loss on the rows\' write loads (0.01)')
+    sup.add_argument('--unbatched', action='store_true',
+                     help='aggregators row by row (the reference path; default: all rows of a '
+                     'level in one pass)')
+    sup.add_argument('--max-pairs', type=int,
+                     help='(output, input) position pairs per batched aggregator pass (262144)')
     t = parser.add_argument_group('train')
     t.add_argument('--banks', type=Path, help='output of build (or of rows)')
     t.add_argument('--steps', type=int, default=20000)
     t.add_argument('--lr', type=float, default=3e-4)
-    t.add_argument('--item-lr', type=float, default=3e-3)
+    t.add_argument('--item-lr', type=float, default=None,
+                   help='per-item Adam rate of the live items (3e-3; on a rows banks dir, the '
+                   'read phase, 1e-2: rows drift about 10%% from their init in 300 steps)')
     t.add_argument('--retrieval-weight', type=float, default=0.5)
     t.add_argument('--clip', type=float, default=1.0)
     t.add_argument('--candidates', default='', help='scored per space, e.g. A=8,B=16,C=32,D=64')

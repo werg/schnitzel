@@ -150,8 +150,8 @@ def test_lazy_rows_equal_the_full_stack_when_caches_are_fresh(tmp_path):
         levels = sp.aggregate(g, ops, leaves)
         for j in range(len(g.row_ids)):
             value, key, mass = view.item(s, g.depth, j)
-            torch.testing.assert_close(value, levels[-1][j][0], rtol=1e-5, atol=1e-6)
-            torch.testing.assert_close(key, levels[-1][j][1], rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(value, levels[-1][j][0], rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(key, levels[-1][j][1], rtol=1e-4, atol=1e-5)
             assert float(mass) == pytest.approx(float(levels[-1][j][2]), rel=1e-5)
             cache = ItemCache(train=True)
 
@@ -159,7 +159,10 @@ def test_lazy_rows_equal_the_full_stack_when_caches_are_fresh(tmp_path):
                 return [(v, nn.functional.normalize(k, dim=-1), torch.tensor(1.0)) for (v, _), k
                         in zip(cache.get(kb, space, ids), cache.keys(kb, space, ids))]
             grad_v, grad_k, _ = view.grad_value(s, g.depth, j, leaf)   # sampled deep path
-            assert torch.equal(grad_v.detach(), value) and torch.equal(grad_k.detach(), key)
+            # the recomputation is batched differently from the cached pass: equal up to
+            # summation order
+            torch.testing.assert_close(grad_v.detach(), value, rtol=1e-5, atol=1e-5)
+            torch.testing.assert_close(grad_k.detach(), key, rtol=1e-5, atol=1e-5)
 
 
 def test_field_key_is_the_share_weighted_mean_without_correction():
@@ -184,7 +187,7 @@ def test_gradients_reach_leaves_aggregators_and_key_heads(tmp_path):
     read = r.read(torch.randn(HIDDEN), [kb], ['ds'], 5, cache)
     (read.span.square().sum()).backward()
     stats = cache.backward()
-    assert stats['rows'] > 0 and stats['drift'] == 0.0
+    assert stats['rows'] > 0 and stats['drift'] < 1e-5
     assert any(v.grad is not None and v.grad.abs().sum() > 0 for v in cache.values.values())
     assert any(k.grad is not None and k.grad.abs().sum() > 0 for k in cache.key_leaves.values())
     for s in SPACES:
@@ -373,7 +376,8 @@ def test_train_step_with_rows_from_the_stack_and_the_phases(tmp_path):
     args = SimpleNamespace(phase='l1a', retrieval_only=False, inbatch_negatives=4,
                            balance_weight=0.01, retrieval_weight=0.5, retrieval_anneal=0,
                            retrieval_floor=0.0, clip=1.0, item_lr=0.01, write_level_index=0,
-                           consolidate_every=0, read_anchor=0.0, rows_from_stack='x')
+                           consolidate_every=0, read_anchor=0.0, rows_from_stack='x',
+                           write_balance=0.01)
     sets = l1.parameter_sets(r, None, ops)
     params = [p for ps in sets.values() for p in ps]
     opt = torch.optim.AdamW(l1.optimizer_groups(sets, SimpleNamespace(
@@ -393,9 +397,12 @@ def test_train_step_with_rows_from_the_stack_and_the_phases(tmp_path):
     assert 'superpose' not in out and out['items'] == 0
     assert all(torch.equal(a, b) for a, b in zip(live(), start))
     assert torch.equal(op_weight, start_op)
-    out = l1.train_step(ctx, [ep], opt, args, 1, phase='l1a',
+    usage = {}
+    out = l1.train_step(ctx, [ep], opt, args, 1, usage, phase='l1a',
                         trainable=l1.set_phase(sets, l1.phase_set('l1a', args)))
-    assert out['superpose']['rows'] > 0 and out['superpose']['drift'] == 0.0
+    assert out['superpose']['rows'] > 0 and out['superpose']['drift'] < 1e-5
+    assert out['superpose']['write_balance'] > 0          # the rows' write loads, balanced
+    assert any(k.startswith('write/ds/') and bool(u.touched.any()) for k, u in usage.items())
     assert out['items'] > 0 and not torch.equal(op_weight, start_op)
     assert any(not torch.equal(a, b) for a, b in zip(live(), start))
     report = l1.superposition_metrics(ctx, {})
@@ -572,3 +579,113 @@ def test_stack_fit_learns_the_rows_and_reports_sweeps(tmp_path):
     stats = fit.write_stats()['ds']['A']
     assert stats['share_entropy'] >= 0 and stats['row_load']['n'] > 0
     fit.close()
+
+
+def test_batched_rows_equal_row_by_row_values_and_gradients(tmp_path):
+    kb = leaf_kb(tmp_path)
+    cfg = config(max_pairs=200)          # several chunks per pass
+    view, ops = view_of(kb, cfg, tmp_path)
+    with torch.no_grad():                 # zero-initialized paths must matter here
+        for p in ops.parameters():
+            p.add_(0.02 * torch.randn_like(p))
+    for s, g in view.graphs.items():
+        cache = ItemCache(train=True)
+
+        def leaf(space, ids):
+            return [(v, nn.functional.normalize(k, dim=-1), torch.tensor(1.0)) for (v, _), k
+                    in zip(cache.get(kb, space, ids), cache.keys(kb, space, ids))]
+        results = []
+        for batched in (True, False):
+            view.config.batched = batched
+            view.clear()
+            rows = list(range(len(g.row_ids)))
+            got = view.grad_values(s, g.depth, rows, leaf, deep=1.0)
+            loss = sum((v ** 2).sum() + (k * torch.arange(k.shape[0])).sum() + m
+                       for v, k, m in got)
+            params = list(ops.parameters())
+            ids = g.ids
+            leaves = [v for v, _ in cache.get(kb, s, ids)] + cache.keys(kb, s, ids)
+            grads = torch.autograd.grad(loss, params + leaves, allow_unused=True)
+            results.append(([t.detach() for triple in got for t in triple], grads))
+        view.config.batched = True
+        (va, ga), (vb, gb) = results
+        for a, b in zip(va, vb):
+            torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+        for a, b in zip(ga, gb):
+            assert (a is None) == (b is None)
+            if a is not None:       # up to summation order, relative to the tensor's scale
+                # (0-d: tau, a sum of cancelling share gradients)
+                tol = (1e-4 if a.dim() == 0 else 1e-5) + 1e-4 * float(b.abs().max())
+                assert float((a - b).abs().max()) <= tol
+
+
+def test_fit_key_path_learns_row_keys_away_from_the_field_mean(tmp_path):
+    kb = leaf_kb(tmp_path)
+    view, ops = view_of(kb, config(), tmp_path)
+    gen = torch.Generator().manual_seed(3)
+    stored = {s: {it.id: it for it in kb.read(s, g.ids, live=True)}
+              for s, g in view.graphs.items()}
+    corrections = {s: torch.zeros(len(g.ids), SPACES[s].key_width, requires_grad=True)
+                   for s, g in view.graphs.items()}
+
+    def leaf(space, ids):
+        g = view.graphs[space]
+        rows = torch.tensor([g.index[i] for i in ids])
+        keys = nn.functional.normalize(torch.stack([stored[space][i].key.float() for i in ids])
+                                       + corrections[space][rows], dim=-1)
+        return [(stored[space][i].values.float(), k, torch.tensor(1.0))
+                for i, k in zip(ids, keys.unbind(0))]
+    targets, values = {}, {}
+    for s, g in view.graphs.items():     # learned row keys that left their fields' mean
+        values[s] = [v.detach() for v, _, _ in view.items(s, g.depth, range(len(g.row_ids)))]
+        targets[s] = nn.functional.normalize(
+            g.row_keys + 0.7 * torch.randn(g.row_keys.shape, generator=gen), dim=-1)
+    opt = torch.optim.Adam(list(ops.key_heads.parameters()) + list(corrections.values()),
+                           lr=1e-2)
+
+    def key_cos() -> float:
+        out = []
+        for s, g in view.graphs.items():
+            view.clear()
+            got = view.grad_values(s, g.depth, list(range(len(g.row_ids))), leaf, deep=1.0)
+            out += [float(nn.functional.cosine_similarity(k, t, dim=-1))
+                    for (_, k, _), t in zip(got, targets[s])]
+        return sum(out) / len(out)
+    before = key_cos()
+    for _ in range(60):
+        opt.zero_grad()
+        total = 0
+        for s, g in view.graphs.items():
+            view.clear()
+            loss, parts, _ = sp.fit_losses(view, s, g.row_ids, values[s],
+                                           targets[s], leaf, weights=(0.0, 0.0, 1.0))
+            total = total + loss
+        total.backward()
+        opt.step()
+    after = key_cos()
+    assert after > before + 0.2, (before, after)
+    assert any(float(p.abs().sum()) > 0 for p in ops.key_heads.parameters())
+
+
+def test_exact_scans_and_bucketed_row_placement():
+    gen = torch.Generator().manual_seed(0)
+    centres = nn.functional.normalize(torch.randn(6, 16, generator=gen), dim=-1)
+    keys = nn.functional.normalize(centres[torch.arange(600) % 6]
+                                   + 0.2 * torch.randn(600, 16, generator=gen), dim=-1)
+    rows = nn.functional.normalize(torch.randn(50, 16, generator=gen), dim=-1)
+    full = (keys.double() @ rows.double().T).topk(3, dim=1)
+    values, indices = sp.exact_topk(keys, rows, 3, chunk=37)          # exact, in blocks
+    assert torch.equal(indices, full.indices) and torch.equal(values, full.values)
+    assert torch.equal(sp.exact_argmax(rows, keys, chunk=41),
+                       (rows.double() @ keys.double().T).argmax(dim=1))
+    # small sets: one exact FPS as before; large: FPS within k-means++ buckets
+    unit = nn.functional.normalize(keys, dim=-1)       # place_rows renormalizes
+    assert torch.equal(sp.place_rows(keys, 20, bucket=400),
+                       unit[sorted(sp.farthest_points(unit, 20))])
+    placed = sp.place_rows(keys, 60, bucket=64, seed=1)
+    assert placed.shape == (60, 16)
+    assert len({tuple(r.tolist()) for r in placed}) == 60                 # distinct leaves
+    nearest = (placed @ centres.T).argmax(dim=1)
+    counts = torch.bincount(nearest, minlength=6)
+    assert int(counts.min()) >= 5                  # every cluster gets its share of rows
+    assert torch.equal(placed, sp.place_rows(keys, 60, bucket=64, seed=1))   # reproducible

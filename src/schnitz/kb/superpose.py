@@ -124,6 +124,8 @@ class SuperposeConfig:
     max_positives: int = 8          # retrieval positives kept per read and space
     per_level: bool = True          # an aggregator per level (else one for all levels)
     seed: int = 0
+    batched: bool = True            # all rows of a level in one aggregator pass
+    max_pairs: int = 1 << 18        # (output, input) position pairs per batched pass
 
     def field_range(self, space: str) -> tuple[float, float]:
         """The level-1 field size of a space as (low, high): a number or a range ``lo:hi``."""
@@ -205,12 +207,92 @@ def farthest_points(keys: Tensor, m: int) -> list[int]:
     return chosen
 
 
-def place_rows(leaf_keys: Tensor, m: int) -> Tensor:
+SCAN_ELEMENTS = 1 << 25    # similarities per block of an exact scan (256 MB in float64)
+
+
+def exact_topk(queries: Tensor, keys: Tensor, k: int, chunk: int | None = None
+               ) -> tuple[Tensor, Tensor]:
+    """Exact top-``k`` cosine neighbours among ``keys`` of every query (float64 on the CPU,
+    blocks of ``chunk`` queries, by default ``SCAN_ELEMENTS`` similarities per block; no
+    approximate index)."""
+    q = queries.detach().double().cpu()
+    kk = keys.detach().double().cpu()
+    k = min(k, kk.shape[0])
+    chunk = chunk or max(1, SCAN_ELEMENTS // max(kk.shape[0], 1))
+    values, indices = [], []
+    for start in range(0, q.shape[0], chunk):
+        top = (q[start:start + chunk] @ kk.T).topk(k, dim=1)
+        values.append(top.values)
+        indices.append(top.indices)
+    return torch.cat(values), torch.cat(indices)
+
+
+def exact_argmax(queries: Tensor, keys: Tensor, chunk: int | None = None) -> Tensor:
+    """For every query the index of its most similar key (exact, blocks of ``chunk``
+    keys, by default ``SCAN_ELEMENTS`` similarities per block; ties: the lower index)."""
+    q = queries.detach().double().cpu()
+    kk = keys.detach().double().cpu()
+    chunk = chunk or max(1, SCAN_ELEMENTS // max(q.shape[0], 1))
+    best = torch.full((q.shape[0],), -math.inf, dtype=torch.float64)
+    arg = torch.zeros(q.shape[0], dtype=torch.long)
+    for start in range(0, kk.shape[0], chunk):
+        sim = q @ kk[start:start + chunk].T
+        val, idx = sim.max(dim=1)
+        better = val > best
+        best = torch.where(better, val, best)
+        arg = torch.where(better, idx + start, arg)
+    return arg
+
+
+def kmeanspp(keys: Tensor, k: int, gen: torch.Generator) -> Tensor:
+    """k-means++ seeding (cosine distance 1 - cos, D^2 sampling) of ``k`` rows of unit
+    ``keys``; returns their indices. O(n k)."""
+    keys = keys.detach().double().cpu()
+    n = keys.shape[0]
+    k = min(k, n)
+    first = int(torch.randint(n, (1,), generator=gen))
+    chosen = [first]
+    dist = (1 - keys @ keys[first]).clamp_min(0)
+    for _ in range(k - 1):
+        w = dist ** 2
+        total = float(w.sum())
+        nxt = int(torch.multinomial(w / total, 1, generator=gen)) if total > 0 else \
+            int(torch.randint(n, (1,), generator=gen))
+        chosen.append(nxt)
+        dist = torch.minimum(dist, (1 - keys @ keys[nxt]).clamp_min(0))
+    return torch.tensor(chosen)
+
+
+def place_rows(leaf_keys: Tensor, m: int, bucket: int = 4096, seed: int = 0) -> Tensor:
     """Initial row positions: the keys of ``m`` leaves chosen by farthest-point sampling
-    (spread over the occupied key space, reproducible). The rows' own keys follow from
-    their values once initialized."""
+    (spread over the occupied key space, reproducible). Up to ``2 bucket`` leaves one
+    exact FPS (O(N m)); beyond, FPS within buckets: ``ceil(N / bucket)`` centres by
+    k-means++ seeding on a sample, every leaf assigned exactly to its nearest centre,
+    and each bucket's share of the ``m`` rows (proportional to its leaves) by FPS inside
+    it: O(N N/bucket + bucket m). The rows' own keys follow from their values once
+    initialized."""
     keys = nn.functional.normalize(leaf_keys.detach().float().cpu(), dim=-1)
-    return keys[sorted(farthest_points(keys, m))]
+    n = keys.shape[0]
+    m = min(m, n)
+    if n <= 2 * bucket:
+        return keys[sorted(farthest_points(keys, m))]
+    gen = torch.Generator().manual_seed(seed)
+    centres_n = math.ceil(n / bucket)
+    sample = torch.randperm(n, generator=gen)[:min(n, max(20 * centres_n, 20000))]
+    centres = keys[sample[kmeanspp(keys[sample], centres_n, gen)]]
+    owner = exact_argmax(keys, centres)
+    members = [torch.nonzero(owner == c).flatten() for c in range(centres.shape[0])]
+    sizes = np.array([len(x) for x in members], np.float64)
+    quota = sizes / sizes.sum() * m
+    take = np.floor(quota).astype(int)
+    for c in np.argsort(-(quota - take))[:m - int(take.sum())]:   # largest remainders
+        take[c] += 1
+    take = np.minimum(take, sizes.astype(int))
+    chosen = []
+    for idx, t in zip(members, take.tolist()):
+        if t > 0:
+            chosen += idx[farthest_points(keys[idx], t)].tolist()
+    return keys[sorted(chosen)]
 
 
 def memberships(keys: Tensor, rows: Tensor, overlap: int,
@@ -219,10 +301,9 @@ def memberships(keys: Tensor, rows: Tensor, overlap: int,
     ``softmax(tau cos)`` (sum one)."""
     if not len(keys) or not len(rows):
         return [[] for _ in range(len(keys))]
-    sim = keys.detach().double().cpu() @ rows.detach().double().cpu().T
-    top = sim.topk(min(overlap, rows.shape[0]), dim=1)
+    values, indices = exact_topk(keys, rows, overlap)
     return [_shares(list(zip(idx, val)), tau)
-            for idx, val in zip(top.indices.tolist(), top.values.tolist())]
+            for idx, val in zip(indices.tolist(), values.tolist())]
 
 
 def _shares(pairs: Sequence[tuple[int, float]], tau: float) -> list[tuple[int, float]]:
@@ -237,13 +318,14 @@ def fields_of(keys: Tensor, rows: Tensor, overlap: int, tau: float
     its nearest input (whose shares are renormalized over its c + 1 rows)."""
     member = memberships(keys, rows, overlap, tau)
     if len(keys) and len(rows):
-        sim = keys.detach().double().cpu() @ rows.detach().double().cpu().T
         filled = {o for pairs in member for o, _ in pairs}
-        for o in range(rows.shape[0]):
-            if o not in filled:
-                i = int(torch.argmax(sim[:, o]))
-                member[i] = _shares([(r, float(sim[i, r])) for r, _ in member[i]]
-                                    + [(o, float(sim[i, o]))], tau)
+        empty = [o for o in range(rows.shape[0]) if o not in filled]
+        if empty:
+            k64, r64 = keys.detach().double().cpu(), rows.detach().double().cpu()
+            nearest = exact_argmax(r64[empty], k64).tolist()
+            for o, i in zip(empty, nearest):
+                member[i] = _shares([(r, float(k64[i] @ r64[r])) for r, _ in member[i]]
+                                    + [(o, float(k64[i] @ r64[o]))], tau)
     fields: list[list[tuple[int, float]]] = [[] for _ in range(len(rows))]
     for i, pairs in enumerate(member):
         for o, share in pairs:
@@ -256,6 +338,21 @@ def dynamic_shares(key: Tensor, anchors: Tensor, candidates: Sequence[int], tau:
     differentiable in the input key and tau (sum one: invariant 7)."""
     rows = anchors[list(candidates)].to(key.device)
     return torch.softmax(tau * (rows @ nn.functional.normalize(key.float(), dim=-1)), dim=0)
+
+
+def candidate_shares(keys: Tensor, anchors: Tensor, candidates: Sequence[Sequence[int]],
+                     tau: Tensor) -> tuple[Tensor, Tensor]:
+    """``dynamic_shares`` of many inputs at once: (P, C) shares over each input's
+    candidate rows (padded to the longest list; padding has share 0) and the (P, C)
+    candidate row index."""
+    width = max(len(c) for c in candidates)
+    index = to_device(torch.tensor([list(c) + [0] * (width - len(c)) for c in candidates]),
+                      keys.device)
+    valid = to_device(torch.tensor([[True] * len(c) + [False] * (width - len(c))
+                                    for c in candidates]), keys.device)
+    sims = torch.einsum('pcd,pd->pc', anchors.to(keys.device).float()[index],
+                        nn.functional.normalize(keys.float(), dim=-1))
+    return torch.softmax((tau * sims).masked_fill(~valid, -math.inf), dim=1), index
 
 
 @dataclasses.dataclass
@@ -520,12 +617,12 @@ def build_rows(kb: KnowledgeBase, dest: Path, config: SuperposeConfig,
             continue
         items = kb.read(space, ids)
         keys = torch.stack([it.key.float() for it in items])
-        m = config.row_count(space, len(ids))
-        rows = [row_id(kb.dataset, space, n) for n in range(m)]
+        anchors = place_rows(keys, config.row_count(space, len(ids)), seed=config.seed)
+        rows = [row_id(kb.dataset, space, n) for n in range(anchors.shape[0])]
         one = dataclasses.replace(config, depth=1)
         graph = build_graph(kb.dataset, space, ids, keys, [it.mass for it in items],
                             [it.time for it in items], [it.values.shape[0] for it in items],
-                            rows, place_rows(keys, m), one)
+                            rows, anchors, one)
         values = mean_rows(graph, [it.values.float() for it in items])
         level = graph.levels[0]
         row_keys = [mean_key([graph.keys[i] for i in ins],
@@ -604,6 +701,13 @@ class WriteOps(nn.Module):
         return [float(self.tau(n, space).detach()) for n in range(1, depth + 1)]
 
 
+def head_input(out: Tensor) -> Tensor:
+    """The key head's input: the row output's mean over positions, unit length (the
+    outputs' rows have norm sqrt(width), so an unnormalized mean would make every Adam
+    step of the zero-initialized head move the key by about lr x width)."""
+    return nn.functional.normalize(out.float().mean(0), dim=-1)
+
+
 def field_key(head: nn.Module, keys: Sequence[Tensor], gates, out: Tensor) -> Tensor:
     """A row's key from its field: the inputs' unit keys weighted by the aggregator's
     input weights (gates share x mass, normalized; differentiable), plus the key head's
@@ -612,7 +716,7 @@ def field_key(head: nn.Module, keys: Sequence[Tensor], gates, out: Tensor) -> Te
     w = w.to(out.device).float()
     w = w / w.sum().clamp_min(1e-12)
     base = (w[:, None] * torch.stack([k.to(out.device).float() for k in keys])).sum(0)
-    return nn.functional.normalize(base + head(out.float().mean(0)), dim=-1)
+    return nn.functional.normalize(base + head(head_input(out)), dim=-1)
 
 
 def apply_field(op: nn.Module, values: Sequence[Tensor], gates, offsets: Sequence[Tensor],
@@ -650,6 +754,56 @@ def combine(ops: WriteOps, graph: SpaceGraph, level: int, j: int,
     return out, key, mass.float()
 
 
+def combine_many(ops: WriteOps, graph: SpaceGraph, level: int, rows: Sequence[int],
+                 inputs: Sequence[Sequence[tuple[Tensor, Tensor, Tensor]]], device, autocast,
+                 max_pairs: int | None = None) -> list[tuple[Tensor, Tensor, Tensor]]:
+    """``combine`` for many rows of one level in one aggregator pass (packed pairs,
+    ``MLPMatrix.forward_many``): the dynamic shares of every (row, input) pair in one
+    masked softmax over the inputs' candidate rows, the field keys in one head call.
+    Equal to ``[combine(..., j, ...) for j in rows]`` up to summation order."""
+    rows = list(rows)
+    if not rows:
+        return []
+    lv = graph.levels[level - 1]
+    anchors = graph.row_keys.to(device).float()
+    tau = ops.tau(level, graph.space)
+    owner, cand_rows, position, keys, masses, values = [], [], [], [], [], []
+    for g, (j, ins) in enumerate(zip(rows, inputs)):
+        for k, (v, key, mass) in zip(lv.inputs[j], ins):
+            cands = lv.candidates[k]
+            owner.append(g)
+            cand_rows.append(cands)
+            position.append(cands.index(j))
+            keys.append(key)
+            masses.append(mass)
+            values.append(v)
+    values = gather_to(values, device)
+    key_in = torch.stack(gather_to(keys, device)).float()
+    shares, _ = candidate_shares(key_in, anchors, cand_rows, tau)
+    share = shares.gather(1, to_device(torch.tensor(position), device)[:, None])[:, 0]
+    gates = torch.stack(gather_to(masses, device)).float() * share
+    owner_t = to_device(torch.tensor(owner), device)
+    offsets = key_in - anchors[to_device(torch.tensor(rows), device)][owner_t]
+    groups, start = [], 0
+    counts = [len(lv.inputs[j]) for j in rows]
+    for g, (j, n) in enumerate(zip(rows, counts)):
+        groups.append(([(values[i], gates[i], offsets[i])
+                        for i in range(start, start + n)], anchors[j], int(lv.count[j])))
+        start += n
+    with autocast():
+        got = ops.op(level, graph.space).forward_many(groups, neighbour_keys=True,
+                                                      max_pairs=max_pairs)
+    outs = [o.float() for o, _ in got]
+    # field keys: gate-normalized mean of the inputs' keys + the head on the mean output
+    total = torch.zeros(len(rows), device=device).index_add(0, owner_t, gates)
+    w = gates / total[owner_t].clamp_min(1e-12)
+    base = torch.zeros(len(rows), key_in.shape[1], device=device).index_add(
+        0, owner_t, w[:, None] * key_in)
+    head = ops.key_head(level, graph.space)(torch.stack([head_input(o) for o in outs]))
+    out_keys = nn.functional.normalize(base + head, dim=-1)
+    return [(o, k, m.float()) for o, k, (_, m) in zip(outs, out_keys, got)]
+
+
 def aggregate(graph: SpaceGraph, ops: WriteOps, leaves: Sequence[tuple[Tensor, Tensor, Tensor]],
               *, device='cpu', autocast=None) -> list[list[tuple[Tensor, Tensor, Tensor]]]:
     """Every level of ``graph`` from the leaves' (value, unit key, mass), with gradients
@@ -663,21 +817,102 @@ def aggregate(graph: SpaceGraph, ops: WriteOps, leaves: Sequence[tuple[Tensor, T
     return out
 
 
+def to_device(t: Tensor, device) -> Tensor:
+    """A host tensor on ``device`` without waiting for the device's queue (pinned,
+    non-blocking copy): index tensors built on the host must not synchronize."""
+    device = torch.device(device)
+    if device.type == 'cuda' and t.device.type == 'cpu':
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
+
+
+def gather_to(tensors: Sequence[Tensor], device) -> list[Tensor]:
+    """``[t.to(device) for t in tensors]`` with one copy for all tensors not yet there
+    (concatenated along the first dimension, or stacked when 0-d); tensors listed twice are
+    copied once. Differentiable like ``.to``."""
+    device = torch.device(device)
+    out = list(tensors)
+    away: dict[int, int] = {}
+    for n, t in enumerate(tensors):
+        if t.device != device and id(t) not in away:
+            away[id(t)] = n
+    if not away:
+        return out
+    firsts = list(away.values())
+    moving = [tensors[n] for n in firsts]
+    if all(t.dim() == 0 for t in moving):
+        moved = list(torch.stack(moving).to(device).unbind(0))
+    else:
+        flat = [t.reshape(-1, *t.shape[1:]) if t.dim() else t.reshape(1) for t in moving]
+        same = len({f.shape[1:] for f in flat}) == 1 and len({f.dtype for f in flat}) == 1
+        if not same:
+            moved = [t.to(device) for t in moving]
+        else:
+            joined = torch.cat(flat).to(device)
+            moved = [piece.reshape(t.shape) for piece, t in
+                     zip(torch.split(joined, [f.shape[0] for f in flat]), moving)]
+    by_id = {id(t): m for t, m in zip(moving, moved)}
+    return [by_id.get(id(t), t) if t.device != device else t for t in out]
+
+
+def segment_index(lengths: Sequence[int], device) -> Tensor:
+    """The segment number of every row of ``lengths``-sized consecutive segments."""
+    return to_device(torch.repeat_interleave(torch.arange(len(lengths)),
+                                             torch.tensor(list(lengths))), device)
+
+
 def default_leaf_key(space: str, item_id: str, value: Tensor, raw: Tensor) -> Tensor:
     """A leaf's unit key: its (live) key."""
     return nn.functional.normalize(raw.float(), dim=-1)
 
 
-def head_leaf_key(heads, corrections: Callable | None = None) -> Callable:
+def _default_many(space, ids, values, raws):
+    return nn.functional.normalize(torch.stack([r.float() for r in raws]), dim=-1)
+
+
+default_leaf_key.many = _default_many
+
+
+def head_leaf_key(heads, corrections: Callable | None = None,
+                  corrections_many: Callable | None = None) -> Callable:
     """Leaf keys from content: the item-key head of the value (unnormalized mean) plus a
     free per-item correction (``corrections(space, item_id, raw)``; default the item's
     live key, which then holds the correction), normalized. The heads learn to place a
-    corpus; the correction holds item-specific placement."""
+    corpus; the correction holds item-specific placement. ``key.many(space, ids, values,
+    raws)`` computes many leaves' keys in one head call (``corrections_many(space, ids,
+    raws)`` gives their corrections stacked)."""
     def key(space: str, item_id: str, value: Tensor, raw: Tensor) -> Tensor:
         head = heads.item[space](value.float()).mean(-2)
         corr = raw if corrections is None else corrections(space, item_id, raw)
         return nn.functional.normalize(head + corr.to(head.device).float(), dim=-1)
+
+    def many(space: str, ids: Sequence[str], values: Sequence[Tensor], raws) -> Tensor:
+        lengths = [int(v.shape[0]) for v in values]
+        out = heads.item[space](torch.cat([v.float() for v in values]))
+        seg = segment_index(lengths, out.device)
+        heads_mean = torch.zeros(len(values), out.shape[1], device=out.device,
+                                 dtype=out.dtype).index_add(0, seg, out)
+        heads_mean = heads_mean / to_device(torch.tensor(lengths, dtype=out.dtype),
+                                            out.device)[:, None]
+        if corrections_many is not None:
+            corr = corrections_many(space, ids, raws)
+        elif corrections is not None:
+            corr = torch.stack([corrections(space, i, r) for i, r in zip(ids, raws)])
+        else:
+            corr = torch.stack([r.float() for r in raws])
+        return nn.functional.normalize(heads_mean + corr.to(out.device).float(), dim=-1)
+    key.many = many
     return key
+
+
+def leaf_keys(fn: Callable, space: str, ids: Sequence[str], values: Sequence[Tensor],
+              raws: Sequence[Tensor]) -> list[Tensor]:
+    """Unit keys of many leaves: ``fn.many`` in one call when it has one, else per leaf."""
+    if not len(ids):
+        return []
+    if hasattr(fn, 'many'):
+        return list(fn.many(space, ids, values, raws).float().unbind(0))
+    return [fn(space, i, v, r).float() for i, v, r in zip(ids, values, raws)]
 
 
 # -- the stack view -----------------------------------------------------------------------
@@ -744,9 +979,12 @@ class SuperposedKB:
             items = self.kb.read(space, chunk, live=live)
             pairs = self.values_fn(space, chunk) if self.values_fn is not None else \
                 [(it.values, it.key) for it in items]
-            for item_id, item, (value, raw) in zip(chunk, items, pairs):
-                keys.append(self.leaf_key(space, item_id, value.float().to(self.device),
-                                          raw.float().to(self.device)).float().cpu())
+            got = leaf_keys(self.leaf_key, space, chunk,
+                            [v.float() for v in gather_to([v for v, _ in pairs], self.device)],
+                            [r.float() for r in gather_to([r for _, r in pairs], self.device)])
+            if got:
+                keys += list(torch.stack(got).cpu().unbind(0))
+            for item in items:
                 mass.append(item.mass)
                 time.append(item.time)
                 length.append(int(item.values.shape[0]))
@@ -842,8 +1080,9 @@ class SuperposedKB:
         for r in rows:
             self._src.pop((space, r), None)
         if touched[g.depth] and space in self.top_keys:
-            for j in sorted(touched[g.depth]):
-                self.top_keys[space][j] = self.item(space, g.depth, j)[1].cpu()
+            tops = sorted(touched[g.depth])
+            for j, (_, key, _) in zip(tops, self.items(space, g.depth, tops)):
+                self.top_keys[space][j] = key.cpu()
         return {'leaves': len(rows), 'rows': {n: sorted(v) for n, v in touched.items()}}
 
     def refield(self, fields: Mapping[str, float], step: int) -> None:
@@ -854,7 +1093,7 @@ class SuperposedKB:
         self.begin(step)
         for space, field in fields.items():
             g = self.graphs[space]
-            keys = torch.stack([k.cpu() for _, k, _ in self._sources(space, range(len(g.ids)))])
+            keys = torch.stack([k for _, k, _ in self._sources(space, range(len(g.ids)))]).cpu()
             self.graphs[space] = build_graph(self.dataset, space, g.ids, keys, g.mass, g.time,
                                              g.length, g.row_ids, g.row_keys, self.config,
                                              self.ops.taus(space, self.config.depth), field,
@@ -889,74 +1128,104 @@ class SuperposedKB:
                 device = self.device if live and self.kb.live_device is not None else None
                 pairs = [(it.values, it.key) for it in self.kb.read(space, ids, live=live,
                                                                     device=device)]
-            for r, item_id, (v, raw) in zip(todo, ids, pairs):
-                v = v.detach().float().to(self.device)
-                key = self.leaf_key(space, item_id, v, raw.detach().float().to(self.device))
-                self._src[(space, r)] = (v, key.float(),
-                                         torch.tensor(float(g.mass[r]), device=self.device))
+            values = [v.float() for v in gather_to([v.detach() for v, _ in pairs], self.device)]
+            keys = leaf_keys(self.leaf_key, space, ids, values,
+                             [r.float() for r in gather_to([r.detach() for _, r in pairs],
+                                                           self.device)])
+            masses = to_device(torch.tensor(g.mass[todo], dtype=torch.float),
+                               self.device).unbind(0)
+            for r, v, key, m in zip(todo, values, keys, masses):
+                self._src[(space, r)] = (v, key, m)
         return [self._src[(space, r)] for r in rows]
 
-    def _apply(self, space: str, level: int, j: int, inputs) -> tuple[Tensor, Tensor, Tensor]:
-        return combine(self.ops, self.graphs[space], level, j, inputs, self.device,
-                       self.autocast)
+    def _apply(self, space: str, level: int, rows: Sequence[int], inputs
+               ) -> list[tuple[Tensor, Tensor, Tensor]]:
+        """The rows of one level from their fields' inputs: one batched aggregator pass
+        (``combine_many``), or row by row (``config.batched`` False, the reference)."""
+        g = self.graphs[space]
+        if self.config.batched:
+            return combine_many(self.ops, g, level, rows, inputs, self.device, self.autocast,
+                                self.config.max_pairs)
+        return [combine(self.ops, g, level, j, ins, self.device, self.autocast)
+                for j, ins in zip(rows, inputs)]
 
     def _fresh(self, key: tuple[str, int, int]) -> bool:
         got = self._cache.get(key)
         return got is not None and self.step - got[1] < max(1, self.config.cache_every)
 
     @torch.no_grad()
-    def item(self, space: str, level: int, j: int) -> tuple[Tensor, Tensor, Tensor]:
-        """A level item's (value, key, mass) without gradient; lower levels from the cache."""
+    def items(self, space: str, level: int, rows: Sequence[int]
+              ) -> list[tuple[Tensor, Tensor, Tensor]]:
+        """Level items' (value, key, mass) without gradient; lower levels from the cache.
+        The missing rows of a level are computed together, their inputs first."""
+        rows = list(rows)
         if level == 0:
-            return self._sources(space, [j])[0]
+            return self._sources(space, rows)
         g = self.graphs[space]
         top = level == g.depth
-        if top and (space, j) in self._top:
-            return self._top[(space, j)]
-        key = (space, level, j)
-        if not top and self._fresh(key):
-            return self._cache[key][0]
-        ins = g.levels[level - 1].inputs[j]
-        below = self._sources(space, ins) if level == 1 else \
-            [self.item(space, level - 1, k) for k in ins]
-        out = self._apply(space, level, j, below)
-        self.counters['computed'] = self.counters.get('computed', 0) + 1
-        if top:
-            self._top[(space, j)] = out
-        else:
-            self._cache[key] = (out, self.step)
-        return out
+        todo = [j for j in dict.fromkeys(rows)
+                if not ((space, j) in self._top if top else self._fresh((space, level, j)))]
+        if todo:
+            ins = g.levels[level - 1].inputs
+            need = sorted({k for j in todo for k in ins[j]})
+            below = dict(zip(need, self._sources(space, need) if level == 1 else
+                             self.items(space, level - 1, need)))
+            outs = self._apply(space, level, todo, [[below[k] for k in ins[j]] for j in todo])
+            self.counters['computed'] = self.counters.get('computed', 0) + len(todo)
+            for j, out in zip(todo, outs):
+                if top:
+                    self._top[(space, j)] = out
+                else:
+                    self._cache[(space, level, j)] = (out, self.step)
+        return [self._top[(space, j)] if top else self._cache[(space, level, j)][0]
+                for j in rows]
+
+    def item(self, space: str, level: int, j: int) -> tuple[Tensor, Tensor, Tensor]:
+        return self.items(space, level, [j])[0]
 
     def value(self, space: str, level: int, j: int) -> Tensor:
         return self.item(space, level, j)[0]
 
-    def grad_value(self, space: str, level: int, j: int, leaf: Callable, *,
-                   deep: float | None = None, seed: str = '') -> tuple[Tensor, Tensor, Tensor]:
-        """A row's (value, key, mass) recomputed with a graph. Level-1 inputs are
-        ``leaf(space, ids)`` ((value, key, mass) each, with gradients where wanted); higher
-        inputs are the cached items, and a sampled fraction ``deep`` (default
-        ``deep_grad``) is recomputed one level down and enters as
-        ``cached + (fresh - fresh.detach()) / p``: the forward is the cached item exactly,
-        the gradient that of the fresh recomputation."""
+    def grad_values(self, space: str, level: int, rows: Sequence[int], leaf: Callable, *,
+                    deep: float | None = None, seed: str = ''
+                    ) -> list[tuple[Tensor, Tensor, Tensor]]:
+        """Rows' (value, key, mass) recomputed with a graph, all rows of the level in one
+        pass. Level-1 inputs are ``leaf(space, ids)`` ((value, key, mass) each, with
+        gradients where wanted; one call for the union of the fields); higher inputs are
+        the cached items, and a sampled fraction ``deep`` (default ``deep_grad``, drawn
+        per (row, input)) is recomputed one level down (once per input, shared by the
+        rows that sampled it) and enters as ``cached + (fresh - fresh.detach()) / p``: the
+        forward is the cached item exactly, the gradient that of the fresh recomputation."""
+        rows = list(rows)
+        if not rows:
+            return []
         g = self.graphs[space]
-        ins = g.levels[level - 1].inputs[j]
+        ins = g.levels[level - 1].inputs
+        need = sorted({k for j in rows for k in ins[j]})
         if level == 1:
-            inputs = leaf(space, [g.ids[k] for k in ins])
+            got = dict(zip(need, leaf(space, [g.ids[k] for k in need])))
+            inputs = [[got[k] for k in ins[j]] for j in rows]
         else:
             p = self.config.deep_grad if deep is None else deep
-            rnd = random.Random(f'{self.config.seed}:{self.step}:{self.dataset}:{space}:'
-                                f'{level}:{j}:{seed}')
-            inputs = []
-            for k in ins:
-                cached = self.item(space, level - 1, k)
-                if p > 0 and rnd.random() < p:
-                    fresh = self.grad_value(space, level - 1, k, leaf, deep=deep, seed=seed)
-                    self.counters['deep'] = self.counters.get('deep', 0) + 1
-                    inputs.append(tuple(c + (f - f.detach()) / min(p, 1.0)
-                                        for c, f in zip(cached, fresh)))
-                else:
-                    inputs.append(cached)
-        return self._apply(space, level, j, inputs)
+            cached = dict(zip(need, self.items(space, level - 1, need)))
+            picks = {}
+            for j in dict.fromkeys(rows):
+                rnd = random.Random(f'{self.config.seed}:{self.step}:{self.dataset}:{space}:'
+                                    f'{level}:{j}:{seed}')
+                picks[j] = {k for k in ins[j] if p > 0 and rnd.random() < p}
+            deep_rows = sorted(set().union(*picks.values()))
+            fresh = dict(zip(deep_rows, self.grad_values(space, level - 1, deep_rows, leaf,
+                                                         deep=deep, seed=seed)))
+            self.counters['deep'] = self.counters.get('deep', 0) + \
+                sum(len(picks[j]) for j in rows)
+            inputs = [[tuple(c + (f - f.detach()) / min(p, 1.0)
+                             for c, f in zip(cached[k], fresh[k])) if k in picks[j]
+                       else cached[k] for k in ins[j]] for j in rows]
+        return self._apply(space, level, rows, inputs)
+
+    def grad_value(self, space: str, level: int, j: int, leaf: Callable, *,
+                   deep: float | None = None, seed: str = '') -> tuple[Tensor, Tensor, Tensor]:
+        return self.grad_values(space, level, [j], leaf, deep=deep, seed=seed)[0]
 
     # -- rows ------------------------------------------------------------------------------------
     def top_item(self, space: str, item_id: str) -> tuple[Tensor, Tensor, Tensor]:
@@ -968,7 +1237,7 @@ class SuperposedKB:
 
     def top_values(self, space: str) -> list[Tensor]:
         g = self.graphs[space]
-        return [self.item(space, g.depth, j)[0] for j in range(len(g.row_ids))]
+        return [v for v, _, _ in self.items(space, g.depth, range(len(g.row_ids)))]
 
     def top_time(self, space: str, item_id: str) -> int:
         g = self.graphs[space]
@@ -984,8 +1253,8 @@ class SuperposedKB:
         """The rows' search keys: their current field keys."""
         for space, g in self.graphs.items():
             width = self.kb.spaces[space].key_width
-            keys = [self.item(space, g.depth, j)[1].cpu() for j in range(len(g.row_ids))]
-            self.top_keys[space] = torch.stack(keys) if keys else torch.zeros(0, width)
+            keys = [k for _, k, _ in self.items(space, g.depth, range(len(g.row_ids)))]
+            self.top_keys[space] = torch.stack(keys).cpu() if keys else torch.zeros(0, width)
 
     def search(self, space: str, query: Tensor, k: int, query_time: int | None,
                exclude: Sequence[str] = ()) -> list[tuple[float, str]]:
@@ -1051,13 +1320,14 @@ class SuperposedKB:
         g = self.graphs[space]
         lv = g.levels[0]
         tau = self.ops.tau(1, space)
-        entropy = []
-        for r, cands in enumerate(lv.candidates):
-            key = self._sources(space, [r])[0][1]
-            p = dynamic_shares(key, g.row_keys.to(key.device), cands, tau)
-            entropy.append(float(-(p * p.clamp_min(1e-30).log()).sum()))
-        loads = [float(self.item(space, g.depth, j)[2]) for j in range(len(g.row_ids))]
-        return {'share_entropy': round(sum(entropy) / max(len(entropy), 1), 4),
+        entropy = 0.0
+        if lv.candidates:
+            keys = torch.stack([k for _, k, _ in self._sources(space, range(len(g.ids)))])
+            p, _ = candidate_shares(keys, g.row_keys, lv.candidates, tau)
+            entropy = float((-(p * p.clamp_min(1e-30).log()).sum(1)).mean())
+        loads = torch.stack([m for _, _, m in self.items(space, g.depth,
+                                                         range(len(g.row_ids)))]).tolist()
+        return {'share_entropy': round(entropy, 4),
                 'row_load': distribution(loads), 'churn': self.churn.get(space),
                 'tau': [round(t, 3) for t in self.ops.taus(space, g.depth)]}
 
@@ -1083,15 +1353,16 @@ class SuperposedKB:
         g = self.graphs[space]
         for n, lv in enumerate(g.levels, 1):
             below = self._sources(space, range(len(g.ids))) if n == 1 else \
-                [self.item(space, n - 1, k) for k in range(len(g.row_ids))]
+                self.items(space, n - 1, range(len(g.row_ids)))
             tau = self.ops.tau(n, space)
             anchors = g.row_keys.to(self.device)
             fields: list[list[tuple[int, float]]] = [[] for _ in lv.inputs]
-            for i, cands in enumerate(lv.candidates):
-                p = dynamic_shares(below[i][1], anchors, cands, tau)
-                for o, share in zip(cands, p.tolist()):
+            shares, _ = candidate_shares(torch.stack([x[1] for x in below]), anchors,
+                                         lv.candidates, tau)
+            for i, (cands, p) in enumerate(zip(lv.candidates, shares.tolist())):
+                for o, share in zip(cands, p):
                     fields[o].append((i, share))
-            mass = np.array([float(x[2]) for x in below], np.float64)
+            mass = torch.stack([x[2] for x in below]).double().cpu().numpy()
             time = g.level_time(n - 1)
             length = g.level_length(n - 1)
             g.levels[n - 1] = summarize(fields, mass, time, length, lv.candidates)
@@ -1129,12 +1400,13 @@ class SuperposedKB:
                     for n, ((v, k, _), it) in enumerate(zip(leaves, stored))])
                 below = g.ids
                 for n, level in enumerate(g.levels, 1):
-                    got = [self.item(space, n, j) for j in range(len(level.inputs))]
+                    got = self.items(space, n, range(len(level.inputs)))
                     items = [NewItem(v.cpu(), k.float().cpu(), Provenance((), 'rewrite', step),
                                      float(level.mass[j]), int(level.time[j]),
                                      g.level_ids[n][j])
                              for j, (v, k, _) in enumerate(got)]
-                    out.rewrite(space, below, items, shares=level.matrix(len(below)).toarray())
+                    # sparse: each input has only its c candidate rows
+                    out.rewrite(space, below, items, shares=level.matrix(len(below)))
                     below = g.level_ids[n]
             out.close()
             scratch = KnowledgeBase(build, writable=True)
@@ -1182,6 +1454,7 @@ class SuperposedCache(ItemCache):
         self.views, self.step, self.producer = dict(views), step, producer
         self.tops: dict[tuple[str, str, str], Tensor] = {}
         self.top_keys: dict[tuple[str, str, str], Tensor] = {}
+        self.top_masses: dict[tuple[str, str, str], float] = {}
         for view in self.views.values():
             view.begin(step)
 
@@ -1193,22 +1466,36 @@ class SuperposedCache(ItemCache):
     def sources(self, kb: KnowledgeBase, space: str, ids: Sequence[str]):
         return ItemCache.get(self, kb, space, ids)
 
-    def _row(self, kb: KnowledgeBase, space: str, item_id: str) -> tuple[str, str, str]:
-        ref = (kb.dataset, space, item_id)
-        if ref not in self.tops:
-            value, key, _ = self._view(kb.dataset).top_item(space, item_id)
-            self.tops[ref] = value.to(self.device).detach().clone().requires_grad_(self.train)
-            self.top_keys[ref] = key.to(self.device).detach().clone().requires_grad_(self.train)
-        return ref
+    def _rows(self, kb: KnowledgeBase, space: str, ids: Sequence[str]
+              ) -> list[tuple[str, str, str]]:
+        """The rows as this step's leaves; the missing ones computed together."""
+        missing = [i for i in dict.fromkeys(ids) if (kb.dataset, space, i) not in self.tops]
+        if missing:
+            view = self._view(kb.dataset)
+            g = view.graphs[space]
+            got = view.items(space, g.depth, [g.top_index[i] for i in missing])
+            masses = torch.stack([m for _, _, m in got]).tolist()
+            for item_id, (value, key, _), m in zip(missing, got, masses):
+                ref = (kb.dataset, space, item_id)
+                self.tops[ref] = value.to(self.device).detach().clone() \
+                    .requires_grad_(self.train)
+                self.top_keys[ref] = key.to(self.device).detach().clone() \
+                    .requires_grad_(self.train)
+                self.top_masses[ref] = m
+        return [(kb.dataset, space, i) for i in ids]
 
     def get(self, kb: KnowledgeBase, space: str, ids: Sequence[str]):
         view = self._view(kb.dataset)
-        return [(self.tops[self._row(kb, space, i)], view.top_time(space, i)) for i in ids]
+        return [(self.tops[ref], view.top_time(space, ref[2]))
+                for ref in self._rows(kb, space, ids)]
 
     def keys(self, kb: KnowledgeBase, space: str, ids: Sequence[str]) -> list[Tensor]:
-        return [self.top_keys[self._row(kb, space, i)] for i in ids]
+        return [self.top_keys[ref] for ref in self._rows(kb, space, ids)]
 
     def mass(self, dataset: str, space: str, item_id: str) -> float:
+        ref = (dataset, space, item_id)
+        if ref in self.top_masses:
+            return self.top_masses[ref]
         return self._view(dataset).top_mass(space, item_id)
 
     def search(self, kbs: Sequence[KnowledgeBase], allowed, space: str, query: Tensor, k: int,
@@ -1255,43 +1542,66 @@ class SuperposedCache(ItemCache):
             fresh = [None] * len(ids)
             if self.producer is not None:
                 fresh = self.producer.values(space, [(dataset, i) for i in ids])
-            values = [v for v, _ in self.sources(kb, space, ids)]
+            values = [v if f is None else f
+                      for (v, _), f in zip(self.sources(kb, space, ids), fresh)]
             raws = ItemCache.keys(self, kb, space, ids)
             g = view.graphs[space]
-            out = []
-            for item_id, v, f, raw in zip(ids, values, fresh, raws):
-                value = v if f is None else f
-                out.append((value, view.leaf_key(space, item_id, value, raw),
-                            torch.tensor(float(g.mass[g.index[item_id]]), device=value.device)))
-            return out
+            keys = leaf_keys(view.leaf_key, space, ids, values, raws)
+            masses = to_device(torch.tensor([float(g.mass[g.index[i]]) for i in ids]),
+                               values[0].device).unbind(0) if ids else []
+            return list(zip(values, keys, masses))
         return leaf
 
-    def backward(self) -> dict:
-        """Recompute the rows that received gradients and backpropagate."""
+    def backward(self, balance: float = 0.0, usage: dict | None = None) -> dict:
+        """Recompute the rows that received gradients and backpropagate. With
+        ``balance`` > 0 also the write side's balance loss on those rows' loads (their
+        masses under the dynamic shares, differentiable in the leaves' keys and tau)
+        against a moving average of each row's load (``usage['write/<kb>/<space>']``,
+        ``losses.balance_loss``): mass moving onto already loaded rows costs."""
+        from schnitz.kb.losses import UsageEMA, balance_loss
         if not self.train:
             raise ValueError('an evaluation cache does not backpropagate')
         done, drift = 0, 0.0
+        balances = []
         for view in self.views.values():
             view.counters = {}
+        groups: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
         for ref, value in self.tops.items():
-            key = self.top_keys[ref]
-            if value.grad is None and key.grad is None:
-                continue
-            dataset, space, item_id = ref
+            if value.grad is not None or self.top_keys[ref].grad is not None:
+                groups.setdefault(ref[:2], []).append(ref)
+        tensors, grads = [], []
+        for (dataset, space), refs in groups.items():   # all touched rows of a space at once
             view = self.views[dataset]
             g = view.graphs[space]
-            out, out_key, _ = view.grad_value(space, g.depth, g.top_index[item_id],
-                                              self.leaf_fn(dataset, view.kb))
-            drift = max(drift, float((out.detach().to(value.device) - value.detach()).abs().max()))
-            tensors, grads = [], []
-            for got, leaf in ((out, value), (out_key, key)):
-                if leaf.grad is not None:
-                    tensors.append(got)
-                    grads.append(leaf.grad.to(got.device))
+            got = view.grad_values(space, g.depth, [g.top_index[r[2]] for r in refs],
+                                   self.leaf_fn(dataset, view.kb))
+            if balance > 0 and usage is not None:
+                name = f'write/{dataset}/{space}'
+                ema = usage.setdefault(name, UsageEMA(len(g.row_ids)))
+                ema.grow(len(g.row_ids))
+                rows = torch.tensor([g.top_index[r[2]] for r in refs])
+                loads = torch.stack([m for _, _, m in got])
+                b = balance_loss(rows, loads, ema)
+                ema.update(rows, loads.detach())
+                tensors.append(balance * b)
+                grads.append(torch.ones_like(b))
+                balances.append(float(b.detach()))
+            for ref, (out, out_key, _) in zip(refs, got):
+                value, key = self.tops[ref], self.top_keys[ref]
+                drift = max(drift, float((out.detach().to(value.device)
+                                          - value.detach()).abs().max()))
+                for fresh, leaf in ((out, value), (out_key, key)):
+                    if leaf.grad is not None:
+                        tensors.append(fresh)
+                        grads.append(leaf.grad.to(fresh.device))
+                done += 1
+        if tensors:
             torch.autograd.backward(tensors, grads)
-            done += 1
         deep = sum(v.counters.get('deep', 0) for v in self.views.values())
-        return {'rows': done, 'deep': deep, 'drift': drift}
+        out = {'rows': done, 'deep': deep, 'drift': drift}
+        if balances:
+            out['write_balance'] = sum(balances) / len(balances)
+        return out
 
     def touched_tops(self) -> list[tuple[str, str, str]]:
         return [ref for ref, leaf in self.tops.items() if leaf.grad is not None]
@@ -1311,9 +1621,9 @@ def fit_losses(view: SuperposedKB, space: str, row_ids: Sequence[str],
     g = view.graphs[space]
     parts: dict[str, list[Tensor]] = {'cos': [], 'mse': [], 'key': []}
     loads = []
-    for n, (row, target) in enumerate(zip(row_ids, targets)):
-        out, key, mass = view.grad_value(space, g.depth, g.top_index[row], leaf, deep=1.0,
-                                         seed='fit')
+    got_rows = view.grad_values(space, g.depth, [g.top_index[r] for r in row_ids], leaf,
+                                deep=1.0, seed='fit')
+    for n, ((out, key, mass), target) in enumerate(zip(got_rows, targets)):
         got = item_losses({space: out}, {space: target.to(out.device)})
         parts['cos'].append(got[f'cos_{space}'])
         parts['mse'].append(got[f'mse_{space}'])
@@ -1353,15 +1663,20 @@ def consolidate(views: Mapping[str, SuperposedKB], refs: Sequence[tuple[str, str
     for _ in range(steps):
         cache = SuperposedCache(views, device, train=True, step=-1)
         total = None
-        for dataset, space, item_id in refs:
+        groups: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+        for ref in refs:
+            groups.setdefault(ref[:2], []).append(ref)
+        for view in views.values():
+            view.clear()
+        for (dataset, space), members in groups.items():
             view = views[dataset]
             g = view.graphs[space]
-            view.clear()
-            out = view.grad_value(space, g.depth, g.top_index[item_id],
-                                  cache.leaf_fn(dataset, view.kb), deep=1.0, seed='refit')[0]
-            parts = item_losses({space: out}, {space: before[(dataset, space, item_id)]})
-            loss = parts[f'cos_{space}'] + parts[f'mse_{space}']
-            total = loss if total is None else total + loss
+            got = view.grad_values(space, g.depth, [g.top_index[r[2]] for r in members],
+                                   cache.leaf_fn(dataset, view.kb), deep=1.0, seed='refit')
+            for ref, (out, _, _) in zip(members, got):
+                parts = item_losses({space: out}, {space: before[ref]})
+                loss = parts[f'cos_{space}'] + parts[f'mse_{space}']
+                total = loss if total is None else total + loss
         (total / len(refs)).backward()
         cache.apply(item_lr)
     refit = distance() if steps else moved

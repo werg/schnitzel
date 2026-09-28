@@ -362,6 +362,11 @@ class LiveSnapshot:
         self.release()
 
 
+def _issparse(x) -> bool:
+    """A scipy.sparse matrix (without importing scipy here)."""
+    return hasattr(x, 'tocsr') and hasattr(x, 'nnz')
+
+
 class KnowledgeBase:
     """One KB directory. ``writable=True`` takes the exclusive writer lock and recovers;
     ``verify=True`` checks every committed segment's checksum after opening."""
@@ -885,6 +890,13 @@ class KnowledgeBase:
 
     @staticmethod
     def _share_matrix(inputs: Sequence[str], n_out: int, shares) -> np.ndarray:
+        if _issparse(shares):          # scipy.sparse: (outputs, inputs), kept sparse
+            if shares.shape != (n_out, len(inputs)):
+                raise ValueError(f'shares are (outputs, inputs) = ({n_out}, {len(inputs)})')
+            matrix = shares.tocsr().astype(np.float64)
+            matrix.sum_duplicates()
+            matrix.sort_indices()
+            return matrix
         if shares is None:
             if n_out != 1:
                 raise ValueError('a rewrite with several outputs needs explicit shares '
@@ -914,7 +926,8 @@ class KnowledgeBase:
         """Replace the current ``inputs`` by ``outputs`` (new ids) in one commit.
 
         ``shares[o]`` gives output o's responsibility share of each input (a mapping
-        input id -> share, or an (outputs, inputs) matrix); optional only for a single
+        input id -> share, or an (outputs, inputs) matrix, dense or ``scipy.sparse``: a
+        store-scale rewrite lists each input's few outputs); optional only for a single
         output (share 1 of every input). Shares are nonnegative, each input's shares
         sum to one within ``tolerance`` (then normalized exactly) and every output has
         a positive share of some input. Each output's mass must equal the share-weighted
@@ -931,17 +944,23 @@ class KnowledgeBase:
             table, mass = self._map(space, 'rows.i64'), self._map(space, 'mass.f32')
             masses = np.array([float(mass[r]) for r in rows])
             matrix = self._share_matrix(inputs, len(outputs), shares)
-            if not np.isfinite(matrix).all() or (matrix < 0).any():
+            is_sparse = _issparse(matrix)
+            values = matrix.data if is_sparse else matrix
+            if not np.isfinite(values).all() or (values < 0).any():
                 raise ValueError('shares are finite and nonnegative')
-            totals = matrix.sum(0)
+            totals = np.asarray(matrix.sum(0)).ravel()
             for input_id, total in zip(inputs, totals):
                 if abs(total - 1.0) > tolerance:
                     raise ValueError(f'shares of input {input_id!r} sum to {total}, not 1 '
                                      '(invariant 7)')
-            matrix = matrix / totals
-            if (matrix.sum(1) <= 0).any():
+            if is_sparse:                 # the same division, entry by entry
+                matrix = matrix.copy()
+                matrix.data = matrix.data / totals[matrix.indices]
+            else:
+                matrix = matrix / totals
+            if (np.asarray(matrix.sum(1)).ravel() <= 0).any():
                 raise ValueError('every output needs a positive share of some input')
-            expected = matrix @ masses
+            expected = np.asarray(matrix @ masses).ravel()
             versions = [int(table[r, VERSION]) for r in rows]
             times = [int(table[r, TIME]) for r in rows]
             source_lists = [self._meta(space, r)['sources'] for r in rows]
@@ -951,7 +970,14 @@ class KnowledgeBase:
                 if abs(item.mass - expected[o]) > tolerance * max(1.0, abs(expected[o])):
                     raise ValueError(f'output {o} has mass {item.mass}, but its shares of the '
                                      f'inputs carry {expected[o]}')
-                used = np.flatnonzero(matrix[o] > 0).tolist()
+                if is_sparse:
+                    a, b = matrix.indptr[o], matrix.indptr[o + 1]
+                    keep = matrix.data[a:b] > 0
+                    used = matrix.indices[a:b][keep].tolist()
+                    row_shares = matrix.data[a:b][keep].tolist()
+                else:
+                    used = np.flatnonzero(matrix[o] > 0).tolist()
+                    row_shares = [matrix[o, i] for i in used]
                 sources = tuple(sorted({s for i in used for s in source_lists[i]}))
                 provenance = item.provenance
                 if provenance.sources and set(provenance.sources) != set(sources):
@@ -960,8 +986,8 @@ class KnowledgeBase:
                                         provenance.dataset)
                 fixed.append(NewItem(item.values, item.key, provenance, float(expected[o]),
                                      max([item.time] + [times[i] for i in used]), item.id))
-                lineages.append(tuple((inputs[i], versions[i], float(matrix[o, i]))
-                                      for i in used))
+                lineages.append(tuple((inputs[i], versions[i], float(share))
+                                      for i, share in zip(used, row_shares)))
             ids = [item.id or uuid.uuid4().hex for item in fixed]
             if len(set(ids)) != len(ids) or any(self.has(i) for i in ids):
                 raise ValueError('rewrite outputs need new, distinct ids')

@@ -450,19 +450,27 @@ class StackFit:
         self.ops, self.heads, self.config = ops, heads, config
         self.device = torch.device(device)
         self.heldout_mod = heldout_mod
-        self.leaves, self.stored = {}, {}
+        self.leaves, self.stored, self.records, self.datasets = {}, {}, {}, {}
+        self.producers = None
         for name, info in manifest['kbs'].items():
             path = leaf_banks / info['dir']
             if not (path / 'manifest.json').exists():
                 continue
             kb = KnowledgeBase(path)
             self.leaves[name] = kb
+            self.datasets[name] = kb.dataset
             self.stored[name] = {}
             for space in kb.spaces:
                 ids = _current(kb, space)
+                items = kb.read(space, ids)
                 self.stored[name][space] = {it.id: (it.values.float().to(self.device),
                                                     it.key.float().to(self.device))
-                                            for it in kb.read(space, ids)}
+                                            for it in items}
+                # a leaf's record, when a codec produced it from one (its producer source)
+                for it in items:
+                    if it.provenance.producer == 'codec' and len(it.provenance.sources) == 1:
+                        self.records.setdefault(kb.dataset, {}).setdefault(space, {})[
+                            it.id] = it.provenance.sources[0]
         self.corrections = torch.nn.ParameterDict({
             f'{name}/{space}': torch.nn.Parameter(torch.zeros(
                 len(items), kb_width(self.leaves[name], space), device=self.device))
@@ -479,12 +487,52 @@ class StackFit:
 
         def correction(space, item_id, raw):
             return self.corrections[f'{name}/{space}'][self.index[name][space][item_id]]
-        return head_leaf_key(self.heads, correction)
+
+        def corrections(space, ids, raws):
+            from schnitz.kb.superpose import to_device
+            rows = to_device(torch.tensor([self.index[name][space][i] for i in ids]),
+                             self.device)
+            return self.corrections[f'{name}/{space}'][rows]
+        return head_leaf_key(self.heads, correction, corrections)
+
+    def resolve(self, dataset: str, space: str, item_id: str):
+        """A leaf's producer source for ``Producers`` (a codec item of one record with
+        text and a cached span), else None (the leaf keeps its stored value)."""
+        record = self.records.get(dataset, {}).get(space, {}).get(item_id)
+        prod = self.producers
+        if record is None or prod is None or record not in prod.texts \
+                or dataset not in prod.caches or record not in prod.caches[dataset]:
+            return None
+        return ('codec', dataset, record)
+
+    def stored_value(self, dataset: str, space: str, item_id: str) -> torch.Tensor | None:
+        """A leaf's stored bank item (the producers' exactness check)."""
+        for name, ds in self.datasets.items():
+            if ds == dataset:
+                got = self.stored[name].get(space, {}).get(item_id)
+                return None if got is None else got[0]
+        return None
+
+    def _values(self, name: str, space: str, ids) -> list[torch.Tensor]:
+        """Leaf values: with producers the writer's and codecs' recomputation (leaf tensors
+        whose gradients ``producers.backward`` carries into writer and codecs), else the
+        stored bank items."""
+        stored = [self.stored[name][space][i][0] for i in ids]
+        if self.producers is None:
+            return stored
+        fresh = self.producers.values(space, [(self.datasets[name], i) for i in ids])
+        return [v if f is None else f for v, f in zip(stored, fresh)]
 
     def values_fn(self, name: str):
         def values(space, ids):
-            return [self.stored[name][space][i] for i in ids]
+            got = self._values(name, space, ids)
+            return [(v, self.stored[name][space][i][1]) for v, i in zip(got, ids)]
         return values
+
+    def begin(self) -> None:
+        """A new step: producer recomputations are stale after an optimizer step."""
+        if self.producers is not None:
+            self.producers.begin()
 
     def load(self, targets: dict[str, RowTargets], step: int = 0) -> dict:
         """New row targets: views anchored at the rows, candidates from the leaves' keys."""
@@ -519,13 +567,14 @@ class StackFit:
         view, key = self.views[name], self.leaf_key(name)
 
         def leaf(space, ids):
+            from schnitz.kb.superpose import leaf_keys, to_device
             g = view.graphs[space]
-            out = []
-            for i in ids:
-                value, raw = self.stored[name][space][i]
-                out.append((value, key(space, i, value, raw),
-                            torch.tensor(float(g.mass[g.index[i]]), device=self.device)))
-            return out
+            values = self._values(name, space, ids)
+            keys = leaf_keys(key, space, ids, values,
+                             [self.stored[name][space][i][1] for i in ids])
+            masses = to_device(torch.tensor([float(g.mass[g.index[i]]) for i in ids]),
+                               self.device).unbind(0)
+            return list(zip(values, keys, masses))
         return leaf
 
     def loss(self, picks: dict[str, list[tuple[str, int]]], weights,
@@ -560,26 +609,34 @@ class StackFit:
     def measure(self, picks: dict[str, list[tuple[str, int]]], views=None) -> dict:
         """Reproduction per space (1 - cosine, relative MSE, key cosine) of the rows,
         computed fresh."""
-        from schnitz.kb.producer import item_losses
         views = views or self.views
         out: dict[str, list[float]] = {}
         for view in views.values():
             view.clear()
         for space, rows in picks.items():
+            by_kb: dict[str, list[int]] = {}
             for name, n in rows:
+                g = views[name].graphs[space]
+                if self.targets[name].rows[space][n] in g.top_index:
+                    by_kb.setdefault(name, []).append(n)
+            for name, ns in by_kb.items():
                 t, view = self.targets[name], views[name]
                 g = view.graphs[space]
-                row = t.rows[space][n]
-                if row not in g.top_index:
-                    continue
-                value, key, _ = view.item(space, g.depth, g.top_index[row])
-                got = item_losses({space: value}, {space: t.values[space][n]})
-                out.setdefault(f'cos_{space}', []).append(got[f'cos_{space}'].item())
-                out.setdefault(f'mse_{space}', []).append(got[f'mse_{space}'].item())
-                out.setdefault(f'keycos_{space}', []).append(float(F.cosine_similarity(
-                    key.cpu(), t.keys[space][n], dim=-1)))
+                got_rows = view.items(space, g.depth, [g.top_index[t.rows[space][n]]
+                                                       for n in ns])
+                for n, (value, key, _) in zip(ns, got_rows):
+                    self._measure_one(out, space, t, n, value, key)
         return {k: round(sum(v) / len(v), 5) for k, v in sorted(out.items())} | \
             {'rows': sum(len(r) for r in picks.values())}
+
+    @staticmethod
+    def _measure_one(out: dict, space: str, t, n: int, value: torch.Tensor, key: torch.Tensor) -> None:
+        from schnitz.kb.producer import item_losses
+        got = item_losses({space: value}, {space: t.values[space][n]})
+        out.setdefault(f'cos_{space}', []).append(got[f'cos_{space}'].item())
+        out.setdefault(f'mse_{space}', []).append(got[f'mse_{space}'].item())
+        out.setdefault(f'keycos_{space}', []).append(float(F.cosine_similarity(
+            key.cpu(), t.keys[space][n], dim=-1)))
 
     def write_stats(self) -> dict:
         """Per KB and space: share entropy, row load distribution, churn, tau."""
@@ -689,10 +746,8 @@ def train_stack(args) -> None:
     if 'rows' not in manifest:
         raise SystemExit(f'{args.banks} is not a rows banks dir (train.py l1 rows)')
     trained = set((args.train or 'operators,keys').split(','))
-    if trained - {'operators', 'keys'}:
-        raise SystemExit('the write fit trains the aggregators (operators) and the leaves\' '
-                         'key heads and corrections (keys); writer/codecs through the stack: '
-                         'not built')
+    if trained - {'operators', 'keys', 'writer', 'codecs'}:
+        raise SystemExit('the write fit trains operators, keys, writer and codecs')
     out = Run(args.output)
     dirs = {name: info['dir'] for name, info in manifest['kbs'].items()}
     snapshot_step = -1
@@ -734,27 +789,73 @@ def train_stack(args) -> None:
                            if k.startswith('keys.')})
     ops.to(device)
     heads.to(device)
-    fit = StackFit(ops, heads, config, Path(manifest['rows']['leaves']), manifest, device,
-                   args.heldout_mod)
+    leaf_banks = Path(manifest['rows']['leaves'])
+    fit = StackFit(ops, heads, config, leaf_banks, manifest, device, args.heldout_mod)
+    # writer and codecs through the stack: the leaves recomputed by the shared producer
+    # replay (the record's writer span, then the codecs), as in L1b
+    model = prod = codec_stack = None
+    producer_sets = {'writer': [], 'codecs': []}
+    if trained & {'writer', 'codecs'}:
+        from schnitz.kb.producer import producer_params
+        from schnitz.kb.stages.l1 import load_model
+        model = load_model(args)
+        model.writer.eval()           # replay forward = recomputation (no dropout)
+        codec_reader, _ = load_reader(model, leaf_banks, None, args.seed)
+        codec_stack = codec_reader.stack
+        leaf_manifest = json.loads((leaf_banks / 'banks.json').read_text())
+        span_root = Path(leaf_manifest.get('span_cache') or leaf_banks / 'spans')
+        caches = {fit.datasets[name]: SpanCache(span_root / kb_dir(name))
+                  for name in fit.leaves if (span_root / kb_dir(name) / 'manifest.json').exists()}
+        wanted = {r for spaces in fit.records.values() for ids in spaces.values()
+                  for r in ids.values()}
+        texts = {r: v['text'] for r, v in read_sources(
+            {str(t) for t in leaf_manifest['transcripts']}, wanted).items()}
+        prod = Producers(Writer(model, codec_stack), resolve=fit.resolve,
+                         stored=fit.stored_value, texts=texts,
+                         caches=caches, level=args.level or leaf_manifest.get('level', 's0'),
+                         mode=args.feed, batch=args.producer_batch)
+        fit.producers = prod
+        chosen = producer_params(model, codec_stack)
+        for name in ('writer', 'codecs'):
+            if name in trained:
+                producer_sets[name] = chosen[name]
+                for q in chosen[name]:
+                    q.requires_grad_(True)
+        print(json.dumps({'producers': {'records': len(wanted), 'texts': len(texts),
+                                        'caches': sorted(caches), 'feed': args.feed}}),
+              flush=True)
     rng = random.Random(args.seed)
     step = 0
     state = out.load('producers.pt', 'cpu')
     if state is not None:
         ops.load_state_dict(state['stack'])
         heads.load_state_dict(state['heads'])
+        if prod is not None and 'writer' in state:
+            model.writer.load_state_dict(state['writer'])
+            codec_stack.codecs.load_state_dict(state['codecs'])
         for k, v in state['corrections'].items():
             fit.corrections[k].data.copy_(v)
         step = state['step']
         rng.setstate(state['rng'])
         snapshot_step = state.get('targets_step', snapshot_step)
     budgets = fit.load(load_row_targets(targets_dir, dirs), step)
-    params = list(ops.parameters())
+    # the key paths (the stack's row-key heads, the leaves' item-key heads and corrections)
+    # at their own rate: their outputs are unit keys that a full-rate step overshoots
+    key_params = list(ops.key_heads.parameters())
     if 'keys' in trained:
-        params += list(heads.item.parameters()) + list(fit.corrections.parameters())
+        key_params += list(heads.item.parameters()) + list(fit.corrections.parameters())
     else:
         for p in list(heads.parameters()) + list(fit.corrections.parameters()):
             p.requires_grad_(False)
-    optimizer, schedule = warmup_optimizer(params, args.warmup, step, lr=args.lr,
+    ids = {id(p) for p in key_params}
+    params = [p for p in ops.parameters() if id(p) not in ids] + key_params
+    groups = [{'params': [p for p in ops.parameters() if id(p) not in ids], 'lr': args.lr},
+              {'params': key_params, 'lr': args.key_lr}]
+    for name, lr in (('writer', args.writer_lr), ('codecs', args.codec_lr)):
+        if producer_sets[name]:            # their own low rates, as L1b's producers
+            groups.append({'params': producer_sets[name], 'lr': lr})
+            params += producer_sets[name]
+    optimizer, schedule = warmup_optimizer(groups, args.warmup, step, lr=args.lr,
                                            weight_decay=0.0)
     if state is not None:
         optimizer.load_state_dict(state['optimizer'])
@@ -765,7 +866,7 @@ def train_stack(args) -> None:
                           trained_params=sum(p.numel() for p in params)))
     train_split, held_split = fit.split(False), fit.split(True)
     nominal = {s: config.field_size(s) for s in SPACES}
-    model = reader = None
+    reader = None
 
     def evaluate(tag: int) -> None:
         nonlocal model, reader
@@ -817,6 +918,7 @@ def train_stack(args) -> None:
         picks = {s: [rows[rng.randrange(len(rows))] for _ in range(args.batch_size)]
                  for s, rows in train_split.items() if rows}
         fields = {s: config.sample_field(s, rng) for s in SPACES}
+        fit.begin()
         fit.refield(fields, step)
         if device == 'cuda':
             torch.cuda.reset_peak_memory_stats()
@@ -824,6 +926,10 @@ def train_stack(args) -> None:
         optimizer.zero_grad(set_to_none=True)
         loss, parts = fit.loss(picks, weights, args.balance_weight)
         loss.backward()
+        if prod is not None:          # the leaves' gradients into the writer and codecs
+            got = prod.backward()
+            parts.update({f'producer_{k}': v for k, v in got.items()
+                          if isinstance(v, (int, float)) and v is not None})
         torch.nn.utils.clip_grad_norm_(params, args.clip)
         optimizer.step()
         schedule.step()
@@ -843,7 +949,9 @@ def train_stack(args) -> None:
                 train_split, held_split = fit.split(False), fit.split(True)
                 out.log({'step': step, 'targets_step': snapshot_step, 'reloaded': str(targets_dir)})
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
-            out.save('producers.pt', {'stack': ops.state_dict(), **fit.state(),
+            extra = {} if prod is None else {'writer': model.writer.state_dict(),
+                                             'codecs': codec_stack.codecs.state_dict()}
+            out.save('producers.pt', {'stack': ops.state_dict(), **fit.state(), **extra,
                                       'optimizer': optimizer.state_dict(), 'step': step,
                                       'rng': rng.getstate(), 'targets_step': snapshot_step,
                                       'superpose': dataclasses.asdict(config)})
@@ -1107,6 +1215,20 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                              '--export-rows-every) and reload when a newer one appears')
     parser.add_argument('--follow-every', type=int, default=50,
                         help='stack: steps between checks for a newer snapshot')
+    parser.add_argument('--key-lr', type=float, default=1e-4,
+                        help='stack: rate of the key paths (row-key heads, item-key heads, '
+                        'leaf corrections)')
+    parser.add_argument('--writer-lr', type=float, default=3e-6,
+                        help='stack with --train writer: the writer\'s rate (L1b\'s 3e-6)')
+    parser.add_argument('--codec-lr', type=float, default=3e-5,
+                        help='stack with --train codecs: the codecs\' rate (L1b\'s 3e-5)')
+    parser.add_argument('--producer-batch', type=int, default=1,
+                        help='stack with --train writer/codecs: records replayed together '
+                        '(1: exact for banks written one at a time, as L1b)')
+    parser.add_argument('--unbatched', action='store_true',
+                        help='stack: aggregators row by row (reference path)')
+    parser.add_argument('--max-pairs', type=int,
+                        help='stack: position pairs per batched aggregator pass (262144)')
     parser.add_argument('--balance-weight', type=float, default=0.01,
                         help='stack: balance loss on the rows\' loads (against collapse)')
     parser.add_argument('--stack-eval-banks', type=Path,

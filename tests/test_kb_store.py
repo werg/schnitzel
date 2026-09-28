@@ -828,3 +828,39 @@ def test_batched_live_read_matches_per_item(tmp_path, monkeypatch, resident):
         after = snap.read('A', ids)
         assert all(torch.equal(a.values, b.values) for a, b in zip(before, after))
         assert not torch.equal(kb.read('A', ids, live=True)[1].values, before[1].values)
+
+
+def test_rewrite_with_a_sparse_share_matrix_equals_the_dense_one(tmp_path):
+    from scipy import sparse
+    dense_kb, sparse_kb = make(tmp_path, 'dense'), make(tmp_path, 'sparse')
+    masses = [1., 3., 2., 0.5]
+    ids_d = dense_kb.append('A', [item(sources=(f's{i}',), mass=m, id=f'x{i}')
+                                  for i, m in enumerate(masses)])
+    ids_s = sparse_kb.append('A', [item(sources=(f's{i}',), mass=m, id=f'x{i}')
+                                   for i, m in enumerate(masses)])
+    matrix = np.array([[0.7, 0.25, 0.0, 0.0], [0.3, 0.0, 1.0, 0.0], [0.0, 0.75, 0.0, 1.0]])
+    expected = matrix @ np.array(masses)
+
+    def outs():
+        return [item(sources=(), mass=float(m), producer='rewrite', id=f'o{n}')
+                for n, m in enumerate(expected)]
+    a = dense_kb.rewrite('A', ids_d, outs(), shares=matrix)
+    b = sparse_kb.rewrite('A', ids_s, outs(), shares=sparse.csr_matrix(matrix))
+    got_a, got_b = dense_kb.read('A', a), sparse_kb.read('A', b)
+    assert [g.mass for g in got_a] == [g.mass for g in got_b]
+    assert [g.lineage for g in got_a] == [g.lineage for g in got_b]
+    assert [g.shares for g in got_a] == [g.shares for g in got_b]
+    assert [g.provenance.sources for g in got_a] == [g.provenance.sources for g in got_b]
+    assert [g.time for g in got_a] == [g.time for g in got_b]
+    # the same validation (invariant 7) on the sparse path
+    fresh = make(tmp_path, 'fresh')
+    ids = fresh.append('A', [item(sources=(f's{i}',), mass=m) for i, m in enumerate(masses)])
+    for bad, message in (
+            (matrix * np.array([1, 1, 0.5, 1]), 'sum to'),
+            (np.array([[0.7, 1.0, 0, 1.0], [0.3, 0, 1.0, 0], [0, 0, 0, 0]]), 'positive share'),
+            (-matrix, 'nonnegative'),
+            (matrix[:, :3], r'\(outputs, inputs\)')):
+        with pytest.raises(ValueError, match=message):
+            fresh.rewrite('A', ids, outs(), shares=sparse.csr_matrix(bad))
+    for kb in (dense_kb, sparse_kb, fresh):
+        kb.close()
