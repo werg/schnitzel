@@ -345,6 +345,16 @@ applies to every stage.
      default, switched on only if item drift, read drift on a fixed probe set or
      cross-KB retention show see-saw (logged every eval). A per-space read combine
      stays as an ablation.
+     *Task order follows evidence (owner, 28 September).* The read phase's tasks
+     are not fixed in advance: they are reordered whenever evaluations show a task
+     does not exercise the KB. The current order starts with high-redundancy,
+     high-target-entropy probes, where the answer is hard to predict alone but easy
+     to read from many diverse copies: parallel-version recall (Bible translations,
+     target version never stored), citance recall (a paper's abstract from other
+     papers' descriptions of it), the r6 QA passages, a synthetic people world as a
+     redundancy knob (32 vs 4 records per fact), and verbatim windows as a read-path
+     sanity check. SQL (semantically aliased) and agent tasks come after, once reads
+     carry content (retrieved vs shuffled) on the probes.
      *Content-dependent training (28 September).* On plain text-to-SQL the frozen
      decoder's reads helped as much with shuffled items as with the right ones
      (captured 1.22 vs 1.19, content 0.01 nats): R learned a task-format soft

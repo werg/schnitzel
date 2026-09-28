@@ -913,3 +913,8 @@ log your decisions and changes of direction"), newest last.
   descriptions per cited paper. Its target is the cited paper's abstract or a held-out
   paper's background paragraph, with the other descriptions in the KB. It waits for
   the first probes' results.
+- 28 September (owner): the training plan stays flexible and follows evidence. The
+  L1 read phase is reoriented to high-redundancy, high-target-entropy probes:
+  parallel-version recall, citance recall, r6 QA, and the synthetic redundancy knob.
+  How to continue (SQL with aliasing, agent tasks, B9) is decided from their
+  retrieved-vs-shuffled results. B3 -> B4 and K1 continue unchanged.
