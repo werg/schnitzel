@@ -824,3 +824,10 @@ log your decisions and changes of direction"), newest last.
   is write-side only (fields, re-superposition on writes, L2's stack). Kept: the
   read anchor (on R and heads), item-preserving consolidation of write fields, the
   r/w phase schedule and a `--read-combine s_s` ablation.
+- 28 Sep (owner, binding). Superposition operators are cluster/grid aggregators:
+  the KB holds their outputs at anchors (cluster centres or grid points in key
+  space); they are conditioned on the anchor's position with inputs at positions
+  relative to it, and are never run at a query's or a written record's key. K3
+  becomes aggregator pretraining with recovery by reading (covering entries -> R ->
+  the member record); the target-key K3a/K3b and my depth-2 variant of it are
+  superseded and will be replaced on the field code.

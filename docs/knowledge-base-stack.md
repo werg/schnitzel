@@ -125,8 +125,12 @@ rewrite: S_s(neighbourhood | target keys) ──▶ items in space s, written ba
   Retrieval neighbourhoods grow with coarseness: fine spaces retrieve few items,
   coarse spaces many.
 - **Forward codecs** F_s map the writer's span to each space.
-- **Superposition operator, per space.** S_s maps a neighbourhood of items of
-  space s to items of space s, conditioned on target keys. Input and output live
+- **Superposition operator, per space.** S_s is a cluster/grid aggregator (owner,
+  28 September): it maps the items in a field of space s to one item at the
+  field's anchor (a cluster centre or grid point in key space, never a record's
+  or a query's key), conditioned on the anchor's position, each input entering
+  with its position relative to the anchor. The KB stores these aggregator
+  outputs. Input and output live
   in the same space (closure), so it can be applied recursively. It is a
   write-side operator: it runs across overlapping fields of the store and
   replaces them by superposed items, written back (at reads, R reads retrieved
@@ -255,17 +259,16 @@ applies to every stage.
    each slot's records, with in-batch and KB negatives. It is the L1 stage with
    only the retrieval loss (`--retrieval-only`); no separate key-table
    distillation.
-5. **K3 - Superposition operator warm-up** (drop-one: a neighbourhood of items in
-   space s with the target removed; S_s produces an item from which R
-   reconstructs the target's span).
-   - *K3a:* S_s conditioned on the target key only.
-   - *K3b:* additionally each neighbour item's key enters at each of its
-     positions (continues K3a; the key weights start at zero, so K3b begins as
-     K3a).
-   - *Depth (owner, 28 September):* the warm-up also runs S_s recursively, at
-     least two levels (a neighbourhood of level-1 items, each itself S_s over a
-     neighbourhood of records), so the operator works on its own outputs before
-     L1 uses it that way.
+5. **K3 - Aggregator warm-up** (rewrite then recover). Anchors and overlapping
+   fields over a set of related records' items per space; the aggregators turn
+   each field into an entry at its anchor (at depth >= 2 the entries are
+   aggregated again at coarser anchors). For each member record, the top-level
+   entries whose fields cover it are retrieved by the record's key, as a read
+   would, and R reconstructs the record's span for the frozen decoder (NLL, KL,
+   cosine). Controls: records outside every field, and another region's entries.
+   Aggregators are never run at a record's own key (the earlier K3a/K3b form,
+   which conditioned S_s on the target record's key, is superseded; K3b's
+   neighbour-key features live on as positions relative to the anchor).
 6. **Bank creation** (offline): the model with a record in context calls
    `memory_write()`; the span, the per-space heads and the key heads give the
    items, one KB per dataset. The same path builds a user's KB from their own
