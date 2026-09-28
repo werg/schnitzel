@@ -887,3 +887,11 @@ log your decisions and changes of direction"), newest last.
   steps moved the rows only about 1%. It uses 300 transcripts per corpus, 2000 read
   steps and item lr 3e-2 (10x the smoke's), with row and key drift evaluated every 250
   steps. The write fit then runs on the drifted rows.
+- 28 September: the long read phase on plain text-to-SQL was stopped at step ~300.
+  Rows drifted 10-13% by step 250, but shuffled reads helped as much as the right
+  ones (captured 1.19 vs 1.22, content 0.01 nats). The decoder is frozen in L1a, so
+  R and the read operators learned a content-free format prompt, and schema names are
+  mostly guessable. The long read phase moves to spider-memory (answers are stored
+  values, dev databases held out) as `kb-read-values`. The SQL tasks get schema
+  aliasing, and L1 gets a content-contrast term against shuffled reads and an
+  optional null prefix (in progress).
