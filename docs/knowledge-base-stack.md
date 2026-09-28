@@ -126,16 +126,18 @@ rewrite: S_s(neighbourhood | target keys) ──▶ items in space s, written ba
   coarse spaces many.
 - **Forward codecs** F_s map the writer's span to each space.
 - **Superposition operator, per space.** S_s maps a neighbourhood of items of
-  space s to items of space s, conditioned on target keys. Because input and
-  output live in the same space (closure), the same operator serves reads
-  (combine a retrieved neighbourhood into one item for a query) and rewriting the
-  store (replace a neighbourhood by new items, written back). Rewriting is meant
+  space s to items of space s, conditioned on target keys. Input and output live
+  in the same space (closure), so it can be applied recursively. It is a
+  write-side operator: it runs across overlapping fields of the store and
+  replaces them by superposed items, written back (at reads, R reads retrieved
+  entries directly; section 5.1 step 7). Rewriting is meant
   to increase superposition and the availability of knowledge, not to reduce the
   amount of representation: *compaction* (fewer outputs than inputs) is only its
   special case. Applied recursively, it spreads each source over more items and
   lets each item carry more sources. (Earlier drafts called it the compactor.)
 - **Recombiner (reverse codec)** R reads the items of all spaces and produces a
-  span in the decoder's input space. Spaces may be missing (a space may not
+  span in the decoder's input space; at reads it takes the retrieved entries
+  with their gates and is conditioned on the query key. Spaces may be missing (a space may not
   retrieve anything relevant), so R is trained with spaces dropped.
 - **Output positions** are variable. In pre-training the target count is given by
   the target (the original span's n). At inference S_s emits the average
@@ -301,16 +303,17 @@ applies to every stage.
      7), recorded as rewrite shares; an item's time is the latest of its
      sources' (invariant 2); mixing only within one KB (invariant 6). Control:
      depth 0 (the items themselves) at the same storage and read budget.
-     *Against write/read see-saw (owner):* one S_s would both define the entries
-     (write-side fields) and combine them at reads, so every read-side update
-     would move all entries of all KBs. After a shared warm-up the operator is
-     untied: S_s^w (write fields) frozen or a slow moving average of S_s^r; the
-     leaves are the fast per-KB parameters; S_s^r (read combine) trains with an
-     anchor (reads of held-out entries of all KBs keep their outputs). S_s^w
-     changes only through consolidation steps that re-fit the leaves so the
-     entries stay put. Plain alternation (read phase, write phase) is kept as a
-     schedule for comparison; item drift, read drift and cross-KB retention are
-     logged.
+     *One operator per side (owner, 28 September):* S_s is write-side only: its
+     fields build the superposed entries and re-superpose them when knowledge is
+     added. A read retrieves the top entries per space and R reads them directly
+     (gates from retrieval times stored mass), conditioned on the query key; a
+     per-query S_s combine before R would redo work R does and, sharing weights
+     with the write side, would move every entry with each read-side update. So
+     entries change only through their leaves and through item-preserving
+     consolidation of the write fields (leaves re-fit to the pre-update entries);
+     R and the key heads are anchored on held-out entries of all KBs. A per-space
+     read combine stays as an ablation, and read/write phase alternation as a
+     schedule; item drift, read drift and cross-KB retention are logged.
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
@@ -409,7 +412,7 @@ are the levers; the dense per-pair form is kept on purpose.
 
 - Space count, widths and position ratios (the table above is a starting point).
 - Neighbourhood sizes per space, and M/N in rewrite-then-recover.
-- Whether R also receives the query (question-conditioned recombination).
+- (Decided 28 September: R receives the query key; no per-query S_s at reads.)
 - How rewriting levels are scheduled once the store is large.
 - Top-k size for cached teacher distributions, and the distillation corpus.
 

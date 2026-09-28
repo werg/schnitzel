@@ -818,3 +818,9 @@ log your decisions and changes of direction"), newest last.
   all KBs; S_s^w changes only in item-preserving consolidation steps (leaves re-fit
   to the pre-update entries). The owner's alternation stays available as a phase
   schedule and is the comparison.
+- 28 Sep (owner; supersedes the untie design above). No read-time S_s: with
+  superposed entries it is redundant with R and is what couples read-side updates
+  to the entries. Reads: top entries per space -> R (query-conditioned) -> span. S_s
+  is write-side only (fields, re-superposition on writes, L2's stack). Kept: the
+  read anchor (on R and heads), item-preserving consolidation of write fields, the
+  r/w phase schedule and a `--read-combine s_s` ablation.
