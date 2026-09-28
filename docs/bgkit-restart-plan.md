@@ -883,3 +883,21 @@ log your decisions and changes of direction"), newest last.
   rows are close to free rows (captured 0.716 vs 0.775 after 20 joint steps) at five
   times the step cost (30-37 s against 6-7 s), because the aggregators run one small
   call per row and level; batching them per level is next.
+- 28 Sep, superposed KB second pass (coordinator's list). (1) Batched aggregators as
+  packed pairs with segment sums rather than padding (no waste on fields of 1 to 48
+  inputs; a group's result equals the per-row call up to summation order; the
+  row-by-row path stays as `--unbatched`). Deep samples below the read level are drawn
+  per (row, input) as before but recomputed once per input and shared by the rows that
+  drew them. The remaining cost was host-device syncs (per-item masses, keys and index
+  tensors on a busy shared GPU), removed by batching and pinned non-blocking copies. (2)
+  The row-key head reads the unit-normalized mean output and the key paths get their
+  own rate (1e-4): at full rate the zero-initialized head overshot and key cosine fell
+  from 0.97 to 0.85. Joint field sampling is seeded by step (exact resume); the write
+  balance uses a separate usage EMA per KB and space (`write/<kb>/<space>`). (3) Writer
+  and codecs train through the fit with the shared `Producers` replay and L1b's rates;
+  the writer stays in eval mode so the no-gradient forward equals the recomputation. (4)
+  Sparse shares in `kb_store.rewrite` as a separate branch, so dense rewrites are bit for
+  bit unchanged; row placement keeps the exact FPS for small KBs (unchanged results) and
+  uses FPS inside k-means++ buckets beyond; scans stay exact (invariant 8). (5) Read-phase
+  item rate on rows 1e-2 (3e-2 overfits the smoke set after 100 steps; 3e-3 barely moves
+  the rows).

@@ -1372,6 +1372,10 @@ def load_write_stack(path: Path, dims: dict, args):
     return ops, config, run_config, state
 
 
+ITEM_LR = 3e-3          # live items of a leaf bank (L1a, K2) and leaves under the stack
+ROWS_ITEM_LR = 1e-2     # free rows in the read phase (smoke: 3e-2 overfits after 100 steps)
+
+
 def train(args) -> None:
     model = load_model(args)
     lm = model.decoder.base_lm
@@ -1399,6 +1403,9 @@ def train(args) -> None:
                         max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
                         read_combine=args.read_combine)
     banks_manifest = json.loads((args.banks / 'banks.json').read_text())
+    if args.item_lr is None:     # the read phase moves free rows faster than leaf items
+        args.item_lr = ROWS_ITEM_LR if 'rows' in banks_manifest and not args.rows_from_stack \
+            else ITEM_LR
     config.learned_keys = args.keys == 'learned' or (args.keys == 'auto'
                                                      and 'rows' in banks_manifest)
     # learned keys are unit keys; with --rows-from-stack the live keys are the leaves' key
@@ -1761,7 +1768,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--banks', type=Path, help='output of build (or of rows)')
     t.add_argument('--steps', type=int, default=20000)
     t.add_argument('--lr', type=float, default=3e-4)
-    t.add_argument('--item-lr', type=float, default=3e-3)
+    t.add_argument('--item-lr', type=float, default=None,
+                   help='per-item Adam rate of the live items (3e-3; on a rows banks dir, the '
+                   'read phase, 1e-2: rows drift about 10%% from their init in 300 steps)')
     t.add_argument('--retrieval-weight', type=float, default=0.5)
     t.add_argument('--clip', type=float, default=1.0)
     t.add_argument('--candidates', default='', help='scored per space, e.g. A=8,B=16,C=32,D=64')
