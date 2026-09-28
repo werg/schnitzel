@@ -1,0 +1,783 @@
+"""L1: live KB items trained in place, end to end (docs/knowledge-base-stack.md, 5.1 step 6).
+
+Two commands:
+
+``build`` (offline bank creation, invariant 1). For every dataset KB named by the
+memory transcripts (``scripts/prepare_memory_transcripts.py``; slot ``kb``), every
+record a slot names becomes one item per space A-D: the frozen writer encodes the
+record text into a span (``--span-source writer``: B3 free-running at the densest
+length-scaled ratio s0; ``teacher``: the cached S2 teacher span of the B1 cache,
+R6 records only), the K1 forward codecs (``--codecs`` stack.pt, or random init) map
+the span into the spaces, and the item's key per space is the initial key head
+applied to the frozen decoder's query-layer state averaged over the record text.
+The initial key heads are seeded and saved beside the banks, so queries and keys
+start in one geometry; the trainer starts from them. Item time is the record's
+``created_at``; provenance names the record id. Training reads stored items only.
+
+``train``. The frozen decoder (``--reader-state``: the B3 merged decoder, protocol
+installed if the state has none; later B4) reads each transcript rendered with the
+LFM2 chat template, ``memory_search()`` calls without arguments (a v1 transcript's
+query text is dropped), loss on assistant tokens only. At every call the read path
+(``schnitz.kb_read``) takes the query-layer state at the call's own closing
+parenthesis, retrieves per space from the episode's KB (authorization: the episode's
+dataset only), gates, combines (S_s, R) and splices the span between ``<|mem|>`` and
+``<|/mem|>`` of the call's tool message. Queries are exact causal prefixes: the
+query at call k is computed from a pass over the prefix up to the call with the
+spans of all earlier reads spliced in (a pass per site, truncated at the query
+layer, recomputed in backward), so gradients reach earlier reads through later
+queries too; then one full pass gives the task loss. Jointly trained: item values
+and keys in place (``kb_store`` live mode, sparse Adam per item and key), key
+heads, router, S_s and R; the decoder is frozen. An auxiliary retrieval loss
+(balanced BCE on gate logits: the slot's target items up, other candidates down)
+supervises routing; recall@k per space is logged.
+
+Evaluation arms on validation transcripts (invariant 9): ``noctx`` (empty memory
+spans), ``text`` (the slot records' text as the tool result: the information-
+matched text control), ``retrieved`` (the L1 read), ``shuffled`` (another episode's
+reads), ``gold`` (the target items, gate 1, no retrieval) and ``gold_shuffled``.
+Reported with ``kb_eval.nll_summary`` (captured fractions of the text arm's gain,
+content nats over the shuffled controls), recall and effective items per read.
+Training-only; the decoder parts run in ``sdkb-bgkit``.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import math
+from pathlib import Path
+import random
+import re
+import shutil
+import sys
+import time
+
+import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+from schnitz.kb_eval import distribution, effective_count, nll_summary  # noqa: E402
+from schnitz.kb_read import (DEFAULT_CANDIDATES, ItemCache, KeyHeads, L1Reader,  # noqa: E402
+                             ReadConfig, source_index, splice)
+from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance  # noqa: E402
+from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS  # noqa: E402
+
+MEM, MEM_END = SPAN_TOKENS['mem'][0], SPAN_TOKENS['mem_end'][0]
+MEM_ID = SPAN_TOKENS['mem'][1]
+MEMORY_NAMES = {t['name'] for t in MEMORY_TOOLS}
+CALL = re.compile(r'memory_search\(\s*\)')
+
+
+# -- transcripts ---------------------------------------------------------------------
+class Transcripts:
+    """The first ``limit`` transcripts of ``split`` per directory, in file order, read
+    lazily by byte offset (the full corpora do not fit in memory as parsed rows)."""
+
+    def __init__(self, dirs: list[Path], split: str, limit: int | None):
+        self.entries: list[tuple[Path, int, str]] = []
+        for d in dirs:
+            path = d / f'transcripts-{split}.jsonl'
+            if not path.exists():
+                continue
+            with path.open('rb') as handle:
+                n = 0
+                while limit is None or n < limit:
+                    offset = handle.tell()
+                    if not handle.readline():
+                        break
+                    self.entries.append((path, offset, str(d)))
+                    n += 1
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def __getitem__(self, i: int) -> dict:
+        path, offset, d = self.entries[i]
+        with path.open('rb') as handle:
+            handle.seek(offset)
+            row = json.loads(handle.readline())
+        row['_dir'] = d
+        return row
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
+
+
+def load_rows(dirs: list[Path], split: str, limit: int | None) -> list[dict]:
+    return list(Transcripts(dirs, split, limit))
+
+
+def slots_of(row: dict) -> list[dict]:
+    return [m['content']['slot'] for m in row['messages']
+            if isinstance(m.get('content'), dict) and 'slot' in m['content']]
+
+
+def query_time(row: dict) -> int:
+    prov = row.get('provenance') or {}
+    return int(prov.get('source_query_time', prov.get('query_time', 2)))
+
+
+def chat(row: dict, texts: dict[str, str] | None = None) -> tuple[list[dict], list[dict]]:
+    """Messages and tools for the chat template: memory_search calls without arguments
+    (the current schema), slots as empty ``<|mem|><|/mem|>`` pairs, or with ``texts``
+    the slot records' text (the oracle text arm); other dict contents as JSON."""
+    messages = []
+    for m in row['messages']:
+        m = dict(m)
+        content = m.get('content')
+        if isinstance(content, dict) and 'slot' in content:
+            ids = content['slot']['record_ids']
+            m['content'] = MEM + MEM_END if texts is None else '\n\n'.join(texts[r] for r in ids)
+        elif isinstance(content, dict):
+            m['content'] = json.dumps(content, ensure_ascii=False)
+        if m.get('tool_calls'):
+            m['tool_calls'] = [
+                {**tc, 'function': {**tc['function'], 'arguments': {}}}
+                if tc['function']['name'] == 'memory_search' else tc for tc in m['tool_calls']]
+        messages.append(m)
+    tools = list(MEMORY_TOOLS) + [t for t in row.get('tools') or []
+                                  if t['name'] not in MEMORY_NAMES]
+    return messages, tools
+
+
+@dataclasses.dataclass
+class Episode:
+    episode_id: str
+    kb: str
+    ids: torch.Tensor           # (T,)
+    targets: torch.Tensor       # positions t whose token is a loss target (predicted at t - 1)
+    calls: list[int]            # query position of each memory_search call, in order
+    mems: list[int]             # position of each slot's <|mem|>, in the same order
+    slots: list[dict]
+    query_time: int
+    row: dict
+
+
+def _render(tok, messages, tools):
+    out = tok.apply_chat_template(messages, tools=tools, tokenize=True, return_dict=True,
+                                  return_assistant_tokens_mask=True)
+    return list(out['input_ids']), list(out['assistant_masks'])
+
+
+def layout(row: dict, tok, texts: dict[str, str] | None = None) -> Episode:
+    """Token layout of a transcript. The query position of a call is the token holding
+    its closing parenthesis (so calls in one block have their own positions)."""
+    messages, tools = chat(row, texts)
+    ids, mask = _render(tok, messages, tools)
+    slots = slots_of(row)
+    calls, mems = [], []
+    if texts is None:
+        text = tok.apply_chat_template(messages, tools=tools, tokenize=False)
+        enc = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+        if list(enc['input_ids']) != ids:
+            raise ValueError('tokenizing the rendered text differs from the chat template')
+        owner = {}
+        for t, (a, b) in enumerate(enc['offset_mapping']):
+            for ch in range(a, b):
+                owner.setdefault(ch, t)
+        for block in re.finditer(r'<\|tool_call_start\|>(.*?)<\|tool_call_end\|>', text, re.S):
+            for call in CALL.finditer(block.group(1)):
+                calls.append(owner[block.start(1) + call.end() - 1])
+        mems = [t for t, x in enumerate(ids) if x == MEM_ID]
+        if not (len(calls) == len(mems) == len(slots)):
+            raise ValueError(f'{row["episode_id"]}: {len(calls)} calls, {len(mems)} memory '
+                             f'slots, {len(slots)} slots')
+        if any(m <= c for c, m in zip(calls, mems)):
+            raise ValueError('a result precedes its call')
+    targets = torch.tensor([t for t in range(1, len(ids)) if mask[t]], dtype=torch.long)
+    return Episode(row['episode_id'], row['kb'], torch.tensor(ids), targets, calls, mems,
+                   slots, query_time(row), row)
+
+
+# -- frozen decoder ------------------------------------------------------------------
+class _Stop(Exception):
+    pass
+
+
+class Frozen:
+    """The frozen reader: embeddings (protocol hooks included), the hidden state after
+    ``query_layer`` layers (a truncated pass), final hidden states and LM-head logits."""
+
+    def __init__(self, lm, query_layer: int, autocast=None):
+        self.lm, self.inner = lm, lm.model
+        self.query_layer = query_layer
+        self.autocast = autocast or (lambda: torch.autocast('cpu', enabled=False))
+        if not 1 <= query_layer <= len(self.inner.layers):
+            raise ValueError('query layer out of range')
+
+    @property
+    def device(self):
+        return self.lm.get_input_embeddings().weight.device
+
+    @torch.no_grad()
+    def embed(self, ids: torch.Tensor) -> torch.Tensor:
+        return self.lm.get_input_embeddings()(ids.to(self.device)).float()
+
+    def mid(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        box = {}
+
+        def hook(module, args, output):
+            box['h'] = output[0] if isinstance(output, tuple) else output
+            raise _Stop
+
+        handle = self.inner.layers[self.query_layer - 1].register_forward_hook(hook)
+        try:
+            with self.autocast():
+                self.inner(inputs_embeds=x, attention_mask=attention_mask, use_cache=False)
+        except _Stop:
+            pass
+        finally:
+            handle.remove()
+        return box['h'].float()
+
+    def final(self, x: torch.Tensor) -> torch.Tensor:
+        with self.autocast():
+            return self.inner(inputs_embeds=x, use_cache=False).last_hidden_state
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        with self.autocast():
+            return self.lm.lm_head(hidden).float()
+
+
+# -- episodes through the read path ----------------------------------------------------
+class Context:
+    """What a pass needs: the frozen decoder, the reader, the KBs and their item index."""
+
+    def __init__(self, frozen: Frozen, reader: L1Reader, kbs: dict[str, KnowledgeBase],
+                 autocast=None):
+        self.frozen, self.reader, self.kbs = frozen, reader, kbs
+        self.autocast = autocast or frozen.autocast
+        self.index = {name: {s: source_index(kb, s) for s in kb.spaces} for name, kb in kbs.items()}
+
+    def covered(self, ep: Episode) -> bool:
+        index = self.index.get(ep.kb)
+        return index is not None and all(
+            all(r in index[s] for s in index) for slot in ep.slots for r in slot['record_ids'])
+
+    def targets(self, ep: Episode, j: int) -> dict[str, list[tuple[str, str]]]:
+        slot = ep.slots[j]
+        if slot.get('kb', ep.kb) != ep.kb:
+            raise PermissionError('a slot names another KB than its episode')
+        index = self.index[ep.kb]
+        return {s: [(ep.kb, i) for r in slot['record_ids'] for i in index[s].get(r, ())]
+                for s in index}
+
+
+def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
+                spans: list[torch.Tensor] | None = None):
+    """Task NLL (summed over target tokens) of one transcript and its reads.
+
+    ``mode`` 'retrieve' or 'gold' computes each read at its call from the exact causal
+    prefix; 'fixed' splices the given ``spans`` (controls)."""
+    embeds = ctx.frozen.embed(ep.ids)
+    reads = []
+    if mode == 'fixed':
+        spans = list(spans)
+    else:
+        spans = []
+        before = [sum(m < c for m in ep.mems) for c in ep.calls]
+        k = 0
+        while k < len(ep.calls):
+            group = [k]
+            while group[-1] + 1 < len(ep.calls) and before[group[-1] + 1] == before[k]:
+                group.append(group[-1] + 1)
+            b = before[k]
+            end = ep.calls[group[-1]] + 1
+            x, index = splice(embeds[:end], ep.mems[:b], spans[:b])
+            if torch.is_grad_enabled() and any(s.requires_grad for s in spans[:b]):
+                # recomputed in backward; retrieval stays outside the recomputed function
+                h = checkpoint(ctx.frozen.mid, x[None], use_reentrant=False)[0]
+            else:
+                with torch.no_grad():
+                    h = ctx.frozen.mid(x[None])[0]
+            for j in group:
+                with ctx.autocast():
+                    read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
+                                           ep.query_time, cache, targets=ctx.targets(ep, j),
+                                           gold=mode == 'gold')
+                reads.append(read)
+                spans.append(read.span.float())
+            k = group[-1] + 1
+    x, index = splice(embeds, ep.mems, spans)
+    hidden = ctx.frozen.final(x[None])[0]
+    positions = index[ep.targets] - 1
+    logits = ctx.frozen.logits(hidden[positions])
+    nll = F.cross_entropy(logits, ep.ids[ep.targets].to(logits.device), reduction='sum')
+    return nll, int(ep.targets.numel()), reads, spans
+
+
+# -- model loading (GPU container) ------------------------------------------------------
+def load_model(args):
+    """The frozen decoder (and writer) from S2 plus ``--reader-state``; protocol installed."""
+    from train_bgkit_reps import Model
+    model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
+                                     checkpoint=args.checkpoint,
+                                     adapter_rank=16 if args.reader_state else 0,
+                                     gate_open_start=-1, merge_at=-1, merge_checkpoint=False))
+    if args.reader_state:
+        state = torch.load(args.reader_state, map_location='cpu', mmap=True)
+        model.load_trained(state)
+        del state
+    if model.protocol is None:
+        if not model.merged:
+            raise ValueError('L1 reads through a merged decoder (B3 state or later)')
+        model.install_protocol()
+    for module in (model.decoder, model.writer, model.protocol):
+        for param in module.parameters():
+            param.requires_grad_(False)
+    from schnitz.span_tokens import check_tokenizer
+    check_tokenizer(model.tok)
+    return model
+
+
+def load_stack(path: Path | None, target_norm: float, device, seed: int):
+    """K1 codecs and recombiner (``train_kb_codecs.Stack``): trained, or random init."""
+    from train_kb_codecs import Stack
+    dims = {'state': 512, 'hidden': 256, 'layers': 3}
+    if path is not None and (path.parent / 'config.json').exists():
+        config = json.loads((path.parent / 'config.json').read_text())
+        dims = {k: config.get(k, v) for k, v in dims.items()}
+    torch.manual_seed(seed)
+    stack = Stack(target_norm, dims['state'], dims['hidden'], dims['layers'], False)
+    step = 0
+    if path is not None:
+        state = torch.load(path, map_location='cpu')
+        stack.load_state_dict(state['stack'])
+        step = int(state.get('step', 0))
+    return stack.to(device).eval(), step, dims
+
+
+# -- build --------------------------------------------------------------------------
+def _safe(name: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]', '__', name)
+
+
+def needed_records(rows: list[dict]) -> dict[str, dict[str, str]]:
+    """kb -> record id -> transcript dir (whose manifest names the corpus)."""
+    out: dict[str, dict[str, str]] = {}
+    for row in rows:
+        for slot in slots_of(row):
+            if slot['kb'] != row['kb']:
+                raise PermissionError(f'{row["episode_id"]}: slot of another KB')
+            for r in slot['record_ids']:
+                out.setdefault(row['kb'], {})[r] = row['_dir']
+    return out
+
+
+def read_sources(dirs: set[str], wanted: set[str],
+                 extra: dict[str, int] | None = None) -> dict[str, dict]:
+    """Text and time of the ``wanted`` records. ``extra`` asks for up to that many more
+    records of a KB (in corpus order; distractors, so a KB holds more than the slots
+    name); every record is returned with its ``kb``."""
+    records, extra, added = {}, dict(extra or {}), {}
+    for d in sorted(dirs):
+        manifest = json.loads((Path(d) / 'manifest.json').read_text())
+        corpus = Path(manifest['input'])
+        with (corpus / 'sources.jsonl').open(encoding='utf-8') as handle:
+            for line in handle:
+                rec = json.loads(line)
+                kb = (f'{manifest["kb"]}:{rec.get("domain", "")}'
+                      if manifest.get('kb_per_domain') else manifest['kb'])
+                take = rec['record_id'] in wanted
+                if not take and added.get(kb, 0) < extra.get(kb, 0):
+                    take = True
+                    added[kb] = added.get(kb, 0) + 1
+                if take:
+                    records[rec['record_id']] = {'text': rec['text'], 'kb': kb,
+                                                 'created_at': int(rec['created_at'])}
+    return records
+
+
+def initial_heads(path: Path, hidden: int, seed: int) -> KeyHeads:
+    heads = KeyHeads(hidden, DEFAULT_SPACES)
+    if path.exists():
+        heads.load_state_dict(torch.load(path, map_location='cpu'))
+    else:
+        generator = torch.Generator().manual_seed(seed)
+        for head in heads.heads.values():
+            bound = 1 / math.sqrt(hidden)
+            head.weight.data = torch.empty_like(head.weight).uniform_(-bound, bound,
+                                                                       generator=generator)
+            head.bias.data.zero_()
+        torch.save(heads.state_dict(), path)
+    return heads
+
+
+@torch.no_grad()
+def build(args) -> None:
+    from cache_bgkit_teacher import length_factors
+    rows = []
+    for split, limit in (('train', args.limit), ('validation', args.eval_limit)):
+        rows += load_rows(args.transcripts, split, limit)
+    needed = needed_records(rows)
+    wanted = {r for recs in needed.values() for r in recs}
+    records = read_sources({d for recs in needed.values() for d in recs.values()}, wanted,
+                           {kb: args.distractors for kb in needed})
+    missing = wanted - set(records)
+    if missing:
+        raise ValueError(f'{len(missing)} slot records are not in the corpus sources')
+    for rid, rec in records.items():      # distractor records join their own KB
+        if rid not in wanted and rec['kb'] in needed:
+            needed[rec['kb']][rid] = ''
+    model = load_model(args)
+    frozen = Frozen(model.decoder.base_lm, args.query_layer, model.core.autocast)
+    stack, codec_step, _ = load_stack(args.codecs, model.target_norm, model.device, args.seed)
+    args.output.mkdir(parents=True, exist_ok=True)
+    heads = initial_heads(args.output / 'key_heads_init.pt', frozen.lm.config.hidden_size,
+                          args.seed).to(model.device)
+    teacher = None
+    if args.span_source == 'teacher':
+        from train_bgkit_reps import TeacherCache
+        teacher = TeacherCache(args.cache, None, texts=[])
+        teacher.by_id = {item[2]: item for item in teacher.items}
+    report = {}
+    started = time.time()
+    for kb_name, recs in sorted(needed.items()):
+        root = args.output / _safe(kb_name)
+        kb = KnowledgeBase(root, writable=True) if (root / 'manifest.json').exists() else \
+            KnowledgeBase.create(root, name=_safe(kb_name), dataset=kb_name,
+                                 origin={'command': 'train_kb_l1 build',
+                                         'span_source': args.span_source,
+                                         'codecs': str(args.codecs), 'codec_step': codec_step,
+                                         'reader_state': str(args.reader_state),
+                                         'query_layer': args.query_layer})
+        done = set(source_index(kb, 'D'))
+        todo = sorted((r for r in recs if r not in done),
+                      key=lambda r: len(records[r]['text']))
+        for start in range(0, len(todo), args.batch_size):
+            batch = todo[start:start + args.batch_size]
+            ids = [model.text_ids(records[r]['text']) for r in batch]
+            if teacher is not None:
+                spans = []
+                for r in batch:
+                    if r not in teacher.by_id:
+                        raise ValueError(f'record {r} has no cached teacher span')
+                    shard, row = teacher.by_id[r][:2]
+                    spans.append(teacher.reps(shard, row, 's0').to(model.device).float())
+            else:
+                factors = [length_factors(int(x.shape[0]))[0] for x in ids]
+                examples = [{'ids': x, 'prompt': 'memory', 'factor': f}
+                            for x, f in zip(ids, factors)]
+                lengths = [max(1, math.ceil(x.shape[0] / f)) for x, f in zip(ids, factors)]
+                with model.core.autocast():
+                    spans, _ = model.free_run(examples, lengths)
+                spans = [s.float() for s in spans]
+            width = max(x.shape[0] for x in ids)
+            padded = torch.zeros(len(ids), width, dtype=torch.long)
+            mask = torch.zeros(len(ids), width, dtype=torch.long)
+            for i, x in enumerate(ids):
+                padded[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
+            mask = mask.to(model.device)
+            h = frozen.mid(frozen.embed(padded), mask)
+            states = (h * mask[..., None]).sum(1) / mask.sum(1, keepdim=True)
+            keys = heads(states)
+            per_space = {s: [] for s in DEFAULT_SPACES}
+            with model.core.autocast():
+                encoded = [stack.encode(span) for span in spans]
+            for i, r in enumerate(batch):
+                for s in DEFAULT_SPACES:
+                    per_space[s].append(NewItem(
+                        encoded[i][s].float().cpu(), keys[s][i].float().cpu(),
+                        Provenance((r,), 'codec', codec_step), 1.0, records[r]['created_at']))
+            for s, items in per_space.items():
+                kb.append(s, items)
+            print(json.dumps({'kb': kb_name, 'done': start + len(batch), 'of': len(todo),
+                              'elapsed_s': round(time.time() - started)}), flush=True)
+        report[kb_name] = {'dir': root.name, 'records': len(recs), 'stats': kb.stats()}
+        kb.close()
+    manifest = {'command': 'build', 'transcripts': [str(d) for d in args.transcripts],
+                'limit': args.limit, 'eval_limit': args.eval_limit,
+                'span_source': args.span_source, 'codecs': str(args.codecs),
+                'distractors': args.distractors, 'codec_step': codec_step, 'reader_state': str(args.reader_state),
+                'query_layer': args.query_layer, 'seed': args.seed, 'kbs': report}
+    (args.output / 'banks.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps({'built': {k: v['records'] for k, v in report.items()}}), flush=True)
+
+
+# -- train --------------------------------------------------------------------------
+def open_live(banks: Path, output: Path) -> dict[str, KnowledgeBase]:
+    """The live copies of the banks under ``output/kbs`` (copied on first start)."""
+    live_root = output / 'kbs'
+    manifest = json.loads((banks / 'banks.json').read_text())
+    if not live_root.exists():
+        pending = output / 'kbs.pending'
+        shutil.rmtree(pending, ignore_errors=True)
+        pending.mkdir(parents=True)
+        for info in manifest['kbs'].values():
+            shutil.copytree(banks / info['dir'], pending / info['dir'],
+                            ignore=shutil.ignore_patterns('writer.lock'))
+        pending.rename(live_root)
+    kbs = {}
+    for name, info in manifest['kbs'].items():
+        kb = KnowledgeBase(live_root / info['dir'], writable=True)
+        for s in kb.spaces:
+            if not kb.is_live(s):
+                kb.enable_live(s)
+        kbs[name] = kb
+    return kbs
+
+
+def _read_stats(reads, sink: dict) -> None:
+    for read in reads:
+        sink.setdefault('n', []).append(read.n)
+        for s, info in read.spaces.items():
+            if info.recall is not None:
+                sink.setdefault(f'recall_{s}', []).append(info.recall)
+            if len(info.gates):
+                sink.setdefault(f'eff_{s}', []).append(effective_count(info.gates.tolist())['entropy'])
+                sink.setdefault(f'mass_{s}', []).append(info.mass)
+
+
+def _mean(sink: dict) -> dict:
+    return {k: round(sum(v) / len(v), 4) for k, v in sorted(sink.items()) if v}
+
+
+def train_step(ctx: Context, episodes: list[Episode], optimizer, args) -> dict:
+    cache = ItemCache(ctx.frozen.device, train=True)
+    optimizer.zero_grad(set_to_none=True)
+    tokens = sum(int(ep.targets.numel()) for ep in episodes)
+    stats: dict[str, list] = {}
+    nll_total, aux_total = 0.0, 0.0
+    for ep in episodes:
+        nll, _, reads, _ = run_episode(ctx, ep, cache, 'retrieve')
+        aux = [r.aux for r in reads if r.aux is not None]
+        loss = nll / tokens
+        if aux and args.retrieval_weight:
+            aux_mean = torch.stack(aux).mean()
+            loss = loss + args.retrieval_weight * aux_mean / len(episodes)
+            aux_total += aux_mean.item() / len(episodes)
+        loss.backward()
+        nll_total += nll.item()
+        _read_stats(reads, stats)
+    torch.nn.utils.clip_grad_norm_(ctx.reader.parameters(), args.clip)
+    optimizer.step()
+    counts = cache.apply(args.item_lr, args.key_lr)
+    return {'nll': nll_total / tokens, 'aux': aux_total, 'tokens': tokens, **counts,
+            **_mean(stats)}
+
+
+@torch.no_grad()
+def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok) -> dict:
+    cache = ItemCache(ctx.frozen.device, train=False)
+    sums = {a: 0.0 for a in ('noctx', 'full', 'retrieved', 'shuffled', 'gold', 'gold_shuffled')}
+    tokens = 0
+    stats: dict[str, list] = {}
+    gold_stats: dict[str, list] = {}
+    got = {'retrieved': [], 'gold': []}
+    for ep in episodes:
+        for mode, name in (('retrieve', 'retrieved'), ('gold', 'gold')):
+            nll, n, reads, spans = run_episode(ctx, ep, cache, mode)
+            sums[name] += nll.item()
+            got[name].append(spans)
+            _read_stats(reads, stats if name == 'retrieved' else gold_stats)
+        tokens += n
+        empty = [torch.zeros(0, ctx.reader.config.span_width) for _ in ep.mems]
+        sums['noctx'] += run_episode(ctx, ep, cache, 'fixed', empty)[0].item()
+        text_ep = layout(ep.row, tok, texts)
+        if int(text_ep.targets.numel()) != n:
+            raise ValueError('the text arm changes the target tokens')
+        sums['full'] += run_episode(ctx, text_ep, cache, 'fixed', [])[0].item()
+    for i, ep in enumerate(episodes):   # another episode's reads, cyclically per site
+        for name, control in (('retrieved', 'shuffled'), ('gold', 'gold_shuffled')):
+            other = got[name][(i + 1) % len(episodes)]
+            spans = [other[j % len(other)] if other else
+                     torch.zeros(0, ctx.reader.config.span_width) for j in range(len(ep.mems))]
+            sums[control] += run_episode(ctx, ep, cache, 'fixed', spans)[0].item()
+    report = nll_summary(sums, tokens, ('retrieved', 'shuffled', 'gold', 'gold_shuffled'),
+                         {'retrieved': 'shuffled', 'gold': 'gold_shuffled'})
+    report['episodes'], report['tokens'] = len(episodes), tokens
+    report['reads'] = _mean(stats)
+    report['gold_reads'] = _mean(gold_stats)
+    report['span_reps'] = distribution(stats.get('n', []))
+    return report
+
+
+def train(args) -> None:
+    model = load_model(args)
+    lm = model.decoder.base_lm
+    if args.decoder_checkpoint:
+        from schnitz.bgkit_span import checkpoint_layers
+        checkpoint_layers(lm.model.layers)
+    frozen = Frozen(lm, args.query_layer, model.core.autocast)
+    candidates = dict(DEFAULT_CANDIDATES, **{k: int(v) for k, v in
+                                             (p.split('=') for p in args.candidates.split(',') if p)})
+    stack, _, dims = load_stack(args.codecs, model.target_norm, 'cpu', args.seed)
+    config = ReadConfig(candidates=candidates, hidden=lm.config.hidden_size,
+                        span_width=lm.get_input_embeddings().weight.shape[1],
+                        target_norm=model.target_norm, state=dims['state'],
+                        op_hidden=dims['hidden'], layers=dims['layers'], gate=args.gate,
+                        max_items=args.max_items, max_reps=args.max_reps,
+                        checkpointing=not args.no_operator_checkpoint)
+    torch.manual_seed(args.seed)
+    reader = L1Reader(config)
+    reader.keys.load_state_dict(torch.load(args.banks / 'key_heads_init.pt', map_location='cpu'))
+    if args.codecs is not None:
+        reader.recombiner.load_state_dict(stack.recombiner.state_dict())
+    del stack
+    reader.to(model.device)
+    optimizer = torch.optim.AdamW(reader.parameters(), lr=args.lr, weight_decay=0.01)
+    args.output.mkdir(parents=True, exist_ok=True)
+    state_path = args.output / 'reader.pt'
+    kbs = open_live(args.banks, args.output)
+    if not state_path.exists():
+        for kb in kbs.values():         # a crash before the first save restarts from the banks
+            if kb.live_updates:
+                raise ValueError(f'{kb.root} has live updates but no reader checkpoint; '
+                                 'remove the output directory to restart')
+    step = 0
+    rng = random.Random(args.seed)
+    if state_path.exists():
+        state = torch.load(state_path, map_location=model.device, weights_only=False)
+        reader.load_state_dict(state['reader'])
+        optimizer.load_state_dict(state['optimizer'])
+        step = state['step']
+        rng.setstate(state['rng'])
+        torch.set_rng_state(state['torch_rng'])
+        # items and keys back to exactly the state paired with the reader checkpoint
+        for name, kb in kbs.items():
+            kb.restore_live(state['live_tag'])
+            if kb.live_updates != state['live_updates'][name]:
+                raise ValueError(f'{name}: restored live state does not match the checkpoint')
+    ctx = Context(frozen, reader, kbs)
+    tok = model.tok
+
+    skipped: dict[str, int] = {}
+
+    def episode(row) -> Episode | None:
+        """The layout of a usable transcript, else None (counted by reason)."""
+        reason = None
+        if not slots_of(row) or row['kb'] not in kbs:
+            reason = 'no_reads_or_kb'
+        else:
+            ep = layout(row, tok)
+            if ep.ids.numel() > args.max_tokens:
+                reason = 'too_long'
+            elif not ctx.covered(ep):
+                reason = 'records_missing'
+        if reason is not None:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            return None
+        return ep
+
+    train_rows = Transcripts(args.transcripts, 'train', args.limit)
+    eval_eps = [ep for ep in map(episode, Transcripts(args.transcripts, 'validation',
+                                                      args.eval_limit)) if ep is not None]
+    eval_skip, skipped = dict(skipped), {}
+    eval_eps = eval_eps[:args.eval_items]
+    wanted = {r for ep in eval_eps for slot in ep.slots for r in slot['record_ids']}
+    texts = {r: v['text'] for r, v in
+             read_sources({ep.row['_dir'] for ep in eval_eps}, wanted).items()}
+    (args.output / 'config.json').write_text(json.dumps(dict(
+        vars(args), read_config=dataclasses.asdict(config),
+        params=sum(p.numel() for p in reader.parameters()), train_transcripts=len(train_rows),
+        eval_episodes=len(eval_eps), eval_skipped=eval_skip,
+        kbs={k: kb.stats() for k, kb in kbs.items()}), indent=2, default=str) + '\n')
+    metrics = (args.output / 'metrics.jsonl').open('a', encoding='utf-8')
+
+    def log(record):
+        metrics.write(json.dumps(record) + '\n')
+        metrics.flush()
+        print(json.dumps(record), flush=True)
+
+    def save():
+        """The reader checkpoint paired with an exact live checkpoint of every KB
+        (``checkpoint_live``); the previous pair is dropped once the new one is in place."""
+        tag = f'step{step:08d}'
+        for kb in kbs.values():
+            if tag not in kb.live_checkpoints():
+                kb.checkpoint_live(tag)
+        pending = state_path.with_suffix('.pending')
+        torch.save({'reader': reader.state_dict(), 'optimizer': optimizer.state_dict(),
+                    'step': step, 'rng': rng.getstate(), 'torch_rng': torch.get_rng_state(),
+                    'live_tag': tag,
+                    'live_updates': {k: kb.live_updates for k, kb in kbs.items()},
+                    'config': dataclasses.asdict(config)}, pending)
+        pending.replace(state_path)
+        for kb in kbs.values():
+            for old in kb.live_checkpoints():
+                if old != tag:
+                    kb.drop_live_checkpoint(old)
+
+    if step == 0 and args.eval_every:
+        log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+    order: list[int] = []
+    window: dict[str, float] = {}
+    started = time.time()
+    while step < args.steps:
+        batch = []
+        while len(batch) < args.batch_size:
+            if not order:
+                order = list(range(len(train_rows)))
+                rng.shuffle(order)
+            ep = episode(train_rows[order.pop()])
+            if ep is not None:
+                batch.append(ep)
+        reader.train()
+        result = train_step(ctx, batch, optimizer, args)
+        step += 1
+        for key, value in result.items():
+            window[key] = window.get(key, 0.0) + value
+        if step % args.log_every == 0:
+            log({'step': step, **{k: round(v / args.log_every, 4) for k, v in window.items()},
+                 'skipped': dict(skipped), 'elapsed_s': round(time.time() - started)})
+            window = {}
+        if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
+            save()
+            reader.eval()
+            log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok)})
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('build', 'train'):
+        p = sub.add_parser(name)
+        p.add_argument('--transcripts', type=Path, nargs='+', required=True,
+                       help='memory transcript directories (v1 or v2)')
+        p.add_argument('--checkpoint', type=Path, required=True)
+        p.add_argument('--experiment', default='bgkit2_s2_showcase')
+        p.add_argument('--reader-state', type=Path, required=True,
+                       help='B3 writer.pt (merged decoder); later B4')
+        p.add_argument('--codecs', type=Path, help='K1 stack.pt; random init when omitted')
+        p.add_argument('--limit', type=int, help='train transcripts per directory')
+        p.add_argument('--eval-limit', type=int, default=256,
+                       help='validation transcripts per directory')
+        p.add_argument('--query-layer', type=int, default=8)
+        p.add_argument('--cuda-fraction', type=float, default=0.15)
+        p.add_argument('--seed', type=int, default=0)
+        p.add_argument('--output', type=Path, required=True)
+    b = sub.choices['build']
+    b.add_argument('--span-source', choices=('writer', 'teacher'), default='writer')
+    b.add_argument('--cache', type=Path, help='B1 teacher cache (span source teacher)')
+    b.add_argument('--batch-size', type=int, default=32)
+    b.add_argument('--distractors', type=int, default=0,
+                   help='extra records per KB beyond those the transcripts name')
+    t = sub.choices['train']
+    t.add_argument('--banks', type=Path, required=True, help='output of build')
+    t.add_argument('--steps', type=int, default=20000)
+    t.add_argument('--batch-size', type=int, default=8)
+    t.add_argument('--lr', type=float, default=3e-4)
+    t.add_argument('--item-lr', type=float, default=3e-3)
+    t.add_argument('--key-lr', type=float, default=3e-3)
+    t.add_argument('--retrieval-weight', type=float, default=0.5)
+    t.add_argument('--clip', type=float, default=1.0)
+    t.add_argument('--candidates', default='', help='e.g. A=8,B=16,C=32,D=64')
+    t.add_argument('--gate', choices=('sigmoid', 'softmax'), default='sigmoid')
+    t.add_argument('--max-items', type=float, default=4.0)
+    t.add_argument('--max-reps', type=int, default=128)
+    t.add_argument('--max-tokens', type=int, default=3072)
+    t.add_argument('--eval-every', type=int, default=500)
+    t.add_argument('--eval-items', type=int, default=128)
+    t.add_argument('--log-every', type=int, default=25)
+    t.add_argument('--decoder-checkpoint', action='store_true',
+                   help='recompute frozen decoder layers in backward')
+    t.add_argument('--no-operator-checkpoint', action='store_true')
+    args = parser.parse_args()
+    build(args) if args.command == 'build' else train(args)
+
+
+if __name__ == '__main__':
+    main()
