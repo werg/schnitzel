@@ -61,7 +61,10 @@ def prepare(output, exclusions, *, worlds=32, split='alignment-fresh-confirmatio
         split=split, worlds=worlds, episodes=len(rows), accepted_seeds=accepted, rejected_seeds=rejected,
         episodes_path=str(path), episodes_sha256=file_sha256(path), exclusions=excluded,
         generator_sha256=file_sha256(__file__),
-        data_generator_sha256=file_sha256(Path(__file__).parents[2]/'src/sdkb/data.py'),
+        # the package was renamed sdkb -> schnitz (27 Sep 2026); same data generator
+        data_generator_sha256=file_sha256(next(p for p in (Path(__file__).parents[2]/'src/sdkb/data.py',
+                                                        Path(__file__).parents[2]/'src/schnitz/data.py')
+                                               if p.exists())),
         question_generator_sha256=file_sha256(Path(__file__).parents[2]/'scripts/make_identifier_character_control.py'),
         policy='No model results used in corpus construction. Both original and inverted endpoints, source IDs and exact source-text hashes are disjoint from the explicitly listed corpora and other accepted worlds. This is not pretrained-model decontamination.',
         evaluation_gate=dict(min_original_identifiers=8, min_correct_identifier_pairs=4,

@@ -434,3 +434,9 @@ log your decisions and changes of direction"), newest last.
   while its training loss stayed low, which is the class imbalance of one stop
   among k emit positions. From step 12000: stop loss weight 0.2 → 0.5 and stop
   class weight 8 (`--stop-pos-weight`).
+- **28 Sep, rename fallout.** Two tests failed after the SDKB → SCHNITZELJAGD
+  rename: the `sdkb` shim loaded second copies of `schnitz` modules (a patched
+  `SchnitzelAgent` did not reach historical scripts), and one sealed-corpus script
+  hashed the moved `src/sdkb/data.py`. The shim now aliases `sdkb.X` to the same
+  `schnitz.X` module object, and the script falls back to `src/schnitz/data.py`.
+  Historical result records are unchanged.

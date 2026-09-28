@@ -166,3 +166,11 @@ def test_checkpoint_layers_keeps_gradients_and_skips_cached_passes():
         wrapped[0](x)
     wrapped[1](x, use_cache=True)
     assert [layer.calls for layer in wrapped] == [3, 3]
+
+
+def test_sdkb_alias_is_the_schnitz_module():
+    import schnitz.data
+    import sdkb.data
+
+    assert sdkb.data is schnitz.data
+    assert schnitz.data.__spec__.name == 'schnitz.data'
