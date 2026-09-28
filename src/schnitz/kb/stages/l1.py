@@ -63,8 +63,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyHeads,
-                             L1Reader, ReadConfig, source_index, splice)
+from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, L1Reader,
+                             ReadConfig, source_index, splice)
+from schnitz.kb.stack import KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
@@ -277,6 +278,14 @@ class Context:
         self.frozen, self.reader, self.kbs = frozen, reader, kbs
         self.autocast = autocast or frozen.autocast
         self.index = {name: {s: source_index(kb, s) for s in kb.spaces} for name, kb in kbs.items()}
+        self._rows: dict[tuple[str, str], dict[str, int]] = {}
+
+    def rows(self, dataset: str, space: str) -> dict[str, int]:
+        """Row index of every item id of a space (for usage statistics)."""
+        key = (dataset, space)
+        if key not in self._rows:
+            self._rows[key] = {i: r for r, i in enumerate(self.kbs[dataset]._row_ids[space])}
+        return self._rows[key]
 
     def covered(self, ep: Episode) -> bool:
         index = self.index.get(ep.kb)
@@ -342,40 +351,41 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
 
 # -- model loading (GPU container) ------------------------------------------------------
 def load_model(args):
-    """The frozen decoder (and writer) from S2 plus ``--reader-state``; protocol installed."""
-    from schnitz.kb.decoder import Model
-    model = Model(argparse.Namespace(cuda_fraction=args.cuda_fraction, experiment=args.experiment,
-                                     checkpoint=args.checkpoint,
-                                     adapter_rank=16 if args.reader_state else 0,
-                                     gate_open_start=-1, merge_at=-1, merge_checkpoint=False))
-    if args.reader_state:
-        state = torch.load(args.reader_state, map_location='cpu', mmap=True)
-        model.load_trained(state)
-        del state
+    """The frozen decoder (and writer): ``schnitz.kb.decoder.frozen_reader`` with the
+    span protocol installed when the reader state has none (B3); nothing trains."""
+    from schnitz.kb.decoder import frozen_reader
+    from schnitz.span_tokens import check_tokenizer
+    model = frozen_reader(args.checkpoint, args.experiment, args.reader_state,
+                          args.cuda_fraction)
     if model.protocol is None:
         if not model.merged:
             raise ValueError('L1 reads through a merged decoder (B3 state or later)')
         model.install_protocol()
-    for module in (model.decoder, model.writer, model.protocol):
-        for param in module.parameters():
+        for param in model.protocol.parameters():
             param.requires_grad_(False)
-    from schnitz.span_tokens import check_tokenizer
     check_tokenizer(model.tok)
     return model
 
 
+STACK_DIMS = {'state': 512, 'hidden': 256, 'layers': 3}
+
+
 def load_stack(path: Path | None, target_norm: float, device, seed: int):
-    """K1 codecs and recombiner (``train_kb_codecs.Stack``): trained, or random init."""
+    """A ``schnitz.kb.stack.Stack``: a K1 ``stack.pt`` (dims from its config.json), a
+    banks ``stack.pt`` (dims stored with it), or random init (``path`` None)."""
     from schnitz.kb.stack import Stack
-    dims = {'state': 512, 'hidden': 256, 'layers': 3}
-    if path is not None and (path.parent / 'config.json').exists():
-        config = json.loads((path.parent / 'config.json').read_text())
-        dims = {k: config.get(k, v) for k, v in dims.items()}
+    dims, state = dict(STACK_DIMS), None
+    if path is not None:
+        state = torch.load(path, map_location='cpu')
+        if 'dims' in state:
+            dims = state['dims']
+        elif (path.parent / 'config.json').exists():
+            config = json.loads((path.parent / 'config.json').read_text())
+            dims = {k: config.get(k, v) for k, v in dims.items()}
     torch.manual_seed(seed)
     stack = Stack(target_norm, dims['state'], dims['hidden'], dims['layers'], False)
     step = 0
-    if path is not None:
-        state = torch.load(path, map_location='cpu')
+    if state is not None:
         stack.load_state_dict(state['stack'])
         step = int(state.get('step', 0))
     return stack.to(device).eval(), step, dims
@@ -422,17 +432,14 @@ def read_sources(dirs: set[str], wanted: set[str],
     return records
 
 
-def initial_heads(path: Path, hidden: int, seed: int) -> KeyHeads:
-    heads = KeyHeads(hidden, DEFAULT_SPACES)
+def initial_heads(path: Path, hidden: int, key_hidden: int, seed: int) -> KeyHeads:
+    """The initial query and item-key heads (seeded), shared by every KB of a build
+    and the trainer's starting point."""
+    torch.manual_seed(seed)
+    heads = KeyHeads(hidden, key_hidden)
     if path.exists():
         heads.load_state_dict(torch.load(path, map_location='cpu'))
     else:
-        generator = torch.Generator().manual_seed(seed)
-        for head in heads.heads.values():
-            bound = 1 / math.sqrt(hidden)
-            head.weight.data = torch.empty_like(head.weight).uniform_(-bound, bound,
-                                                                       generator=generator)
-            head.bias.data.zero_()
         torch.save(heads.state_dict(), path)
     return heads
 
@@ -455,10 +462,15 @@ def build(args) -> None:
         if rid not in wanted and rec['kb'] in needed:
             needed[rec['kb']][rid] = ''
     model = load_model(args)
-    frozen = Frozen(model.decoder.base_lm, args.query_layer, model.core.autocast)
-    stack, codec_step, _ = load_stack(args.codecs, model.target_norm, model.device, args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
-    heads = initial_heads(args.output / 'key_heads_init.pt', frozen.lm.config.hidden_size,
+    stack_path = args.output / 'stack.pt'
+    resumed = stack_path.exists()
+    stack, codec_step, dims = load_stack(stack_path if resumed else args.codecs,
+                                         model.target_norm, model.device, args.seed)
+    # a random-init stack has no span statistics yet: taken from the first batch
+    needs_statistics = not resumed and args.codecs is None
+    hidden = model.decoder.base_lm.config.hidden_size
+    heads = initial_heads(args.output / 'key_heads_init.pt', hidden, args.key_hidden,
                           args.seed).to(model.device)
     teacher = None
     if args.span_source == 'teacher':
@@ -471,7 +483,7 @@ def build(args) -> None:
         root = args.output / _safe(kb_name)
         kb = KnowledgeBase(root, writable=True) if (root / 'manifest.json').exists() else \
             KnowledgeBase.create(root, name=_safe(kb_name), dataset=kb_name,
-                                 origin={'command': 'train_kb_l1 build',
+                                 origin={'command': 'train.py l1 build',
                                          'span_source': args.span_source,
                                          'codecs': str(args.codecs), 'codec_step': codec_step,
                                          'reader_state': str(args.reader_state),
@@ -497,22 +509,20 @@ def build(args) -> None:
                 with model.core.autocast():
                     spans, _ = model.free_run(examples, lengths)
                 spans = [s.float() for s in spans]
-            width = max(x.shape[0] for x in ids)
-            padded = torch.zeros(len(ids), width, dtype=torch.long)
-            mask = torch.zeros(len(ids), width, dtype=torch.long)
-            for i, x in enumerate(ids):
-                padded[i, :x.shape[0]], mask[i, :x.shape[0]] = x, 1
-            mask = mask.to(model.device)
-            h = frozen.mid(frozen.embed(padded), mask)
-            states = (h * mask[..., None]).sum(1) / mask.sum(1, keepdim=True)
-            keys = heads(states)
+            if needs_statistics:
+                stack.set_statistics(spans)
+                needs_statistics = False
+            if not stack_path.exists():
+                torch.save({'stack': stack.state_dict(), 'step': codec_step, 'dims': dims,
+                            'source': str(args.codecs)}, stack_path)
             per_space = {s: [] for s in DEFAULT_SPACES}
             with model.core.autocast():
                 encoded = [stack.encode(span) for span in spans]
             for i, r in enumerate(batch):
                 for s in DEFAULT_SPACES:
+                    values = encoded[i][s].float()
                     per_space[s].append(NewItem(
-                        encoded[i][s].float().cpu(), keys[s][i].float().cpu(),
+                        values.cpu(), heads.item_key(s, values).float().cpu(),
                         Provenance((r,), 'codec', codec_step), 1.0, records[r]['created_at']))
             for s, items in per_space.items():
                 kb.append(s, items)
@@ -555,6 +565,8 @@ def open_live(banks: Path, output: Path) -> dict[str, KnowledgeBase]:
 def _read_stats(reads, sink: dict) -> None:
     for read in reads:
         sink.setdefault('n', []).append(read.n)
+        for key, value in read.recall_at.items():
+            sink.setdefault(key, []).append(value)
         for s, info in read.spaces.items():
             if info.recall is not None:
                 sink.setdefault(f'recall_{s}', []).append(info.recall)
@@ -577,42 +589,79 @@ def retrieval_weight(args, step: int) -> float:
     return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
 
 
-def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0) -> dict:
+def _balance(ctx: Context, reads, usage: dict) -> torch.Tensor | None:
+    """Spread-out use (stack doc 5.2): ``balance_loss`` per (KB, space) over every
+    scored (read, candidate) pair of the episode's reads, averaged; updates the
+    usage averages with the read mass."""
+    from schnitz.kb.losses import UsageEMA, balance_loss
+    pairs: dict[tuple[str, str], tuple[list[int], list[torch.Tensor]]] = {}
+    for read in reads:
+        for s, info in read.spaces.items():
+            if info.scored_gates is None:
+                continue
+            for (dataset, item_id), gate in zip(info.scored, info.scored_gates):
+                rows = ctx.rows(dataset, s)
+                entry = pairs.setdefault((dataset, s), ([], []))
+                entry[0].append(rows[item_id])
+                entry[1].append(gate)
+    losses = []
+    for (dataset, s), (ids, gates) in pairs.items():
+        key = f'{dataset}/{s}'
+        size = len(ctx.rows(dataset, s))
+        if key not in usage:
+            usage[key] = UsageEMA(size)
+        usage[key].grow(size)
+        ids_t, gates_t = torch.tensor(ids), torch.stack(gates)
+        losses.append(balance_loss(ids_t, gates_t, usage[key]))
+        usage[key].update(ids_t, gates_t.detach().cpu())
+    return torch.stack(losses).mean() if losses else None
+
+
+def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0,
+               usage: dict | None = None) -> dict:
     """One L1a step (items in place; K2 with ``--retrieval-only``): gradients of all
     episodes accumulate, then one optimizer step for the reader and one sparse live
-    update per touched (KB, space) for item values and keys."""
+    update per touched (KB, space) for the item values."""
     if args.phase != 'l1a':
         # L1b (through the sources): recompute each retrieved item's write from its
         # stored source with gradients (selective producer replay, the serialized
         # forward exactly: invariant 3) so the task loss reaches the writer's span heads
         # and the codecs. Not built; this is where it plugs in.
         raise NotImplementedError('L1b (gradients through the sources) is not built')
+    usage = {} if usage is None else usage
     cache = ItemCache(ctx.frozen.device, train=True)
     optimizer.zero_grad(set_to_none=True)
     tokens = sum(int(ep.targets.numel()) for ep in episodes)
     weight = retrieval_weight(args, step)
     stats: dict[str, list] = {}
-    nll_total, aux_total = 0.0, 0.0
+    nll_total, aux_total, balance_total = 0.0, 0.0, 0.0
     for ep in episodes:
         nll, _, reads, _ = run_episode(ctx, ep, cache, 'retrieve',
                                        retrieval_only=args.retrieval_only)
+        terms = [] if nll is None else [nll / tokens]
         aux = [r.aux for r in reads if r.aux is not None]
-        loss = nll / tokens if nll is not None else None
         if aux and weight:
             aux_mean = torch.stack(aux).mean()
-            term = weight * aux_mean / len(episodes)
-            loss = term if loss is None else loss + term
+            terms.append(weight * aux_mean / len(episodes))
             aux_total += aux_mean.item() / len(episodes)
+        if args.balance_weight and not args.retrieval_only:
+            balance = _balance(ctx, reads, usage)
+            if balance is not None:
+                terms.append(args.balance_weight * balance / len(episodes))
+                balance_total += balance.item() / len(episodes)
+        loss = sum(terms) if terms else None
         if loss is not None and loss.requires_grad:
             loss.backward()
         if nll is not None:
             nll_total += nll.item()
         _read_stats(reads, stats)
-    torch.nn.utils.clip_grad_norm_(ctx.reader.parameters(), args.clip)
+    torch.nn.utils.clip_grad_norm_(ctx.reader.trainable(), args.clip)
     optimizer.step()
-    counts = cache.apply(0.0 if args.retrieval_only else args.item_lr, args.key_lr)
+    counts = cache.apply(0.0 if args.retrieval_only else args.item_lr)
     out = {'aux': aux_total, 'retrieval_weight': weight, 'tokens': tokens, **counts,
            **_mean(stats)}
+    if args.balance_weight and not args.retrieval_only:
+        out['balance'] = balance_total
     if not args.retrieval_only:
         out['nll'] = nll_total / tokens
     return out
@@ -668,21 +717,22 @@ def train(args) -> None:
     frozen = Frozen(lm, args.query_layer, model.core.autocast)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
-    stack, _, dims = load_stack(args.codecs, model.target_norm, 'cpu', args.seed)
+    # R (and the span statistics) from the banks' stack, so reads decode what the
+    # bank's codecs encoded; the operators take the stack's dimensions
+    stack, _, dims = load_stack(args.banks / 'stack.pt', model.target_norm, 'cpu', args.seed)
+    stack.recombiner.checkpoint_layers = not args.no_operator_checkpoint
     config = ReadConfig(candidates=candidates, keep=keep, hidden=lm.config.hidden_size,
                         span_width=lm.get_input_embeddings().weight.shape[1],
                         target_norm=model.target_norm, state=dims['state'],
-                        op_hidden=dims['hidden'], layers=dims['layers'], gate=args.gate,
-                        retrieval_tau=args.retrieval_tau, max_reps=args.max_reps,
-                        checkpointing=not args.no_operator_checkpoint)
+                        op_hidden=dims['hidden'], layers=dims['layers'],
+                        key_hidden=args.key_hidden, gate_offset=args.gate_offset,
+                        max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint)
     torch.manual_seed(args.seed)
-    reader = L1Reader(config)
+    reader = L1Reader(config, stack)
     reader.keys.load_state_dict(torch.load(args.banks / 'key_heads_init.pt', map_location='cpu'))
-    if args.codecs is not None:
-        reader.recombiner.load_state_dict(stack.recombiner.state_dict())
-    del stack
     reader.to(model.device)
-    optimizer = torch.optim.AdamW(reader.parameters(), lr=args.lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(reader.trainable(), lr=args.lr, weight_decay=0.01)
+    usage: dict = {}
     args.output.mkdir(parents=True, exist_ok=True)
     state_path = args.output / 'reader.pt'
     kbs = open_live(args.banks, args.output)
@@ -700,6 +750,10 @@ def train(args) -> None:
         step = state['step']
         rng.setstate(state['rng'])
         torch.set_rng_state(state['torch_rng'].cpu())
+        from schnitz.kb.losses import UsageEMA
+        for key, (share, touched) in state.get('usage', {}).items():
+            usage[key] = UsageEMA(len(share))
+            usage[key].share, usage[key].touched = share.cpu(), touched.cpu()
         # items and keys back to exactly the state paired with the reader checkpoint
         for name, kb in kbs.items():
             kb.restore_live(state['live_tag'])
@@ -757,6 +811,7 @@ def train(args) -> None:
         torch.save({'reader': reader.state_dict(), 'optimizer': optimizer.state_dict(),
                     'step': step, 'rng': rng.getstate(), 'torch_rng': torch.get_rng_state(),
                     'live_tag': tag,
+                    'usage': {k: (u.share, u.touched) for k, u in usage.items()},
                     'live_updates': {k: kb.live_updates for k, kb in kbs.items()},
                     'config': dataclasses.asdict(config)}, pending)
         pending.replace(state_path)
@@ -768,8 +823,12 @@ def train(args) -> None:
     if step == 0 and args.eval_every:
         log({'step': 0, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
     order: list[int] = []
-    window: dict[str, float] = {}
+    window: dict[str, list[float]] = {}
     started = time.time()
+
+    def rekey() -> None:     # the search's key cache from the current item-key heads
+        for kb in kbs.values():
+            reader.rekey(kb)
     while step < args.steps:
         batch = []
         while len(batch) < args.batch_size:
@@ -780,15 +839,19 @@ def train(args) -> None:
             if ep is not None:
                 batch.append(ep)
         reader.train()
-        result = train_step(ctx, batch, optimizer, args, step)
+        result = train_step(ctx, batch, optimizer, args, step, usage)
         step += 1
         for key, value in result.items():
-            window[key] = window.get(key, 0.0) + value
+            window.setdefault(key, []).append(value)
+        if args.rekey_every and step % args.rekey_every == 0:
+            rekey()
         if step % args.log_every == 0:
-            log({'step': step, **{k: round(v / args.log_every, 4) for k, v in window.items()},
-                 'skipped': dict(skipped), 'elapsed_s': round(time.time() - started)})
+            log({'step': step, **_mean(window), 'skipped': dict(skipped),
+                 'usage': {k: u.stats() for k, u in usage.items()} if args.log_usage else None,
+                 'elapsed_s': round(time.time() - started)})
             window = {}
         if (args.eval_every and step % args.eval_every == 0) or step == args.steps:
+            rekey()
             save()
             reader.eval()
             log({'step': step, 'eval': evaluate(ctx, eval_eps, texts, tok, args.keep_writes)})
@@ -808,6 +871,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--eval-limit', type=int, default=256,
                         help='validation transcripts per directory')
     parser.add_argument('--query-layer', type=int, default=8)
+    parser.add_argument('--key-hidden', type=int, default=512)
     parser.add_argument('--cuda-fraction', type=float, default=0.15)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--output', type=Path, required=True)
@@ -822,13 +886,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--steps', type=int, default=20000)
     t.add_argument('--lr', type=float, default=3e-4)
     t.add_argument('--item-lr', type=float, default=3e-3)
-    t.add_argument('--key-lr', type=float, default=3e-3)
     t.add_argument('--retrieval-weight', type=float, default=0.5)
     t.add_argument('--clip', type=float, default=1.0)
     t.add_argument('--candidates', default='', help='scored per space, e.g. A=8,B=16,C=32,D=64')
     t.add_argument('--keep', default='', help='read per space (nonzero gates), e.g. A=2,D=4')
-    t.add_argument('--gate', choices=('sigmoid', 'softmax'), default='sigmoid')
-    t.add_argument('--retrieval-tau', type=float, default=0.1)
+    t.add_argument('--gate-offset', type=float, default=0.5,
+                   help='initial gate offset b_s in cosine units')
+    t.add_argument('--balance-weight', type=float, default=0.01,
+                   help='spread-out use (balance loss over scored candidates)')
+    t.add_argument('--log-usage', action='store_true')
+    t.add_argument('--rekey-every', type=int, default=25,
+                   help='refresh the stored (search) keys from the item-key heads')
     t.add_argument('--retrieval-anneal', type=int, default=0,
                    help='steps over which the retrieval weight decays linearly to '
                         '--retrieval-floor (0: constant)')
