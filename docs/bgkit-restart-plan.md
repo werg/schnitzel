@@ -1067,3 +1067,16 @@ log your decisions and changes of direction"), newest last.
   the rest. The r6 QA baseline (frozen, no contrast) keeps improving: content 0.095
   -> 0.145 -> 0.182 nats at steps 250/750/1000 (retrieved 1.591, shuffled 1.773,
   text 1.535).
+- 29 September: the retrieval diagnosis on recall-text. Retrieval-only (K2) runs on a
+  copy of the rows and on the plain windows (no rows), with key lr 1e-2, head lr 1e-3
+  and retrieval weight 1, both stay at chance: validation search recall 0-6% per
+  space. On the windows the retrieval loss even rose (1.38 -> 1.63). So the superposed
+  rows are not the cause. r6 QA retrieval works from the same initial heads (search
+  recall 0.57-0.93 per space, read 0.19-0.53). Likely cause: a slot's positives are
+  the windows overlapping the target, while windows of the same document that
+  overlap only the cue are the most query-similar items and count as negatives. The
+  loss asks the keys to separate near-identical items. Fix in progress: *neutral*
+  items per slot (same-document windows), neither positive nor negative in the
+  retrieval loss. Fallback if that is not enough: distill initial key heads from a
+  text embedding teacher (Qwen3-Embedding-0.6B is cached). K2 has no distillation,
+  so that would be a change of design. Both K2 diagnostics are stopped.
