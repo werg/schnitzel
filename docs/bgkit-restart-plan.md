@@ -112,9 +112,11 @@ at its causal position, without arguments: the query is a vector, the call's
 hidden state (a middle layer) projected by one key head per KB space; the result is a normal
 `<|im_start|>tool` message whose content is the latent span between `<|mem|>` and
 `<|/mem|>`, so KB content is marked apart from the model's own writes. A write is a
-`memory_write(...)` call: first with the reusable content as a text argument that
-the writer encodes (v0.5), then with a latent argument, a `<|bg|>` … `<|/bg|>`
-span generated inside the call. Memory use thus has the same form as tool use in
+`memory_write()` call without text: the model generates the `<|bg|>` … `<|/bg|>`
+span itself, from its context, in the same pass, and per-space heads on that
+pass give the stored items and their keys. There is no text argument and no
+second encoding pass; storing a corpus record is the same call with the record in
+context (owner, 28 September). Memory use thus has the same form as tool use in
 the agent trajectory corpora. The current restart code places reads in BGKit's
 prompt template ("Context: <span> <question>" in the user turn), a training
 shortcut until B4. Training adds interleaved sequences (text, span, text) so the
@@ -585,5 +587,30 @@ log your decisions and changes of direction"), newest last.
   wording, and could carry target information into the key (header names);
   retrieved record ids are logged for readability instead. A short latent query
   span (several vectors, as a write span) is the fallback if one vector per space
-  proves too narrow in L1. `memory_write` keeps its text argument until writes
+  proves too narrow in L1. [Superseded for writes below.] `memory_write` keeps its text argument until writes
   become latent (B4). Transcripts regenerated without query text.
+- 28 Sep (WP3 v2, transcripts regenerated without query text, `memory-<name>-20260928v2`).
+  Agent searches are placed per record: standing records (protocol, general policy) at
+  the start, the rest just before the agent's first action that uses what the record
+  covers (a tool, a listed object or place, an example's most specific command, with one
+  re-read at its next command), plus a protocol re-read after an observation reporting a
+  failed action. The `action_*` placements use the agent's own next action, as the v1
+  tool-doc placement did; the call has no content, so no future text enters the prefix.
+  ScienceWorld episodes without examples draw three from the KB's held-out pool of the
+  same task type (never their own variation). Writes default to `reusable`: trajectories
+  and single-shot results that are reusable later (SQL, table answers, tool calls, short
+  code, multi-hop answers), not puzzle answers or facts a passage already holds.
+- 28 Sep (owner). Writes are single-pass: `memory_write()` opens a `<|bg|>`
+  span the model generates in place; the codecs act as per-space heads on that
+  pass and a key head reads `<|/bg|>`. The text-argument write re-encoded by a
+  second writer pass (v0.5) is dropped, including as an intermediate stage; bank
+  creation is the same call with a record in context. B4 trains in-context writes
+  (write sites in trajectories, the span distilled toward the writer's span of the
+  written content and checked by a reader); B9 trains them by later use.
+- 28 Sep (owner). Items are parameters used only in context (short spans read by
+  the decoder), not mixture-of-experts outputs; hidden-state injection is dropped
+  as a direction. The goal is extreme sparsity: frequent, cheap reads touching a
+  few items of a very large KB, capability from breadth rather than per-sample
+  read intensity. Retrieval tasks are the starting point for this continual-
+  learning system. Consequences: small read spans and candidate counts, and a
+  standing experiment on quality against KB size at a fixed per-sample read budget.

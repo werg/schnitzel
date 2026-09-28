@@ -1,4 +1,5 @@
-"""Memory-protocol chat transcripts for LFM2 (knowledge-base stack WP3, restart plan 3.2).
+"""Memory-protocol chat transcripts for LFM2, version 2 (knowledge-base stack WP3, restart
+plan 3.2).
 
 Every episode of an R6 or task corpus becomes one LFM2 chat transcript in the
 structured form ``tok.apply_chat_template(messages, tools=tools)`` renders:
@@ -7,40 +8,73 @@ structured form ``tok.apply_chat_template(messages, tools=tools)`` renders:
 - ``user``: the task, with the corpus prompt's "Use the stored ..." preamble removed
   (the knowledge base is reached by tool calls now, not announced in the prompt);
 - search sites: an ``assistant`` message whose ``tool_calls`` are one or more
-  ``memory_search(query=...)`` calls, each followed by a ``tool`` message whose
-  content is a latent SLOT ``{"slot": {"kb", "record_ids", ...}}``; the trainer
-  renders it as ``<|mem|>`` + latent span + ``<|/mem|>`` (``schnitz.span_tokens``);
+  ``memory_search()`` calls WITHOUT arguments (owner, 28 Sep: the query is a vector,
+  the decoder's hidden state at the call projected by one key head per KB space),
+  each followed by a ``tool`` message whose content is a latent SLOT
+  ``{"slot": {"kb", "record_ids", ...}}``; the trainer renders it as ``<|mem|>`` +
+  latent span + ``<|/mem|>`` (``schnitz.span_tokens``). The target record ids of every
+  call are in its slot and in the row's ``search_sites`` entry (with the placement
+  ``step`` and ``trigger``);
 - the answer: an ``assistant`` message (text, or native tool calls for function
   calling); multi-turn corpora keep their ``turns`` (customers and observations as
-  ``user``, API results as ``tool``, agent API calls as native tool calls, whose
-  documentation is searched just before the first call of each tool);
-- write sites (trajectory tasks by default): a final ``memory_write(content=...)``
-  call whose content summarizes the episode's own trajectory, and a ``tool`` ack.
+  ``user``, API results as ``tool``, agent API calls as native tool calls);
+- write sites (``--writes``): a final ``memory_write(content=...)`` call with text
+  content and a ``tool`` ack.
 
-Which records a search returns comes from the source episode (``required_ids``,
-the first valid ``sufficient_groups`` entry for R6, related ``supports`` such as
-column values, worked examples and background). Searches are grouped into
-stages (rules/protocol, schema, values, evidence, tool docs, know-how, examples,
-background); multi-hop passages are searched one hop per site, ordered so that
-a hop's title is grounded in the question or in passages read before it.
+Which records a search returns comes from the source episode (``required_ids``, the
+first valid ``sufficient_groups`` entry for R6, related ``supports`` such as column
+values, worked examples and background). ScienceWorld episodes whose source attaches
+no worked example get up to three from the KB's held-out pool of training
+trajectories of the same task type (``--pool-examples``).
 
-Query text is built from the causal prefix (the request, the trajectory so far,
-records already read) and the target record's header (title, table, tool name,
-kind) with varied templates, then audited: no n-gram of ``--ngram`` tokens (5)
-from anything after the call (answer, later turns, gold SQL/calls) or from the
-target records' bodies unless it also occurs in the prefix or the records'
-headers, and no short-answer string unless the prefix already contains it. A
-query that fails falls back to the next candidate; a generic query is the last
-resort and counted.
+Placement (single-shot tasks): all searches precede the answer, grouped into stages
+(rules/protocol, schema, values, evidence, tool docs, know-how, examples, background);
+multi-hop passages are searched one hop per site, ordered so that a hop's title is
+grounded in the question or in passages read before it.
 
-Enforced checks (counts in ``manifest.json``): every slot record exists in the
-episode's KB (``sources.jsonl`` of the corpus; for R6 each dataset domain is its
-own KB) with ``created_at`` before the episode's ``query_time``; slots never
-contain a record that copies the episode's own long answer (its gold
-trajectory) unless it is an explicit ``--gold-slots`` record (train only, flagged
-``gold`` with a ``receding_weight``, restart plan B9); validation and test
-transcripts never reference gold records. Output is deterministic (per-episode
-RNG from ``--seed`` and the episode id) and hashed in the manifest.
+Placement (trajectories), per record; a site sits right before the agent turn
+``step`` (0 = before the first turn):
+
+- protocol, rules, background, the general agent-policy section: step 0 (``start``);
+- tool documentation: before the first call of that tool (``action_tool``); a
+  policy section on an action (cancel, modify, return, ...) before the first call of
+  a state-changing tool whose verb the section names (``action_tool``);
+- know-how (ALFWorld floorplans): before the first action that names an object or
+  location the record lists (``action_entity``);
+- worked examples: before the first action that uses the example's most specific
+  command (the example's command that is rarest among the KB's worked examples,
+  e.g. ``heat``, ``use``, ``click``, ``argmax``, ``awk``, SQL ``SELECT``; terminal
+  commands such as ``answer``/``submit`` never count, exploration commands such as
+  ``go``, ``look``, ``open``, ``ls``, ``DESC`` only when nothing else matches), falling
+  back to its next most specific command the trajectory uses (``action_command``);
+  with ``--example-reads`` 2 (default) it is placed before the first uses of its two
+  most specific commands the trajectory uses, the later one a re-read
+  (``action_command_reread``);
+- a record none of whose cues the trajectory uses is searched at step 0
+  (``start_fallback``); records placed at the same step share a site (one call per
+  kind, table or tool as in single-shot stages; the call's ``trigger`` joins theirs);
+- after an observation that reports a failed action (``--failure-rereads``, at most
+  once per episode) the standing records (protocol, policy, rules) are searched again
+  (``observation_failure``).
+
+The ``action_*`` triggers place a search before the agent's own next action (as
+the tool-doc placement of version 1): the decision uses the record's identity and
+the step the agent takes next, never an observation or answer the agent has not
+seen; the call itself carries no text, and everything before it is the unchanged
+causal prefix. ``observation_failure`` uses only the prefix.
+
+Enforced checks (counts in ``manifest.json``): every ``memory_search`` call has empty
+arguments; every slot record exists in the episode's KB (``sources.jsonl`` of the
+corpus; for R6 each dataset domain is its own KB) with ``created_at`` before the
+episode's ``query_time`` and in the transcript's KB; slots never contain a record
+that copies the episode's own long answer (its gold trajectory) unless it is an
+explicit ``--gold-slots`` record (train only, flagged ``gold`` with a
+``receding_weight``, restart plan B9); validation and test transcripts never
+reference gold records; the source messages (request, turns) appear unchanged and in
+their source order, so every call's prefix is a prefix of the source episode; the
+generated system prompt copies no n-gram of ``--ngram`` tokens from the answer or
+later turns that the request lacks. Output is deterministic (per-episode RNG from
+``--seed`` and the episode id) and hashed in the manifest.
 
 Loss policy: every assistant message (content and tool calls, including
 ``memory_search`` and ``memory_write`` calls) gets loss; system, user and tool
@@ -52,7 +86,6 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import hashlib
-import importlib
 import json
 import os
 from pathlib import Path
@@ -63,24 +96,23 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS  # noqa: E402
 
+FORMAT = 2
 NGRAM = 5
-SHORT_ANSWER = 100          # answers up to this many characters are also string-checked
 OWN_GOLD_TOKENS = 12        # answers shorter than this are not checked for copies
 OWN_GOLD_OVERLAP = 0.5      # share of a record's 8-grams inside the answer = a copy
 COPY_KINDS = {'worked_example', 'know_how', 'protocol', 'policy', 'background', 'rules'}
-WRITE_CHARS = 700
+WRITE_CHARS = 900           # longer write contents are cut (trajectories) or skipped (single-shot)
+POOL_EXAMPLES = 3           # pooled worked examples per episode without any
 LOSS_POLICY = {'loss_on': 'assistant', 'assistant_parts': ['content', 'tool_calls'],
                'no_loss': ['system', 'user', 'tool'], 'template_generation_tags': True}
 
 SYSTEM = (
-    'You can consult a knowledge base. Call memory_search with a short description of what '
-    'you need; each result is a memory span you read directly. Look things up before you '
-    'rely on them.',
-    'A knowledge base holds the reference material for this task. Use memory_search with '
-    'short queries to read documentation, schemas, rules, examples or facts, as often as '
+    'You can consult a knowledge base. Call memory_search() whenever you need knowledge; '
+    'each result is a memory span you read directly. Look things up before you rely on them.',
+    'A knowledge base holds the reference material for this task: documentation, schemas, '
+    'rules, examples and facts. Call memory_search() when you need some of it, as often as '
     'needed.',
-    'Before answering, retrieve what you need with memory_search; results arrive as memory '
-    'spans.',
+    'When you need knowledge, call memory_search(); results arrive as memory spans.',
 )
 ROLE = {
     'function_call': 'Fulfil the request by calling the listed tools; their documentation '
@@ -92,11 +124,12 @@ ROLE = {
     'text_to_sql': 'Database schemas, column values and notes are in the knowledge base.',
     'stored_table_qa': 'Database contents are in the knowledge base.',
 }
-WRITE_POLICY = 'When the task is done, store reusable know-how with memory_write.'
+WRITE_POLICY = 'When the task is done, store reusable results with memory_write.'
 
 # search stages, in order; kinds of one stage share a site
 STAGES = (('protocol', 'policy', 'rules'), ('schema',), ('column_values', 'table_rows'),
           ('evidence',), ('tool_doc',), ('know_how',), ('worked_example',), ('background',))
+STANDING = ('protocol', 'policy', 'rules')
 SPACE_HINT = {'column_values': 'fine', 'table_rows': 'fine', 'schema': 'fine',
               'evidence': 'fine', 'tool_doc': 'fine', 'background': 'coarse',
               'worked_example': 'coarse', 'protocol': 'coarse', 'policy': 'coarse',
@@ -107,56 +140,50 @@ HEADERS = {
     'table_rows': r'^Database (?P<db>\S+), table (?P<table>.+?) \(',
     'evidence': r'^Database (?P<db>\S+), note:',
     'tool_doc': r'^(?:Tool: (?P<tool>\S+)|(?P<area>\w+) tool (?P<tool2>[^:\s]+):)',
-    'policy': r'^(?P<area>\w+) agent policy:',
-    'protocol': r'^(?P<env>\S+) protocol:',
-    'worked_example': r'^Worked example(?: \((?P<family>[^)]*)\))?',
-    'background': r'^Background: (?P<title>[^\n]+)',
     'passage': r'^Title: (?P<title>[^\n]+)',
-    'know_how': r'^Floorplan (?P<plan>\d+)',
 }
-TEMPLATES = {
-    'passage': ('{need}', '{keys}', 'passages about {keys}', 'facts on {keys}',
-                'what is stored about {keys}'),
-    'passage_title': ('{title}', 'about {title}', '{title}: {keys}', 'facts about {title}',
-                      'what the knowledge base says about {title}'),
-    'passage_hop': ('more on {keys}', 'follow-up facts for: {keys}', 'the other passage for {keys}'),
-    'schema': ('schema of table {table} in {db}', 'columns of {db}.{table}',
-               '{table} table definition ({db})', 'which columns does {table} have',
-               '{db} tables for: {keys}'),
-    'column_values': ('values of {table}.{column}', 'possible {column} values in {table}',
-                      'distinct entries of {table} columns {column}', 'stored values for {table}'),
-    'table_rows': ('rows of table {table}', 'contents of {db}.{table}',
-                   'what is stored in the {table} table', 'data in {table}'),
-    'evidence': ('notes on {keys}', 'hints for {db}: {keys}', 'definitions needed for: {keys}',
-                 'how {db} encodes {keys}', 'notes for: {need}'),
-    'tool_doc': ('documentation for {tool}', 'how to call {tool}', 'parameters of {tool}',
-                 '{tool} API docs', 'arguments {tool} expects'),
-    'policy': ('{area} agent policy', 'rules for handling {area} customer requests',
-               'what the {area} policy says about {keys}'),
-    'protocol': ('how to act in {env}', 'action format for {env} tasks',
-                 '{env} interaction protocol', 'rules of the {env} environment'),
-    'rules': ('rules for this kind of puzzle', 'how to solve puzzles like: {keys}',
-              'rules: {keys}'),
-    'know_how': ('where objects are usually found in this house', 'known object locations',
-                 'where to find things for: {keys}'),
-    'worked_example': ('worked examples for: {keys}', 'solved examples similar to {keys}',
-                       'how similar {family} tasks were solved', 'examples of {family} solutions',
-                       'examples like: {need}'),
-    'background': ('background on {keys}', 'reference material about {keys}',
-                   'documentation relevant to {keys}', '{title}', 'background for: {need}'),
-    'gold_trajectory': ('my earlier attempt at this task', 'previous attempt for: {keys}'),
-    'distractor': ('anything else about {keys}', 'related notes: {keys}', '{title}'),
-}
-GENERIC = {'passage': 'relevant passage', 'worked_example': 'worked examples',
-           'background': 'background', 'gold_trajectory': 'earlier attempt'}
 STOP = set('''a an the of in on at to for from by with and or but is are was were be been being
 do does did has have had what which who whom whose when where why how that this these those it
 its as into than then there their they he she his her them i you your we our me my not no yes
 can could would should will shall may might must if so such any all some each about after
-before over under between during also only just very more most other one two use using stored
-give short response question answer please tell find write following return exactly words
-through hello hi thanks thank'''.split())
+before over under between during also only just very more most other one two'''.split())
 MAX_SLOT = {'worked_example': 4, 'background': 4}  # coarse slots keep a sample of their records
+
+# writes: families whose single-shot result is reusable later (see --writes)
+TRAJECTORY_FAMILIES = ('agent', 'policy_tool_agent')
+REUSABLE_FAMILIES = ('text_to_sql', 'stored_table_qa', 'function_call', 'code',
+                     'hotpot_multihop', 'public_multihop_qa', 'public_claim_verification')
+
+# trajectories: commands that end an episode never place a search; exploration commands
+# place one only when an example has no other command the trajectory uses
+TERMINAL = {'answer', 'submit', 'finish', 'final', 'stop', 'exit'}
+EXPLORATION = {'go', 'goto', 'look', 'open', 'close', 'teleport', 'inventory', 'examine',
+               'move_ahead', 'turn_left', 'turn_right', 'turn_around', 'wait', 'wait1', 'scroll',
+               'back', 'ls', 'cd', 'cat', 'pwd', 'echo', 'show', 'desc', 'describe'}
+# read-only API verbs; other tool verbs change state and pull their policy section
+READ_ONLY = {'get', 'list', 'search', 'find', 'calculate', 'think', 'transfer', 'check'}
+FAILURE = re.compile(r'^(?:Observation:\s*)?(?:Nothing happens|No known action|Invalid action|'
+                     r'Error|ERROR|.{0,40}\berror\b|.{0,60}No such file|.{0,40}command not found)',
+                     re.IGNORECASE)
+ACTION = re.compile(r'(?:^|\n)[ \t]*(?:Action|Act)[ \t]*:[ \t]*', re.IGNORECASE)
+CODE = re.compile(r'```(\w*)[ \t]*\n?(.*?)(?:```|$)', re.DOTALL)
+SQL_START = re.compile(r'\s*(select|show|desc|describe|insert|update|delete|create|drop|alter|'
+                       r'with|replace)\b', re.IGNORECASE)
+
+# ETO's ScienceWorld task indices (the numeric ``group`` of its trajectories), matched to
+# the task names of the cp2107 trajectories by the template words of their task texts
+# (majority vote over the training episodes; 23 of 24 indices unanimous, 11: 93 of 120)
+SCIENCEWORLD_ETO_TASKS = {
+    '0': 'boil', '1': 'change-the-state-of-matter-of', '2': 'freeze', '3': 'melt',
+    '4': 'measure-melting-point-known-substance', '6': 'use-thermometer',
+    '7': 'power-component', '8': 'power-component-renewable-vs-nonrenewable-energy',
+    '9': 'test-conductivity', '10': 'test-conductivity-of-unknown-substances',
+    '11': 'find-animal', '12': 'find-living-thing', '13': 'find-non-living-thing',
+    '14': 'find-plant', '15': 'grow-fruit', '16': 'grow-plant', '17': 'chemistry-mix',
+    '18': 'chemistry-mix-paint-secondary-color', '19': 'chemistry-mix-paint-tertiary-color',
+    '20': 'lifespan-longest-lived', '21': 'lifespan-longest-lived-then-shortest-lived',
+    '22': 'lifespan-shortest-lived', '23': 'identify-life-stages-1',
+    '24': 'identify-life-stages-2'}
 
 
 # -- text helpers -----------------------------------------------------------------
@@ -168,36 +195,8 @@ def ngrams(toks: list[str], n: int = NGRAM) -> set[tuple[str, ...]]:
     return {tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)}
 
 
-def contains(haystack: list[str], needle: list[str]) -> bool:
-    """``needle`` occurs as a contiguous token run in ``haystack``."""
-    if not needle or len(needle) > len(haystack):
-        return False
-    first = needle[0]
-    return any(haystack[i] == first and haystack[i:i + len(needle)] == needle
-               for i in range(len(haystack) - len(needle) + 1))
-
-
 def clean(text: str) -> str:
     return re.sub(r'\s+', ' ', text or '').strip()
-
-
-def keyphrase(text: str, limit: int = 8) -> str:
-    """Content words of ``text`` in order (stopwords and duplicates dropped)."""
-    seen, out = set(), []
-    for word in re.findall(r"[\w][\w'&+./-]*", text or ''):
-        word = word.strip("'.-/")
-        low = word.lower()
-        if not word or low in STOP or low in seen or (len(low) < 2 and not low.isdigit()):
-            continue
-        seen.add(low)
-        out.append(word)
-        if len(out) >= limit:
-            break
-    return ' '.join(out)
-
-
-def header(text: str) -> str:
-    return (text or '').split('\n', 1)[0]
 
 
 def fields_of(kind: str, text: str) -> dict:
@@ -207,8 +206,6 @@ def fields_of(kind: str, text: str) -> dict:
     got = {k: v for k, v in found.groupdict().items() if v}
     if 'tool2' in got:
         got['tool'] = got.pop('tool2')
-    if 'family' in got:
-        got['family'] = got['family'].replace('_', ' ')
     return got
 
 
@@ -254,31 +251,83 @@ def need_text(user: str, dataset: str) -> str:
 
 
 def words(text: str, limit: int) -> str:
-    parts = text.split()
-    return ' '.join(parts[:limit])
+    return ' '.join(text.split()[:limit])
 
 
-# -- audit -------------------------------------------------------------------------
-def leak_reason(query: str, *, prefix: list[str], future: list[str], allowed: list[str],
-                answers: list[str], n: int = NGRAM) -> str | None:
-    """Why ``query`` is not derived from the causal prefix, or None.
+# -- agent actions -------------------------------------------------------------------
+def action_parts(text: str) -> list[str]:
+    """The action parts of a turn or worked example: the text after each ``Action:`` /
+    ``Act:`` marker; a turn with none but a final answer counts as ``answer``."""
+    parts = ACTION.split(text or '')[1:]
+    parts = [p for p in parts if p.strip()]
+    if not parts and re.search(r'Final Answer\s*:|^Answer\s*:', text or '', re.MULTILINE):
+        return ['answer']
+    return parts
 
-    ``future`` are texts the query must not copy from (answer, later turns, target
-    record bodies); their n-grams are allowed only where they also occur in ``prefix``
-    or in ``allowed`` (target record headers). A short answer string may appear only if
-    the prefix contains it too."""
-    q = tokens(query)
-    if not q:
-        return 'empty'
-    ok = ngrams(prefix, n) | {g for text in allowed for g in ngrams(tokens(text), n)}
-    mine = ngrams(q, n)
-    for text in future:
-        if mine & (ngrams(tokens(text), n) - ok):
+
+def commands_of(part: str) -> list[str]:
+    """Command names of one action: the SQL keyword of a SQL block, each command of a
+    shell block, else the leading word (``go``, ``click``, ``get_neighbors``, ...)."""
+    code = CODE.search(part)
+    if code:
+        lang, body = code.group(1).lower(), code.group(2)
+        if lang == 'sql' or (lang != 'bash' and SQL_START.match(body)):
+            found = SQL_START.match(body) or re.match(r'\s*([A-Za-z]+)', body)
+            return [found.group(1).lower()] if found else []
+        out = []
+        for seg in re.split(r'\|\||&&|[|;\n]', body):
+            found = re.match(r'\s*(?:sudo\s+)?([A-Za-z_][\w.-]*)', seg)
+            if found:
+                out.append(found.group(1).lower())
+        return out
+    found = re.match(r'\s*([A-Za-z_][\w-]*)', part)
+    return [found.group(1).lower()] if found else []
+
+
+def record_commands(text: str) -> list[str]:
+    """Commands of a worked example in order of first use (duplicates dropped)."""
+    return list(dict.fromkeys(c for part in action_parts(text) for c in commands_of(part)))
+
+
+def know_how_cues(text: str) -> set[str]:
+    """Objects and locations a know-how record lists ("item: place 1, place 2")."""
+    cues = set()
+    for line in (text or '').split('\n')[1:]:
+        if ':' not in line:
+            continue
+        item, places = line.split(':', 1)
+        cues.add(clean(item).lower())
+        cues.update(clean(p).lower() for p in places.split(','))
+    return {c for c in cues if c}
+
+
+def has_phrase(text: str, phrase: str) -> bool:
+    return re.search(r'(?<![\w])' + re.escape(phrase) + r'(?![\w])', text) is not None
+
+
+def verb_stem(tool: str) -> str:
+    verb = tool.split('_')[0].lower()
+    return verb[:-1] if verb.endswith('e') and len(verb) > 4 else verb
+
+
+def task_type(dataset: str, group: str | None) -> str | None:
+    """Task type of a ScienceWorld trajectory group (cp2107 ``gold:<task>:variation:N``,
+    ETO numeric index); None elsewhere (no pooling)."""
+    if dataset != 'scienceworld' or not group:
+        return None
+    if group.startswith('gold:'):
+        return group.split(':')[1]
+    return SCIENCEWORLD_ETO_TASKS.get(group.split('_')[0])
+
+
+# -- audit helpers -------------------------------------------------------------------
+def leak_reason(text: str, *, prefix: list[str], future: list[str], n: int = NGRAM) -> str | None:
+    """'ngram' if ``text`` copies an n-gram of a ``future`` text that the prefix lacks."""
+    mine = ngrams(tokens(text), n)
+    ok = ngrams(prefix, n)
+    for other in future:
+        if mine & (ngrams(tokens(other), n) - ok):
             return 'ngram'
-    for answer in answers:
-        a = tokens(answer)
-        if a and len(answer) <= SHORT_ANSWER and contains(q, a) and not contains(prefix, a):
-            return 'answer'
     return None
 
 
@@ -305,8 +354,8 @@ def tool_stub(name: str) -> dict:
             'before calling.', 'parameters': {'type': 'object', 'properties': {}}}
 
 
-def message_text(message: dict, exclude_memory: bool = True) -> str:
-    """Plain text of a message for the audit (slots and memory-call arguments excluded)."""
+def message_text(message: dict) -> str:
+    """Plain text of a message (slots, write acks and memory calls excluded)."""
     parts = []
     content = message.get('content')
     if isinstance(content, str):
@@ -315,10 +364,20 @@ def message_text(message: dict, exclude_memory: bool = True) -> str:
         parts.append(json.dumps(content, ensure_ascii=False))
     for tc in message.get('tool_calls') or []:
         fn = tc['function']
-        if exclude_memory and fn['name'] in ('memory_search', 'memory_write'):
+        if fn['name'] in ('memory_search', 'memory_write'):
             continue
         parts.append(fn['name'] + ' ' + json.dumps(fn['arguments'], ensure_ascii=False))
     return '\n'.join(parts)
+
+
+def is_memory(message: dict) -> bool:
+    """A memory call, a search slot or a write ack."""
+    content = message.get('content')
+    if isinstance(content, dict) and ('slot' in content or 'write_result' in content):
+        return True
+    calls = message.get('tool_calls') or []
+    return bool(calls) and all(tc['function']['name'] in ('memory_search', 'memory_write')
+                               for tc in calls)
 
 
 def render_text(messages: list[dict], tools: list[dict], tok,
@@ -333,9 +392,9 @@ def render_text(messages: list[dict], tools: list[dict], tok,
 
 def render_check(tok, row: dict) -> Counter:
     """Render ``row`` through the real chat template and check the protocol: one
-    tool-call block per calling assistant message, an empty ``<|mem|><|/mem|>`` pair
-    per slot outside the loss mask, every memory call inside it and no system, user or
-    tool token in it."""
+    tool-call block per calling assistant message, ``memory_search()`` rendered without
+    arguments, an empty ``<|mem|><|/mem|>`` pair per slot outside the loss mask, every
+    memory call inside it and no system, user or tool token in it."""
     bad: Counter = Counter()
     messages, tools = row['messages'], row['tools']
     fill = SPAN_TOKENS['mem'][0] + SPAN_TOKENS['mem_end'][0]
@@ -355,11 +414,15 @@ def render_check(tok, row: dict) -> Counter:
     if text.count('<|tool_call_start|>') != calling:
         bad['tool_call_blocks'] += 1
     trained = tok.decode([t for t, m in zip(ids, mask) if m])
-    for name in ('memory_search', 'memory_write'):
-        want = sum(tc['function']['name'] == name for m in messages
+    searches = sum(tc['function']['name'] == 'memory_search' for m in messages
                    for tc in m.get('tool_calls') or [])
-        if trained.count(name + '(') != want:
-            bad[f'{name}_not_in_loss'] += 1
+    if trained.count('memory_search()') != searches or \
+            text.count('memory_search(') != text.count('memory_search()'):
+        bad['memory_search_not_empty_in_loss'] += 1
+    writes = sum(tc['function']['name'] == 'memory_write' for m in messages
+                 for tc in m.get('tool_calls') or [])
+    if trained.count('memory_write(') != writes:
+        bad['memory_write_not_in_loss'] += 1
     start, end = tok.convert_tokens_to_ids('<|im_start|>'), tok.convert_tokens_to_ids('<|im_end|>')
     role = None
     for i, t in enumerate(ids):
@@ -373,43 +436,19 @@ def render_check(tok, row: dict) -> Counter:
     return bad
 
 
-def slot_ids(message: dict) -> list[str]:
-    content = message.get('content')
-    return content['slot']['record_ids'] if isinstance(content, dict) and 'slot' in content else []
-
-
-def call_context(messages: list[dict], i: int, j: int, tools_text: str,
-                 texts: dict[str, str]) -> tuple[list[str], list[str], list[str]]:
-    """For search call ``j`` of message ``i``: prefix tokens (tool list, earlier messages
-    and the records their slots returned, earlier calls of the same message), future
-    texts (later messages without memory calls, this call's record bodies) and the
-    allowed record headers."""
-    prefix = [tools_text]
-    for m in messages[:i]:
-        prefix.append(message_text(m, exclude_memory=False))
-        prefix += [texts.get(r, '') for r in slot_ids(m)]
-    prefix += [json.dumps(tc['function']['arguments'], ensure_ascii=False)
-               for tc in messages[i]['tool_calls'][:j]]
-    records = [texts.get(r, '') for r in slot_ids(messages[i + 1 + j])]
-    future = [message_text(m) for m in messages[i + 1:]]
-    future += [t.split('\n', 1)[1] if '\n' in t else '' for t in records]
-    return tokens('\n'.join(prefix)), future, [header(t) for t in records]
-
-
 # -- lookups --------------------------------------------------------------------------
 class Lookup:
-    """One memory_search call to be placed: its records and candidate query templates."""
+    """One memory_search call to be placed: its records, placement and flags."""
 
-    def __init__(self, kind: str, records: list[dict], *, fields: dict | None = None,
-                 templates: tuple = (), flags: dict | None = None):
+    def __init__(self, kind: str, records: list[dict], *, flags: dict | None = None,
+                 step: int = 0, trigger: str = 'start'):
         self.kind, self.records = kind, records
-        self.fields = fields or {}
-        self.templates = templates or TEMPLATES.get(kind, ())
         self.flags = flags or {}
+        self.step, self.trigger = step, trigger
 
 
-def _lookups_for_stage(kinds: tuple, records: list[dict], fields: dict,
-                       rng: random.Random, counts: Counter) -> list[Lookup]:
+def lookups_for_stage(kinds: tuple, records: list[dict], rng: random.Random,
+                      counts: Counter, **placement) -> list[Lookup]:
     """Group a stage's records into calls: one per table / tool, one per kind otherwise."""
     groups: dict[tuple, list[dict]] = {}
     for rec in records:
@@ -430,18 +469,18 @@ def _lookups_for_stage(kinds: tuple, records: list[dict], fields: dict,
             counts['slot_records_capped'] += len(recs) - cap
             keep = set(rng.sample(range(len(recs)), cap))
             recs = [r for i, r in enumerate(recs) if i in keep]
-        info = {}
-        for rec in recs:
-            for k, v in fields_of(rec['kind'], rec['text']).items():
-                info.setdefault(k, v)
-        if key[0] == 'column_values':
-            cols = [fields_of('column_values', r['text']).get('column') for r in recs]
-            info['column'] = ', '.join(dict.fromkeys(c for c in cols if c))
-        for k, v in fields.items():
-            info.setdefault(k, v)
-        info.setdefault('family', 'related')
-        out.append(Lookup(key[0], recs, fields=info))
+        out.append(Lookup(key[0], recs, **placement))
     return out
+
+
+def staged(records: list[dict], rng, counts, **placement) -> list[list[Lookup]]:
+    """Records of one site as stages (each a list of calls), in STAGES order."""
+    stages = []
+    for kinds in STAGES:
+        lookups = lookups_for_stage(kinds, records, rng, counts, **placement)
+        if lookups:
+            stages.append(lookups)
+    return stages
 
 
 def hop_order(need: str, records: list[dict]) -> list[dict]:
@@ -458,21 +497,74 @@ def hop_order(need: str, records: list[dict]) -> list[dict]:
     return order
 
 
-def fill(template: str, fields: dict) -> str | None:
-    try:
-        text = template.format(**fields)
-    except KeyError:
-        return None
-    return clean(text) or None
+# -- trajectory placement ------------------------------------------------------------------
+class Step:
+    """One agent turn of a trajectory, as the placement rules see it."""
+
+    def __init__(self, text: str, tool: str | None = None):
+        parts = action_parts(text) if tool is None else []
+        self.commands = {c for p in parts for c in commands_of(p)}
+        self.action = '\n'.join(parts).lower()
+        self.tool = tool
+
+
+def place_records(records: list[dict], steps: list[Step], family: str, command_df: Counter,
+                  tools: list[str], example_reads: int = 2) -> dict[str, list[tuple]]:
+    """record_id -> [(step, trigger), ...] for a trajectory (module docstring); step None
+    = the record is never searched (documentation of a tool the episode never calls). A
+    worked example is read before the first use of each of its ``example_reads`` most
+    specific commands that the trajectory uses, at distinct steps."""
+    first_tool: dict[str, int] = {}
+    for k, s in enumerate(steps):
+        if s.tool:
+            first_tool.setdefault(s.tool, k)
+    out = {}
+    for rec in records:
+        kind, text = rec['kind'], rec['text']
+        where: tuple[int | None, str] = (0, 'start')
+        extra = []
+        if kind == 'tool_doc':
+            name = fields_of('tool_doc', text).get('tool')
+            where = (first_tool[name], 'action_tool') if name in first_tool else (None, 'unused')
+        elif kind == 'policy' and family == 'policy_tool_agent' and '\n# ' not in text:
+            low = text.lower()
+            hits = [first_tool[t] for t in tools if t in first_tool
+                    and verb_stem(t) not in READ_ONLY and len(verb_stem(t)) >= 3
+                    and re.search(r'\b' + re.escape(verb_stem(t)), low)]
+            if hits:
+                where = (min(hits), 'action_tool')
+        elif kind == 'know_how':
+            cues = know_how_cues(text)
+            hit = next((k for k, s in enumerate(steps)
+                        if s.action and any(has_phrase(s.action, c) for c in cues)), None)
+            where = (hit, 'action_entity') if hit is not None else (0, 'start_fallback')
+        elif kind == 'worked_example':
+            cmds = [c for c in record_commands(text) if c not in TERMINAL]
+            order = sorted(range(len(cmds)), key=lambda i: (
+                cmds[i] in EXPLORATION, command_df.get(cmds[i], 0), -i))
+            hits = []
+            for i in order:
+                hit = next((k for k, s in enumerate(steps) if cmds[i] in s.commands), None)
+                if hit is not None and hit not in hits:
+                    hits.append(hit)
+                    if len(hits) >= example_reads:
+                        break
+            hits.sort()
+            where = (hits[0], 'action_command') if hits else (0, 'start_fallback')
+            extra = [(k, 'action_command_reread') for k in hits[1:]]
+        out[rec['record_id']] = [where] + extra
+    return out
 
 
 # -- transcript builder ----------------------------------------------------------------
 class Options:
-    def __init__(self, seed=0, distractor_rate=0.0, gold_slots=False, writes='trajectory',
-                 sequential_rate=0.3, query_hook=None, ngram=NGRAM):
+    def __init__(self, seed=0, distractor_rate=0.0, gold_slots=False, writes='reusable',
+                 sequential_rate=0.3, ngram=NGRAM, pool_examples=True, failure_rereads=True,
+                 example_reads=2):
         self.seed, self.distractor_rate, self.gold_slots = seed, distractor_rate, gold_slots
-        self.writes, self.sequential_rate, self.query_hook = writes, sequential_rate, query_hook
-        self.ngram = ngram
+        self.writes, self.sequential_rate, self.ngram = writes, sequential_rate, ngram
+        self.pool_examples, self.failure_rereads = pool_examples, failure_rereads
+        self.example_reads = example_reads
 
 
 def episode_rng(seed: int, episode_id: str) -> random.Random:
@@ -507,10 +599,11 @@ def _parse_call(text: str) -> dict | None:
     return call(data['name'], args if isinstance(args, dict) else {'value': args})
 
 
-def write_content(episode: dict, family: str, user: str, dataset: str) -> str:
-    """Reusable know-how from the episode's own final trajectory."""
+def write_content(episode: dict, family: str, user: str, dataset: str) -> str | None:
+    """Reusable content from the episode's own result (None: nothing reusable fits)."""
     need = need_text(user, dataset)
     turns = episode.get('turns') or []
+    answer = episode.get('answer', '')
     if family == 'agent':
         actions = [re.sub(r'^.*?Action:\s*', '', t['text'], flags=re.DOTALL).strip()
                    for t in turns if t['role'] == 'assistant']
@@ -519,7 +612,8 @@ def write_content(episode: dict, family: str, user: str, dataset: str) -> str:
             actions = actions[:8] + ['...'] + actions[-7:]
         text = f'Task: {words(need, 40)}\nSolved in {sum(t["role"] == "assistant" for t in turns)} ' \
                f'steps: ' + '; '.join(actions)
-    elif family == 'policy_tool_agent':
+        return text[:WRITE_CHARS]
+    if family == 'policy_tool_agent':
         names = []
         for t in turns:
             if t['role'] == 'assistant' and t['text'].startswith('Call: '):
@@ -530,24 +624,30 @@ def write_content(episode: dict, family: str, user: str, dataset: str) -> str:
                      and not t['text'].startswith('Call: ')), '')
         text = (f'Customer need: {words(need, 40)}\nTool sequence: {" -> ".join(names) or "none"}\n'
                 f'Outcome: {words(clean(last), 50)}')
-    else:
-        text = f'Task: {words(need, 60)}\nSolution: {episode["answer"][:400]}'
-    return text[:WRITE_CHARS]
+        return text[:WRITE_CHARS]
+    db = re.match(r'Database (\S+?)\. ', user)
+    db = f'Database {db.group(1)}. ' if db else ''
+    labels = {'text_to_sql': ('Question', 'SQL'), 'stored_table_qa': ('Question', 'Answer'),
+              'function_call': ('Request', 'Calls'), 'code': ('Task', 'Solution'),
+              'public_claim_verification': ('Claim', 'Verdict')}
+    ask, result = labels.get(family, ('Question', 'Answer'))
+    sep = '\n' if family == 'code' else ' '
+    text = f'{db}{ask}: {words(need, 60)}\n{result}:{sep}{answer.strip()}'
+    return text if len(text) <= WRITE_CHARS else None
 
 
 class Builder:
     """Turns source episodes of one corpus into transcripts, with checks and counts."""
 
     def __init__(self, kb: str, index: dict, options: Options, *, per_domain: bool,
-                 tool_names: dict[str, list[str]] | None = None):
+                 tool_names: dict[str, list[str]] | None = None,
+                 command_df: Counter | None = None, pool: dict | None = None):
         self.kb, self.index, self.opt, self.per_domain = kb, index, options, per_domain
         self.tool_names = tool_names or {}
+        self.command_df = command_df or Counter()
+        self.pool = pool or {}          # task type -> worked-example records (held-out pool)
         self.gold_ids: set[str] = set()
         self.pending_gold: dict | None = None
-        self.hook = None
-        if options.query_hook:
-            module, name = options.query_hook.split(':')
-            self.hook = getattr(importlib.import_module(module), name)
 
     # records ------------------------------------------------------------------------
     def _valid(self, rec: dict, query_time: int, counts: Counter) -> bool:
@@ -562,6 +662,29 @@ class Builder:
 
     def kb_of(self, record_id: str) -> str:
         return f'{self.kb}:{self.index[record_id][2]}' if self.per_domain else self.kb
+
+    def _pooled(self, episode: dict, dataset: str, qt: int, kb: str, answer_grams: set,
+                rng: random.Random, counts: Counter) -> list[dict]:
+        """Up to POOL_EXAMPLES worked examples of the episode's task type from the KB's
+        held-out pool (never the episode's own trajectory)."""
+        prov = episode.get('provenance', {})
+        own = re.sub(r'^[^-]+-', '', episode['episode_id'])
+        kind = task_type(dataset, prov.get('group') or own)
+        picks = []
+        for rec in self.pool.get(kind, []):
+            group = (rec.get('provenance') or {}).get('group')
+            if group == own or group == prov.get('group') and not str(group).isdigit():
+                counts['pool_own_skipped'] += 1
+                continue
+            if not self._valid(rec, qt, counts) or self.kb_of(rec['record_id']) != kb:
+                continue
+            if answer_grams and own_gold(answer_grams, rec['text']):
+                counts['pool_own_gold_skipped'] += 1
+                continue
+            picks.append(rec)
+        if len(picks) > POOL_EXAMPLES:
+            picks = sorted(rng.sample(picks, POOL_EXAMPLES), key=lambda r: r['record_id'])
+        return picks
 
     # main ---------------------------------------------------------------------------
     def build(self, episode: dict, split: str) -> tuple[dict | None, str | None, Counter]:
@@ -615,10 +738,16 @@ class Builder:
             return None, 'records_span_several_kbs', counts
         kb = kbs.pop()
         spare = [s for s in spare if self.kb_of(s['record_id']) == kb]
+        if self.opt.pool_examples and family == 'agent' and self.pool and \
+                not any(r['kind'] == 'worked_example' for r in wanted):
+            pooled = self._pooled(episode, dataset, qt, kb, answer_grams, rng, counts)
+            if pooled:
+                counts['pooled_examples'] += len(pooled)
+                counts['pooled_episodes'] += 1
+                wanted += pooled
 
         user = strip_preamble(episode['query'], dataset)
         need = need_text(user, dataset)
-        keys = keyphrase(need) or words(need, 8)
 
         # tools and system prompt
         tools = list(MEMORY_TOOLS)
@@ -629,12 +758,17 @@ class Builder:
             tools += [tool_stub(n) for n in dict.fromkeys(n for n in names if n)]
         elif family == 'policy_tool_agent':
             tools += [tool_stub(n) for n in self.tool_names.get(area, [])]
-        writes = (self.opt.writes == 'all' or
-                  (self.opt.writes == 'trajectory' and family in ('agent', 'policy_tool_agent')))
+        writes = self.opt.writes == 'all' or \
+            (self.opt.writes in ('trajectory', 'reusable') and family in TRAJECTORY_FAMILIES) or \
+            (self.opt.writes == 'reusable' and family in REUSABLE_FAMILIES)
+        content = write_content(episode, family, user, dataset) if writes else None
+        if writes and content is None:
+            counts['write_skipped_long'] += 1
         system = SYSTEM[rng.randrange(len(SYSTEM))]
         role = ROLE.get(family, '').format(area=area)
-        system = ' '.join(p for p in (system, role, WRITE_POLICY if writes else '') if p)
+        system = ' '.join(p for p in (system, role, WRITE_POLICY if content else '') if p)
         messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+        source_index = [None, -1]    # per message: index of its source turn (-1 = request)
         plans: dict[tuple[int, int], Lookup] = {}
 
         def site(lookups: list[Lookup]):
@@ -642,78 +776,99 @@ class Builder:
             batches = [[lk] for lk in lookups] if sequential else [lookups]
             for batch in batches:
                 messages.append({'role': 'assistant', 'content': '',
-                                 'tool_calls': [call('memory_search', {'query': None})
-                                                for _ in batch]})
+                                 'tool_calls': [call('memory_search', {}) for _ in batch]})
+                source_index.append(None)
                 at = len(messages) - 1
                 for j, lk in enumerate(batch):
                     plans[at, j] = lk
-                    extra = dict(lk.flags)
                     messages.append(slot(kb, [r['record_id'] for r in lk.records],
-                                         space_hint=SPACE_HINT.get(lk.kind), **extra))
+                                         space_hint=SPACE_HINT.get(lk.kind), **lk.flags))
+                    source_index.append(None)
 
-        # search sites
-        stages: list[list[Lookup]] = []
-        if any(r['kind'] == 'passage' for r in wanted):
-            for i, rec in enumerate(hop_order(need, [r for r in wanted if r['kind'] == 'passage'])):
-                info = {'need': words(need, 30), 'keys': keys,
-                        **fields_of('passage', rec['text'])}
-                title = ('passage_title',) if 'title' in info else ()
-                base = 'passage' if i == 0 else 'passage_hop'
-                templates = [t for name in (*title, base) for t in TEMPLATES[name]]
-                stages.append([Lookup('passage', [rec], fields=info, templates=tuple(templates))])
-        first_tool_search = family == 'policy_tool_agent'
-        for kinds in STAGES:
-            if first_tool_search and kinds == ('tool_doc',):
+        # placement
+        turns = episode.get('turns') or []
+        steps: list[Step] = []
+        for turn in turns:
+            if turn['role'] != 'assistant':
                 continue
-            lookups = _lookups_for_stage(kinds, [r for r in wanted if r['kind'] != 'passage'],
-                                         {'keys': keys, 'need': words(need, 30)}, rng, counts)
-            if lookups:
-                stages.append(lookups)
+            text = turn['text']
+            if family == 'policy_tool_agent' and text.startswith('Call: '):
+                parsed = _parse_call(text[6:])
+                if parsed is None:
+                    return None, 'unparsable_call', counts
+                steps.append(Step('', tool=parsed['function']['name']))
+            else:
+                steps.append(Step(text))
+        start_records, later = [], {}
+        if turns:
+            where = place_records([r for r in wanted if r['kind'] != 'passage'], steps, family,
+                                                  self.command_df, self.tool_names.get(area, []),
+                                  self.opt.example_reads)
+            for rec in wanted:
+                if rec['kind'] == 'passage':
+                    start_records.append(rec)
+                    continue
+                for step, trigger in where[rec['record_id']]:
+                    counts[f'trigger_{trigger}'] += 1
+                    if step is None:
+                        counts['tool_docs_never_called'] += 1
+                    else:
+                        later.setdefault(step, []).append((rec, trigger))
+        else:
+            start_records = wanted
+
+        # start sites: passages hop by hop, then stages
+        stages: list[list[Lookup]] = []
+        for rec in hop_order(need, [r for r in start_records if r['kind'] == 'passage']):
+            stages.append([Lookup('passage', [rec])])
+        stages += staged([r for r in start_records if r['kind'] != 'passage'], rng, counts)
+        by_step: dict[int, list[list[Lookup]]] = {}
+        for step, placed in sorted(later.items()):
+            triggers = {r['record_id']: t for r, t in placed}
+            by_step[step] = staged([r for r, _ in placed], rng, counts, step=step)
+            for lookups in by_step[step]:
+                for lk in lookups:
+                    lk.trigger = '+'.join(sorted({triggers[r['record_id']] for r in lk.records}))
+        stages += by_step.pop(0, [])
         if self.opt.gold_slots and split == 'train' and len(tokens(answer)) >= OWN_GOLD_TOKENS:
             gold = gold_record(kb, episode)
             self.gold_ids.add(gold['record_id'])
             counts['gold_slots'] += 1
             stages.insert(min(1, len(stages)), [Lookup(
-                'gold_trajectory', [gold], fields={'keys': keys},
-                flags={'gold': True, 'receding_weight': 1.0})])
+                'gold_trajectory', [gold], flags={'gold': True, 'receding_weight': 1.0})])
             self.pending_gold = gold
         if spare and rng.random() < self.opt.distractor_rate:
             rec = spare[rng.randrange(len(spare))]
-            info = {'keys': keys, **fields_of(rec['kind'], rec['text'])}
-            templates = TEMPLATES['tool_doc'] if 'tool' in info else TEMPLATES['distractor']
             stages.insert(rng.randrange(len(stages) + 1), [Lookup(
-                rec['kind'], [rec], fields=info, templates=templates, flags={'distractor': True})])
+                rec['kind'], [rec], flags={'distractor': True})])
             counts['distractors'] += 1
         for lookups in stages:
             site(lookups)
 
         # the answer / trajectory
-        turns = episode.get('turns') or []
         if family == 'function_call':
             calls = (episode.get('verify') or {}).get('gold')
             if calls is None:
                 calls = json.loads(answer)
             messages.append({'role': 'assistant', 'content': '',
                              'tool_calls': [call(c['name'], c.get('arguments') or {}) for c in calls]})
+            source_index.append(0)
         elif turns:
-            docs = {fields_of('tool_doc', r['text']).get('tool'): r for r in wanted
-                    if r['kind'] == 'tool_doc'}
-            searched: set[str] = set()
+            standing = [r for r in wanted if r['kind'] in STANDING]
+            reread = False
+            step = 0
             last_call = None
-            for turn in turns:
+            for t, turn in enumerate(turns):
                 text = turn['text']
+                if turn['role'] == 'assistant':
+                    for lookups in by_step.get(step, []):
+                        site(lookups)
+                    step += 1
                 if turn['role'] == 'assistant' and text.startswith('Call: ') and \
                         family == 'policy_tool_agent':
                     parsed = _parse_call(text[6:])
-                    if parsed is None:
-                        return None, 'unparsable_call', counts
-                    name = parsed['function']['name']
-                    if name in docs and name not in searched:
-                        searched.add(name)
-                        info = {'keys': keys, **fields_of('tool_doc', docs[name]['text'])}
-                        site([Lookup('tool_doc', [docs[name]], fields=info)])
                     messages.append({'role': 'assistant', 'content': '', 'tool_calls': [parsed]})
-                    last_call = name
+                    last_call = parsed['function']['name']
                 elif turn['role'] == 'assistant':
                     messages.append({'role': 'assistant', 'content': text})
                 elif family == 'policy_tool_agent' and text.startswith('Result: '):
@@ -722,38 +877,40 @@ class Builder:
                     messages.append({'role': 'user', 'content': text[10:]})
                 else:
                     messages.append({'role': 'user', 'content': text})
-            unsearched = [r for n, r in docs.items() if n not in searched]
-            if unsearched and family == 'policy_tool_agent':
-                counts['tool_docs_never_called'] += len(unsearched)
+                source_index.append(t)
+                if turn['role'] != 'assistant' and self.opt.failure_rereads and standing and \
+                        not reread and FAILURE.match(text) and \
+                        any(u['role'] == 'assistant' for u in turns[t + 1:]):
+                    reread = True
+                    counts['trigger_observation_failure'] += len(standing)
+                    by_step.setdefault(step, []).insert(0, lookups_for_stage(
+                        STANDING, standing, rng, counts, step=step,
+                        trigger='observation_failure'))
         else:
             messages.append({'role': 'assistant', 'content': answer})
+            source_index.append(0)
 
         write_sites = []
-        if writes:
+        if content:
             messages.append({'role': 'assistant', 'content': '', 'tool_calls': [call(
-                'memory_write', {'content': write_content(episode, family, user, dataset)})]})
+                'memory_write', {'content': content})]})
+            source_index.append(None)
             write_sites.append({'message': len(messages) - 1, 'call': 0, 'site': 'episode_end',
-                                'source': 'own_trajectory'})
+                                'source': 'own_trajectory' if turns else 'own_result'})
             messages.append({'role': 'tool', 'name': 'memory_write',
                              'content': {'write_result': {'kb': kb, 'status': 'stored'}}})
+            source_index.append(None)
 
-        # queries, in causal order
-        answers = [answer] + [a for a in prov.get('answer_aliases') or [] if isinstance(a, str)]
-        tools_text = json.dumps(tools, ensure_ascii=False)
-        texts = {s['record_id']: s['text'] for s in supports.values()}
-        if self.pending_gold is not None:
-            texts[self.pending_gold['record_id']] = self.pending_gold['text']
         search_sites = []
         for (i, j), lk in sorted(plans.items()):
-            prefix, future, allowed = call_context(messages, i, j, tools_text, texts)
-            query, how = self._choose(lk, rng, prefix, future, allowed, answers)
-            counts[f'query_{how}'] += 1
-            messages[i]['tool_calls'][j]['function']['arguments']['query'] = query
-            result = i + 1 + j
-            search_sites.append({'message': i, 'call': j, 'result': result, 'kind': lk.kind,
-                                 'records': len(lk.records), **lk.flags})
+            search_sites.append({'message': i, 'call': j, 'result': i + 1 + j, 'kind': lk.kind,
+                                 'records': len(lk.records),
+                                 'record_ids': [r['record_id'] for r in lk.records],
+                                 'step': lk.step, 'trigger': lk.trigger, **lk.flags})
+            counts[f'searches_{"mid" if lk.step > 0 else "start"}'] += 1
 
-        row = {'episode_id': episode['episode_id'], 'kb': kb, 'split': split,
+        answers = [answer] + [a for a in prov.get('answer_aliases') or [] if isinstance(a, str)]
+        row = {'episode_id': episode['episode_id'], 'kb': kb, 'split': split, 'format': FORMAT,
                'task_family': episode.get('task_family'), 'messages': messages, 'tools': tools,
                'answer': answer, 'verify': episode.get('verify'),
                'provenance': {**prov, 'source_query_time': qt},
@@ -762,7 +919,8 @@ class Builder:
         for key in ('capability', 'allowed_capability', 'choices', 'restore'):
             if key in episode:
                 row.setdefault('episode_meta', {})[key] = episode[key]
-        problems = self.audit(row, texts, answers, qt)
+        problems = self.audit(row, answers, qt, source_index,
+                              n_source=len(turns) if turns else 1)
         if problems:
             counts.update({f'audit_{k}': v for k, v in problems.items()})
             return None, 'audit_failed:' + ','.join(sorted(problems)), counts
@@ -772,44 +930,29 @@ class Builder:
         counts['writes'] += len(write_sites)
         return row, None, counts
 
-    def _choose(self, lk: Lookup, rng, prefix, future, allowed, answers):
-        known = set(prefix)
-        candidates = [fill(t, lk.fields) for t in lk.templates]
-        candidates = list(dict.fromkeys(c for c in candidates if c))
-        rng.shuffle(candidates)
-        title = lk.fields.get('title')
-        if title and not grounded(title, known):
-            # an ungrounded title is allowed (the record's header) but tried last
-            candidates.sort(key=lambda c: title.lower() in c.lower())
-        for c in candidates:
-            if self.hook is not None:
-                c = clean(self.hook(query=c, kind=lk.kind, need=lk.fields.get('need', '')) or c)
-            if leak_reason(c, prefix=prefix, future=future, allowed=allowed, answers=answers,
-                           n=self.opt.ngram) is None:
-                how = 'template'
-                if title and title.lower() in c.lower() and not grounded(title, known):
-                    how = 'title_ungrounded'
-                elif any(contains(tokens(c), tokens(a)) for a in answers if a and len(a) <= SHORT_ANSWER):
-                    how = 'answer_from_prefix'
-                return c, how
-        generic = GENERIC.get(lk.kind, lk.kind.replace('_', ' '))
-        return generic, 'generic'
-
-    def audit(self, row: dict, texts: dict, answers: list[str], query_time: int) -> Counter:
+    def audit(self, row: dict, answers: list[str], query_time: int,
+              source_index: list[int | None] | None = None, n_source: int | None = None) -> Counter:
         """Independent re-check of a finished transcript; returns violations."""
         bad: Counter = Counter()
         messages = row['messages']
-        tools_text = json.dumps(row['tools'], ensure_ascii=False)
         for i, m in enumerate(messages):
             for j, tc in enumerate(m.get('tool_calls') or []):
                 if tc['function']['name'] != 'memory_search':
                     continue
+                if tc['function']['arguments']:
+                    bad['search_has_arguments'] += 1
+                if i + 1 + j >= len(messages):
+                    bad['slot_not_after_call'] += 1
+                    continue
                 result = messages[i + 1 + j]
-                body = result['content']['slot'] if isinstance(result.get('content'), dict) else None
+                body = result['content'].get('slot') if isinstance(result.get('content'), dict) \
+                    else None
                 if result['role'] != 'tool' or body is None:
                     bad['slot_not_after_call'] += 1
                     continue
                 ids = body['record_ids']
+                if not ids:
+                    bad['empty_slot'] += 1
                 if body.get('gold'):
                     if row['split'] != 'train':
                         bad['gold_outside_train'] += 1
@@ -825,15 +968,19 @@ class Builder:
                             bad['record_other_kb'] += 1
                         if r in self.gold_ids:
                             bad['gold_record_unflagged'] += 1
-                query = tc['function']['arguments'].get('query')
-                if not query:
-                    bad['empty_query'] += 1
-                    continue
-                prefix, future, allowed = call_context(messages, i, j, tools_text, texts)
-                reason = leak_reason(query, prefix=prefix, future=future, allowed=allowed,
-                                     answers=answers, n=self.opt.ngram)
-                if reason:
-                    bad[f'query_leak_{reason}'] += 1
+        # the source messages keep their order: every call's prefix is a source prefix
+        if source_index is not None:
+            seen = [s for s in source_index if s is not None]
+            if seen != list(range(-1, (n_source or 0))):
+                bad['source_order'] += 1
+            for i, m in enumerate(messages):
+                if (source_index[i] is None) != (i == 0 or is_memory(m)):
+                    bad['generated_message_outside_memory'] += 1
+        # the generated system prompt copies nothing from the answer or later turns
+        request = tokens(messages[1]['content']) if len(messages) > 1 else []
+        future = [message_text(m) for m in messages[2:]] + answers
+        if leak_reason(messages[0]['content'], prefix=request, future=future, n=self.opt.ngram):
+            bad['system_leak'] += 1
         return bad
 
 
@@ -852,20 +999,27 @@ def corpus_name(corpus: Path) -> str:
     return re.sub(r'-20\d{6}', '', name)
 
 
-def load_index(corpus: Path) -> tuple[dict, dict[str, list[str]], set[str]]:
-    """record_id -> (created_at, kind, domain); tool names per area; domains."""
+def load_index(corpus: Path) -> tuple[dict, dict[str, list[str]], set[str], Counter, dict]:
+    """record_id -> (created_at, kind, domain); tool names per area; domains; command
+    document frequencies over the worked examples; worked examples per task type."""
     index, tools, domains = {}, {}, set()
+    command_df: Counter = Counter()
+    pool: dict[str, list[dict]] = {}
     with (corpus / 'sources.jsonl').open(encoding='utf-8') as handle:
         for line in handle:
             rec = json.loads(line)
             index[rec['record_id']] = (int(rec['created_at']), rec['kind'], rec.get('domain', ''))
             domains.add(rec.get('domain', ''))
+            prov = rec.get('provenance') or {}
             if rec['kind'] == 'tool_doc':
-                area = (rec.get('provenance') or {}).get('area')
-                name = (rec.get('provenance') or {}).get('tool')
-                if area and name:
-                    tools.setdefault(area, []).append(name)
-    return index, {a: sorted(set(n)) for a, n in tools.items()}, domains
+                if prov.get('area') and prov.get('tool'):
+                    tools.setdefault(prov['area'], []).append(prov['tool'])
+            elif rec['kind'] == 'worked_example':
+                command_df.update(set(record_commands(rec['text'])))
+                kind = task_type(prov.get('dataset', ''), prov.get('group'))
+                if kind:
+                    pool.setdefault(kind, []).append(rec)
+    return index, {a: sorted(set(n)) for a, n in tools.items()}, domains, command_df, pool
 
 
 def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | None = None,
@@ -874,8 +1028,9 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
     if output.exists() and not overwrite:
         raise FileExistsError(output)
     kb = corpus_name(corpus)
-    index, tool_names, domains = load_index(corpus)
-    builder = Builder(kb, index, options, per_domain=len(domains) > 1, tool_names=tool_names)
+    index, tool_names, domains, command_df, pool = load_index(corpus)
+    builder = Builder(kb, index, options, per_domain=len(domains) > 1, tool_names=tool_names,
+                      command_df=command_df, pool=pool)
     tmp = output.with_name(output.name + '.pending')
     tmp.mkdir(parents=True, exist_ok=True)
     summary, digests = {}, {}
@@ -887,6 +1042,7 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
         if options.gold_slots else None
     for split, path in episode_files(corpus).items():
         counts, rejects, per_episode, rendered = Counter(), Counter(), Counter(), Counter()
+        steps = Counter()
         digest = hashlib.sha256()
         written = seen = 0
         with path.open(encoding='utf-8') as src, \
@@ -908,6 +1064,7 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
                 out.write(text)
                 digest.update(text.encode())
                 per_episode[len(row['search_sites'])] += 1
+                steps.update(min(s['step'], 10) for s in row['search_sites'])
                 if tok is not None and written < render_count:
                     rendered['checked'] += 1
                     rendered.update(render_check(tok, row))
@@ -916,22 +1073,26 @@ def run_corpus(corpus: Path, output: Path, options: Options, *, limit: int | Non
         summary[split] = {'input': seen, 'written': written, 'rejected': dict(rejects),
                           'counts': dict(sorted(counts.items())),
                           'searches_per_episode': dict(sorted(per_episode.items())),
+                          'search_step': {('10+' if k == 10 else str(k)): v
+                                          for k, v in sorted(steps.items())},
                           'render_check': dict(rendered)}
     if gold_handle is not None:
         gold_handle.close()
         digests['gold-records-train.jsonl'] = hashlib.sha256(
             (tmp / 'gold-records-train.jsonl').read_bytes()).hexdigest()
     source_manifest = corpus / 'manifest.json'
-    manifest = {'format': 1, 'input': str(corpus), 'kb': kb,
+    manifest = {'format': FORMAT, 'input': str(corpus), 'kb': kb,
                 'kb_per_domain': builder.per_domain,
                 'source_manifest_sha256': hashlib.sha256(source_manifest.read_bytes()).hexdigest()
                 if source_manifest.exists() else None,
                 'options': {'seed': options.seed, 'distractor_rate': options.distractor_rate,
                             'gold_slots': options.gold_slots, 'writes': options.writes,
-                            'sequential_rate': options.sequential_rate,
-                            'query_hook': options.query_hook, 'ngram': options.ngram,
-                            'limit': limit},
+                            'sequential_rate': options.sequential_rate, 'ngram': options.ngram,
+                            'pool_examples': options.pool_examples,
+                            'failure_rereads': options.failure_rereads,
+                            'example_reads': options.example_reads, 'limit': limit},
                 'memory_tools': [t['name'] for t in MEMORY_TOOLS],
+                'memory_search_arguments': 'none (query = hidden state at the call)',
                 'slot_render': f'{SPAN_TOKENS["mem"][0]} latent span {SPAN_TOKENS["mem_end"][0]}',
                 'loss_mask': LOSS_POLICY, 'splits': summary, 'sha256': digests}
     (tmp / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -947,18 +1108,27 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('corpora', nargs='+', type=Path, help='corpus directories')
     parser.add_argument('--output-root', type=Path, required=True)
-    parser.add_argument('--tag', default='20260928', help='date tag of output directories')
+    parser.add_argument('--tag', default='20260928v2', help='tag of output directories')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--distractor-rate', type=float, default=0.0,
                         help='share of episodes with one unhelpful search (default off)')
     parser.add_argument('--gold-slots', action='store_true',
                         help='B9: add the own gold trajectory as a flagged, receding-weight '
                              'record (train only)')
-    parser.add_argument('--writes', choices=('trajectory', 'all', 'none'), default='trajectory')
+    parser.add_argument('--writes', choices=('reusable', 'trajectory', 'all', 'none'),
+                        default='reusable',
+                        help='reusable: trajectories plus single-shot families with a reusable '
+                             'result (SQL, table answers, tool calls, code, multi-hop answers); '
+                             'all: every episode')
     parser.add_argument('--sequential-rate', type=float, default=0.3,
                         help='share of multi-call sites split into consecutive single calls')
-    parser.add_argument('--query-hook', help='module:function(query=, kind=, need=) -> str, '
-                        'e.g. a local-LLM rewriter; its output is audited like any query')
+    parser.add_argument('--no-pool-examples', dest='pool_examples', action='store_false',
+                        help='do not add same-task worked examples to agent episodes without any')
+    parser.add_argument('--no-failure-rereads', dest='failure_rereads', action='store_false',
+                        help='do not search the protocol again after a failed action')
+    parser.add_argument('--example-reads', type=int, default=2,
+                        help='trajectories: reads of a worked example, before the first use of '
+                             'each of its most specific commands (distinct steps)')
     parser.add_argument('--ngram', type=int, default=NGRAM)
     parser.add_argument('--limit', type=int, help='episodes per split (smoke runs)')
     parser.add_argument('--overwrite', action='store_true')
@@ -970,8 +1140,9 @@ def main() -> None:
     args = parser.parse_args()
     options = Options(seed=args.seed, distractor_rate=args.distractor_rate,
                       gold_slots=args.gold_slots, writes=args.writes,
-                      sequential_rate=args.sequential_rate, query_hook=args.query_hook,
-                      ngram=args.ngram)
+                      sequential_rate=args.sequential_rate, ngram=args.ngram,
+                      pool_examples=args.pool_examples, failure_rereads=args.failure_rereads,
+                      example_reads=args.example_reads)
     jobs = [(c, args.output_root / f'memory-{corpus_name(c)}-{args.tag}') for c in args.corpora]
 
     def report(corpus, manifest):

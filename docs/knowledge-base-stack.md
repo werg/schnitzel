@@ -10,15 +10,25 @@ restart plan's reading of "spaces" as BGKit compression ratios.
 The knowledge base (KB) is meant to hold knowledge that would otherwise live in
 the parameters of a much larger language model, so that the KB plus a small
 decoder can replace that model in a modular way. It trades disk storage and some
-latency for resident memory: a very large, dynamic mixture of experts whose
-"experts" are stored items, selected per query.
+latency for resident memory. The items are parameters (trained, or extracted
+from text) that act **only in context**: a read places a short latent span in
+the decoder's context, which the decoder reads like any other input. They are not
+expert outputs mixed into the hidden states (owner, 28 September).
+
+**Extreme sparsity, breadth over intensity.** Reads are frequent and as cheap as
+possible: each read touches a handful of items out of a very large KB and costs a
+short span. Capability is meant to come from the breadth of the KB, not from
+how much is read per sample; the experiment tests how far that goes (quality
+against KB size at a fixed per-sample read budget). Retrieval tasks are the
+starting point for training this kind of continual-learning system, not its
+purpose.
 
 For that, stored items must not be isolated copies of source documents.
 Retrieval-augmented QA works fine with localized records (retrieve the right
 passage, read it), and our training tasks started there, which biases intuition
 towards "find the gold record". A parameter store needs the opposite: every
 item carries parts of many sources, every source is spread over many items, and
-a query is answered by combining many items densely. **Superposition is an
+the few items one read touches each carry many sources. **Superposition is an
 explicit goal**, and objectives are chosen to require it.
 
 Earlier SDKB runs showed how hard it is to get an end-to-end lift from learned
@@ -224,13 +234,16 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
      call, so retrieval can start while the call finishes; the
      result is a tool message whose content is the latent span between `<|mem|>`
      and `<|/mem|>`; everything earlier keeps its cache (causal). Writes are
-     `memory_write` calls. A parameter store is consulted often, so SFT and
+     `memory_write()` calls in which the model generates the `<|bg|>` span
+     itself, in the same pass; per-space heads on that pass give the items and
+     keys (no text argument, no second encoding pass; owner, 28 September). A parameter store is consulted often, so SFT and
      B9 data carry many calls per trajectory (several queries per site, query
      diversity per B5); each call costs its few envelope tokens plus the span.
-   - *Routing through gates:* each space retrieves a generous candidate set and
-     every candidate's gate comes from its query-key similarity; gates scale mass
-     exactly, so the task loss trains keys and query heads (the routing half of
-     a mixture of experts).
+   - *Routing through gates:* each space scores a candidate set and every
+     candidate's gate comes from its query-key similarity, sparse so that a read
+     keeps only a handful of items; gates scale mass
+     exactly, so the task loss trains keys and query heads (learned routing,
+     not expert mixing: the read result stays in context).
    - *Tasks:* reconstruction and QA over the R6 KBs, trajectory SFT over the task
      KBs, continuation of KB-domain text.
    - *Superposition pressure:* the storage budget and recursive rewriting passes
@@ -260,9 +273,13 @@ examples; trajectory SFT, later B9 loops). Training mixes tasks over all KBs.
   the output must follow the KB, not the decoder's weights; removing a domain's
   items must remove the capability; inserting new knowledge must keep old
   knowledge.
-- **Context cost of spliced reads.** A 30-rep span every 64 tokens lengthens a
-  sequence by about 47%; injecting read results into the hidden states, like
-  expert outputs, is the later alternative.
+- **Context cost of reads.** Reads stay in context (owner, 28 September), so
+  their cost is span length times frequency: a 30-rep span every 64 tokens
+  lengthens a sequence by about 47%. Read spans are therefore kept short (a few
+  reps per read, the recombiner's count a trained choice under a budget), and a
+  read's gates are sparse (a handful of items with nonzero mass out of the
+  candidate set). The standing breadth experiment measures quality against KB
+  size at a fixed per-sample read budget.
 - **Gradients into producers.** In L1 items are detached from the writer; L2
   reconnects producers by distillation. Where task gradients must reach a
   producer directly (B9 across rounds), selective producer replay applies
@@ -348,7 +365,7 @@ inputs are. Training data is regenerated where the format changes (owner:
 | MLP-matrix operator | built (`src/schnitz/mlp_matrix.py`, 8 property tests), locality kernel since 28 Sep |
 | K1 codecs and recombiner | training (`scripts/train_kb_codecs.py`, run `kb-k1`, restarted 28 Sep with the locality kernel: B1 teacher spans, B3 reader at step 11500, 28M parameters; the uniform-weight run is kept as `kb-k1-uniform`) |
 | KB store (WP2) | built (`src/schnitz/kb_store.py`, 18 tests, schema `schnitz.kb/2`): per-dataset KBs, per-space items with keys, masses, provenance, versions and lineage; cursor-pinned commits; exact chunked scan over memory-mapped keys. Rewrites carry per-(output, input) responsibility shares (each input's shares sum to one, output mass = share-weighted input mass, stored exactly; several outputs require explicit shares), and `lineage()`/`source_composition()` resolve share x mass through `kb_eval.source_composition`. Per-commit segment checksums (xxh3-128, else blake2b), hash-chained with the head in the manifest; `verify()`, optional on open. Live mode: per-item Adam state, live keys separate from the immutable stored keys (cursor-pinned and other-process reads never see live state), `pin_live()` snapshots of a live generation by in-memory copy on write, `checkpoint_live`/`restore_live` with bit-identical resume (optionally discarding later commits), export as a frozen KB. `compact()` writes a KB without superseded rows, their metadata in `history.jsonl`. 200k-item check (4 x 384 positions each): append 12 s, verify 0.3 s, 64-query scan 0.2 s, composition 3 s, checkpoint 4 s, compaction 19 s. Not yet used by a trainer; live mode is single-process |
-| Memory-protocol transcripts (WP3) | built and generated (`scripts/prepare_memory_transcripts.py`, 12 tests): 504,000 of 504,093 episodes of 22 corpora as LFM2 tool-call transcripts in `/archive/corpora/memory-<name>-20260928` (`memory_search` results as empty `<|mem|>…<|/mem|>` slots naming the records, filled with latent spans by the trainer; one `memory_write` per trajectory episode; query leak audit clean). Open: searches only at episode start for agents, template queries, queries may name record header titles (e.g. SQL table names) not yet in the prefix; no trainer reads them yet (L1) |
+| Memory-protocol transcripts (WP3) | version 2 generated (`scripts/prepare_memory_transcripts.py`, 16 tests): 526,709 of 526,802 episodes of 22 corpora in `/archive/corpora/memory-<name>-20260928v2` (v1 dirs kept; the v1 row's 504,093 was a miscount, v1 also had 526,709). `memory_search()` calls without arguments; target record ids per call in the slot and in `search_sites` (with `step` and `trigger`). Agent trajectories search mid-episode: protocol at the start, tool docs and action-specific policy sections before the first call of the tool, ALFWorld know-how before the first action naming a listed object or place, worked examples before the first use of their most specific command and again before the next one, the protocol again after a failed action; ScienceWorld episodes without examples get three same-task examples from the KB's held-out pool (3.2 searches per train episode, was 1.3). Writes (`--writes reusable`): every trajectory plus SQL, table answers, tool calls, code up to 900 characters and multi-hop answers (281,875 writes). Audit clean (records exist, precede `query_time`, one KB, no gold outside train, source messages unchanged and in order, empty search arguments); LFM2.5-350M render check clean on the first 200 transcripts of every split. Open: `action_*` placement uses the agent's own next action (label side); 93 reasoning-gym episodes still have no records; no trainer reads them yet (L1) |
 | Evaluation harness (WP4) | built (`scripts/benchmark_models.py`, `src/schnitz/kb_eval.py`, verifiers in `src/schnitz/task_verifiers.py`; 15 tests): benchmark of reference models on 8 task corpora with oracle context and closed book; superposition metrics, counterfactual edits, removal and insertion reports. Smoke-tested on 350M and 1.2B (5 episodes per task); reference runs (8B-A1B, Ling-3.0-tiny, 24B-A2B) pending; kb_eval not yet called by a trainer |
 | K2 keys, K3a superposition operator | not built (R5d5 key table exists) |
 | L1, L2 | not built |
