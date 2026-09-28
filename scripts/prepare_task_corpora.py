@@ -715,6 +715,47 @@ def recall_text(output: Path, *, sources: list[Path], tokenizer: str | None, win
     return writer.close({'domain': rt.DOMAIN, 'generator': 'schnitz.recall_text',
                          'sources_files': [str(s) for s in sources],
                          'tokens': tokenizer or 'regex words and punctuation', **summary})
+# -- parallel-version recall ------------------------------------------------------
+PARALLEL_RAW = RAW / 'parallel-20260928/scrollmapper-bible_databases'
+
+
+def parallel_recall(output: Path, *, versions: list[str] | None, targets: list[str],
+                    languages: list[str], train: int, validation: int, min_versions: int,
+                    seed: int, tokenizer: str | None) -> dict:
+    """Recall a passage in a target Bible translation that the KB never stores, from the
+    other stored translations of the same verses (``schnitz.parallel_recall``)."""
+    from schnitz import parallel_recall as pr
+    stored = versions or [c for c, v in pr.VERSIONS.items() if v.language in languages]
+    count = pr.approx_tokens
+    if tokenizer:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(tokenizer, local_files_only=True)
+        count = lambda text: len(tok(text, add_special_tokens=False)['input_ids'])  # noqa: E731
+    result = pr.build(PARALLEL_RAW, stored_codes=stored, target_codes=targets, seed=seed,
+                      train_episodes=train, validation_episodes=validation,
+                      min_versions=min_versions, count_tokens=count, domain=pr.DOMAIN)
+    writer = Writer(output, pr.DOMAIN)
+    for rec in result['records']:          # the whole KB, referenced or not
+        writer.sources[rec['record_id']] = rec
+    for split, rows in result['episodes'].items():
+        for row in rows:
+            writer.add(split, row, [])
+    used = {pr.VERSIONS[c].file for c in [*result['stored_codes'], *targets, pr.REFERENCE]}
+    files = json.loads((PARALLEL_RAW / 'files.json').read_text())
+    return writer.close({
+        'source': 'github.com/scrollmapper/bible_databases', 'raw': str(PARALLEL_RAW),
+        'raw_files': [f for f in files if f['path'] in used],
+        'stored_versions': {c: {'title': pr.VERSIONS[c].title,
+                                'language': pr.VERSIONS[c].language,
+                                'licence': pr.VERSIONS[c].licence, **result['stored'][c]}
+                            for c in result['stored_codes']},
+        'target_versions': {c: {'title': pr.VERSIONS[c].title,
+                                'licence': pr.VERSIONS[c].licence} for c in targets},
+        'versification_reference': pr.REFERENCE, 'min_versions': min_versions, 'seed': seed,
+        'token_counter': tokenizer or 'approx (chars / 4)',
+        'record_kind': pr.KIND, 'task_family': pr.FAMILY,
+        'validation_chapters': sum(s == 'validation' for s in result['split_of'].values()),
+        'episode_rejects': result['rejected'], 'summary': pr.summary(result)})
 
 
 def main() -> None:
@@ -786,6 +827,18 @@ def main() -> None:
     rc.add_argument('--max-tokens', type=int, default=1500)
     rc.add_argument('--continuations', type=int, default=2, help='per document')
     rc.add_argument('--middles', type=int, default=1, help='per document')
+    pr_ = sub.add_parser('parallel-recall')
+    pr_.add_argument('--versions', nargs='+', help='stored versions (default: all PD versions '
+                     'of --kb-languages); target versions are never stored')
+    pr_.add_argument('--target-versions', nargs='+', default=['WEB', 'BBE'])
+    pr_.add_argument('--kb-languages', nargs='+', default=['en'],
+                     help='languages of the stored versions: en fr de es zh ja')
+    pr_.add_argument('--train', type=int, default=4000)
+    pr_.add_argument('--validation', type=int, default=300)
+    pr_.add_argument('--min-versions', type=int, default=3)
+    pr_.add_argument('--seed', type=int, default=0)
+    pr_.add_argument('--tokenizer', help='tokenizer directory for the 64-200 token target '
+                     'window (default: characters / 4)')
     for s in sub.choices.values():
         s.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -816,6 +869,12 @@ def main() -> None:
                                validation=args.validation, min_tokens=args.min_tokens,
                                max_tokens=args.max_tokens, continuations=args.continuations,
                                middles=args.middles)
+    elif args.dataset == 'parallel-recall':
+        manifest = parallel_recall(args.output, versions=args.versions,
+                                   targets=args.target_versions, languages=args.kb_languages,
+                                   train=args.train, validation=args.validation,
+                                   min_versions=args.min_versions, seed=args.seed,
+                                   tokenizer=args.tokenizer)
     else:
         manifest = sql_corpus(args.output, args.dataset, full_rows=args.full_rows,
                               sample_rows=args.sample_rows, value_limit=args.value_limit,

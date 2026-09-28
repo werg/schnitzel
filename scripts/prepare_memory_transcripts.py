@@ -41,7 +41,8 @@ trajectories of the same task type (``--pool-examples``).
 Placement (single-shot tasks): all searches precede the answer, grouped into stages
 (rules/protocol, schema, values, evidence, tool docs, know-how, examples, background);
 multi-hop passages are searched one hop per site, ordered so that a hop's title is
-grounded in the question or in passages read before it.
+grounded in the question or in passages read before it; parallel-recall passages (other
+translations of the requested verses) are searched with one call per translation.
 
 Placement (trajectories), per record; a site sits right before the agent turn
 ``step`` (0 = before the first turn):
@@ -139,17 +140,19 @@ ROLE = {
              'and worked examples are in the knowledge base.',
     'text_to_sql': 'Database schemas, column values and notes are in the knowledge base.',
     'stored_table_qa': 'Database contents are in the knowledge base.',
+    'parallel_recall': 'Other translations of the requested text are in the knowledge base.',
 }
 WRITE_POLICY = 'When the task is done, store reusable results with memory_write().'
 
 # search stages, in order; kinds of one stage share a site
 STAGES = (('protocol', 'policy', 'rules'), ('schema',), ('column_values', 'table_rows'),
-          ('evidence',), ('tool_doc',), ('know_how',), ('worked_example',), ('background',))
+          ('evidence',), ('tool_doc',), ('know_how',), ('worked_example',), ('parallel_passage',),
+          ('background',))
 STANDING = ('protocol', 'policy', 'rules')
 SPACE_HINT = {'column_values': 'fine', 'table_rows': 'fine', 'schema': 'fine',
               'evidence': 'fine', 'tool_doc': 'fine', 'background': 'coarse',
               'worked_example': 'coarse', 'protocol': 'coarse', 'policy': 'coarse',
-              'know_how': 'coarse', 'rules': 'coarse'}
+              'know_how': 'coarse', 'rules': 'coarse', 'parallel_passage': 'fine'}
 HEADERS = {
     'schema': r'^Database (?P<db>\S+), table (?P<table>.+?) \(schema\):',
     'column_values': r'^Database (?P<db>\S+), values of (?P<table>[^.\n]+)\.(?P<column>[^:\n]+):',
@@ -157,6 +160,7 @@ HEADERS = {
     'evidence': r'^Database (?P<db>\S+), note:',
     'tool_doc': r'^(?:Tool: (?P<tool>\S+)|(?P<area>\w+) tool (?P<tool2>[^:\s]+):)',
     'passage': r'^Title: (?P<title>[^\n]+)',
+    'parallel_passage': r'^(?P<title>[^\n]+?) \[(?P<version>[^\]\n]+)\], (?P<ref>[^\n]+)',
 }
 STOP = set('''a an the of in on at to for from by with and or but is are was were be been being
 do does did has have had what which who whom whose when where why how that this these those it
@@ -470,6 +474,8 @@ def lookups_for_stage(kinds: tuple, records: list[dict], rng: random.Random,
             key = (rec['kind'], info.get('db'), info.get('table'))
         elif rec['kind'] in ('tool_doc', 'evidence'):
             key = (rec['kind'], rec['record_id'])
+        elif rec['kind'] == 'parallel_passage':     # one call per stored translation
+            key = (rec['kind'], info.get('version'))
         else:
             key = (rec['kind'],)
         groups.setdefault(key, []).append(rec)
