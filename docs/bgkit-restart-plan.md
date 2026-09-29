@@ -1248,3 +1248,10 @@ log your decisions and changes of direction"), newest last.
   slots name 13-21 records, and a group of 8 episodes about 140, so per-batch groups
   need `--size` above that. An inverse-cloze slot has a median of 6 positives. The
   planned curriculum is 64 -> 1k -> the full 13k+ per episode.
+- 29 September: the K2 data side is merged. It has inverse-cloze retrieval corpora
+  for recall-text r8 and citance recall (4000/300, validation on unseen
+  documents/papers), `l1 subkb` (small per-episode KBs from stored items with
+  random, teacher-mined or mixed distractors) and `--hard-negatives` /
+  `--dump-hits`. The B3 span caches at level s1 are complete, so B4 restarts from
+  step 2500 with `--slot-spans spans-b3-s1 --slot-cap 64`: write prefixes' memory
+  slots are filled with latent spans instead of left empty.
