@@ -1204,3 +1204,17 @@ log your decisions and changes of direction"), newest last.
 - 29 September (owner): a deeper query layer is tested as a required arm: the query is
   read at layer 12 with layers < 12 trainable (`--query-layer`, default 8), next to
   layer 8 with and without the prefix pool.
+- 29 September (owner): monitor and adjust autonomously toward a working system. The
+  retrieval options queue, in order, each gated on the previous showing validation
+  recall above chance on unseen documents at full KB size:
+  1. Decoder-formulated queries: layer 8 vs layer 12, pool on/off.
+  2. K2 with inverse-cloze data from every corpus, a KB-size curriculum (small ->
+     13k+), mined hard negatives (teacher near-misses, our own top wrong hits) and
+     teacher alignment.
+  3. L1a content use on working retrieval: heads first frozen, then joint. Gold
+     reads, contrast and null prefix stay available.
+  4. Multi-read checks: later calls in an episode must query differently.
+  5. Superposed rows over the leaf banks again, then the write fit.
+  Other options held: small KBs with mined distractors as a focused stage;
+  adversarially written distractors as a robustness probe only; redundancy sweeps
+  (r2 vs r8, r4 vs r32).
