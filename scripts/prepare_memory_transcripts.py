@@ -20,6 +20,12 @@ structured form ``tok.apply_chat_template(messages, tools=tools)`` renders:
   the slot of the hop's read (``alternatives``, audited like the slot's records), so the
   L1 bank build (``schnitz.kb.bank.needed_records``) stores every copy; the slot's
   ``record_ids`` stay the one copy the transcript reads;
+- neutral records: a slot's ``neutral`` names records that are neither positives nor
+  negatives of its L1 retrieval loss (banked and readable, audited like the slot's
+  records): the episode's ``neutral`` (recall-text: every other record of the target's
+  document) and the positives of the episode's other slots; only for episodes that
+  carry ``neutral`` and for parallel recall with shared reads (other translations of
+  adjacent verses);
 - the answer: an ``assistant`` message (text, or native tool calls for function
   calling); multi-turn corpora keep their ``turns`` (customers and observations as
   ``user``, API results as ``tool``, agent API calls as native tool calls);
@@ -891,6 +897,33 @@ class Builder:
                 if alts:
                     lk.flags['alternatives'] = list(dict.fromkeys(alts))
                     counts['alternative_records'] += len(lk.flags['alternatives'])
+        # neutral records (``neutral``: neither positives nor negatives of a slot's
+        # retrieval loss, banked and readable): the episode's ``neutral`` (recall-text:
+        # the other records of the target's document) and the other slots' positives of
+        # the same episode (near-duplicates: overlapping windows, other translations of
+        # adjacent verses); only for episodes that carry ``neutral`` and parallel shared
+        # reads
+        if 'neutral' in episode or (family == 'parallel_recall'
+                                    and self.opt.parallel_reads == 'shared'):
+            pool = []
+            for r in episode.get('neutral') or []:
+                if r in self.index and self.index[r][0] < qt and self.kb_of(r) == kb:
+                    pool.append(r)
+                else:
+                    counts['neutral_dropped'] += 1
+            every = [*stages, *(ls for v in by_step.values() for ls in v)]
+            pool += [r for lookups in every for lk in lookups
+                     for r in [*(x['record_id'] for x in lk.records),
+                               *(lk.flags.get('alternatives') or ())]]
+            pool = list(dict.fromkeys(pool))
+            for lookups in every:
+                for lk in lookups:
+                    own = {r['record_id'] for r in lk.records} | \
+                        set(lk.flags.get('alternatives') or ())
+                    neutral = [r for r in pool if r not in own]
+                    if neutral:
+                        lk.flags['neutral'] = neutral
+                        counts['neutral_records'] += len(neutral)
         if self.opt.gold_slots and split == 'train' and len(tokens(answer)) >= OWN_GOLD_TOKENS:
             gold = gold_record(kb, episode)
             self.gold_ids.add(gold['record_id'])
@@ -1042,7 +1075,10 @@ class Builder:
                     alternatives = body.get('alternatives') or []
                     if alternatives and not set(ids) <= set(alternatives):
                         bad['slot_not_in_alternatives'] += 1
-                    for r in dict.fromkeys([*ids, *alternatives]):
+                    neutral = body.get('neutral') or []
+                    if set(neutral) & {*ids, *alternatives}:
+                        bad['neutral_overlaps_positive'] += 1
+                    for r in dict.fromkeys([*ids, *alternatives, *neutral]):
                         if r not in self.index:
                             bad['record_not_in_kb'] += 1
                         elif self.index[r][0] >= query_time:

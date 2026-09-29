@@ -447,7 +447,18 @@ applies to every stage.
   −log Σ_{positive} softmax(score / τ), positives being the items of the slot's
   records (after rewriting, their descendants weighted by responsibility share),
   plus the same loss's recall@k in the logs. It starts routing (K2) and is
-  annealed in L1 as the task loss takes over (`schnitz.kb.losses`).
+  annealed in L1 as the task loss takes over (`schnitz.kb.losses`). Positives
+  also include the slot's `alternatives` (records that alone hold its content).
+  *Neutral* items (29 September) are neither positives nor negatives. They are
+  records that share most of their text with the positives without holding the
+  slot's content. On recall-text these are the other windows of the target's
+  document, which overlap only the cue or sit next to the target. The slot's
+  `neutral` list leaves the loss: neutral scored candidates are dropped, and so are
+  neutral in-batch negatives. They may still be retrieved and read, they are
+  banked, and they are authorized like the other named items. A positive named
+  neutral stays positive; on rows, a row covering a neutral item is neutral unless
+  it covers a positive. Without them the retrieval loss asked the keys to separate
+  near-identical items, and recall-text retrieval stayed at chance.
 - **Rewarding spread-out use.** Breadth needs many items to be useful, not a few
   popular ones: a balance loss n · Σ_j f_j · p_j over the items a batch touches
   (f_j an exponential moving average of item j's share of read mass, p_j its
@@ -561,7 +572,8 @@ inputs are. Training data is regenerated where the format changes (owner:
     detached; item values fixed); `--init-reader` starts L1a from a K2 run's key heads
     and gate offsets and re-keys the KBs. The retrieval loss adds in-batch negatives:
     the target items of the batch's other slots in the same KB (never another KB's),
-    up to `--inbatch-negatives` (64) per space. A read item's gate is multiplied by its
+    up to `--inbatch-negatives` (64) per space, minus the slot's own positives and
+    `neutral` items (5.2). A read item's gate is multiplied by its
     stored mass and by an optional per-item weight (`weights=`, B9's gold weight).
     Optional (5.1 step 7): the content contrast (`--contrast-weight`,
     `--contrast-margin`), the null prefix (`--null-prefix`) and the reader decoder's

@@ -18,8 +18,11 @@ the target by one residue class of windows (windows ``window / stride`` starts a
 tile the text, so there are about ``window / stride`` of them). ``alternatives``
 partitions the target at the window grid: per segment, every record that contains it
 whole, so a transcript slot names every copy of its part of the target and the L1 bank
-build stores all of them. Train and validation are split by document; validation
-documents' windows are in the KB.
+build stores all of them. ``neutral`` lists every other record of the episode's
+document (windows overlapping only the cue or next to the target, the title record):
+they share most of their text with the positives, so the L1 retrieval loss scores
+them neither as positives nor as negatives. Train and validation are split by
+document; validation documents' windows are in the KB.
 
 Tokens come from a pluggable ``offsets(text) -> [(start, end), ...]``: the LFM2.5
 tokenizer's offset mapping for corpora, a regex word/punctuation tokenizer for tests.
@@ -240,12 +243,15 @@ def episodes_for(c: Cut, split: str, seed: int, stride: int, redundancy: int, *,
         if not groups:
             return
         rng.shuffle(groups)
+        named = set(supports).union(*map(set, segments))
+        neutral = list(dict.fromkeys(r['record_id'] for r in c.records
+                                     if r['record_id'] not in named))
         query = PREFIX + rng.choice(PROMPTS[kind]).format(cue=cue.strip())
         out.append({
             'episode_id': f'{DOMAIN}-{doc.key}-{kind}-{index}',
             'environment': f'{DOMAIN}-{split}', 'query': query, 'answer': answer,
             'query_time': 2, 'required_ids': supports, 'sufficient_groups': groups,
-            'alternatives': segments, 'support_annotation': 'verified',
+            'alternatives': segments, 'neutral': neutral, 'support_annotation': 'verified',
             'task_family': 'synthetic_recall',
             'supports': [{'record_id': r, 'text': by_id[r]['text'], 'created_at': 1,
                           'kind': 'passage'} for r in supports],
@@ -314,6 +320,8 @@ def build(documents: list[Document], offsets: Offsets, *, window: int = 96, stri
         'supports_per_episode_median': sorted(len(e['supports']) for e in rows)[len(rows) // 2]
         if rows else None,
         'groups_per_episode': dict(Counter(len(e['sufficient_groups']) for e in rows)),
+        'neutral_per_episode_median': sorted(len(e['neutral']) for e in rows)[len(rows) // 2]
+        if rows else None,
         'records_per_group_median': sorted(len(e['sufficient_groups'][0]) for e in rows)[
             len(rows) // 2] if rows else None}
     return list(records.values()), episodes, summary

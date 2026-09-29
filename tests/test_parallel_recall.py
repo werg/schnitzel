@@ -216,5 +216,11 @@ def test_memory_transcript_shared_reads_with_alternatives(fixture):
             assert {by_id[a]['version'] for a in alts} == set(p['covering_versions'])
             for a in alts[1:]:
                 assert by_id[a]['verse_start'] <= hi and by_id[a]['verse_end'] >= lo
+            # neutral: the episode's other slots' positives (other versions' adjacent
+            # verses), never this slot's own
+            neutral = slot.get('neutral') or []
+            assert not set(neutral) & set(alts)
+            assert set(neutral) | set(alts) == {r for s in slots for r in s['alternatives']}
         assert covered == set(range(p['verse_start'], p['verse_end'] + 1))
+        assert not builder.audit(row, [ep['answer']], 2)
     assert len(primaries) > 1                          # the read version varies

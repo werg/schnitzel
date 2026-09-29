@@ -92,3 +92,22 @@ def test_transcript_slots_name_every_copy():
     assert named == {s['record_id'] for s in e['supports']}
     assert row['messages'][-1]['content'] == e['answer']
     assert not b.audit(row, [e['answer']], 2)
+    # neutral: every other record of the document, never a slot's own positives
+    document = {r['record_id'] for r in recs
+                if r['provenance']['document'] == e['provenance']['document']}
+    for s in slots:
+        assert s['neutral'] and not set(s['neutral']) & {*s['record_ids'], *s['alternatives']}
+        assert set(s['neutral']) | set(s['alternatives']) == document
+    assert set(e['neutral']) <= set(slots[0]['neutral'])
+
+
+def test_neutral_is_the_rest_of_the_document():
+    recs, eps, summary = build()
+    by_doc = {}
+    for r in recs:
+        by_doc.setdefault(r['provenance']['document'], set()).add(r['record_id'])
+    for e in [x for rows in eps.values() for x in rows]:
+        supports = {s['record_id'] for s in e['supports']}
+        assert set(e['neutral']) == by_doc[e['provenance']['document']] - supports
+        assert len(e['neutral']) == len(set(e['neutral']))
+    assert summary['neutral_per_episode_median'] > 0

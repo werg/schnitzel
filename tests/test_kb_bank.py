@@ -102,8 +102,9 @@ def test_record_sources_banks_every_alternative_copy(tmp_path):
     (transcripts / 'manifest.json').write_text(json.dumps(
         {'input': str(corpus), 'kb': 'c', 'kb_per_domain': False}))
     row = {'episode_id': 'e0', 'kb': 'c', 'messages': [{'role': 'tool', 'content': {'slot': {
-        'kb': 'c', 'record_ids': ['r1'], 'alternatives': ['r1', 'r3', 'r4']}}}]}
+        'kb': 'c', 'record_ids': ['r1'], 'alternatives': ['r1', 'r3', 'r4'],
+        'neutral': ['r5']}}}]}
     (transcripts / 'transcripts-train.jsonl').write_text(json.dumps(row) + '\n')
-    assert set(bank.record_sources([transcripts], {'train': None})) == {'r1', 'r3', 'r4'}
+    assert set(bank.record_sources([transcripts], {'train': None})) == {'r1', 'r3', 'r4', 'r5'}
     assert bank.needed_records([{**row, '_dir': 'x'}]) == {
-        'c': dict.fromkeys(['r1', 'r3', 'r4'], 'x')}
+        'c': dict.fromkeys(['r1', 'r3', 'r4', 'r5'], 'x')}
