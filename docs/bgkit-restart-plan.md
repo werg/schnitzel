@@ -1354,3 +1354,11 @@ log your decisions and changes of direction"), newest last.
   freed GPU share (0.24) goes to it. These codecs are used for the next bank builds.
   Query arms at step 600: layer 12 (c) 0.14/0.14/0.37/0.51 (A-D) vs layer 8 (a)
   0.20/0.16/0.43/0.40; the final-layer arm (f) runs.
+- 29 September: the final-layer query arm (f: call-token state at the last layer,
+  trainable backbone, per-space projections; the LLM-embedder recipe) leads clearly.
+  Validation search recall on unseen documents at step 450 is 0.34/0.41/0.54/0.64
+  (A-D), against 0.20/0.16/0.43/0.40 for layer 8 and 0.14/0.14/0.37/0.51 for layer
+  12 at step 600. The query is formulated by the network itself with only a
+  projection on top (owner preference). Next: K2 on inverse-cloze recall-text with
+  the arm (f) setup. Its banks (K1 codecs of step 15500, the recall-text span cache
+  reused) are building in `kb-k2-ic`.
