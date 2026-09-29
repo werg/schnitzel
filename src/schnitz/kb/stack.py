@@ -116,6 +116,14 @@ class SuperpositionOperator(nn.Module):
             max_pairs=max_pairs)
 
 
+def rms(x: torch.Tensor) -> torch.Tensor:
+    """The root mean square of a state (detached): the query modules' outputs are added
+    in units of the call state's scale, which differs by orders of magnitude between
+    layers (0.24 at layer 8 of LFM2.5-350M, about 70 at layer 16), so a zero-initialized
+    projection reaches a useful size at the same rate at any query layer."""
+    return x.detach().pow(2).mean().sqrt()
+
+
 class QueryPool(nn.Module):
     """Attention pooling of the query state over the call's causal prefix
     (``KeyHeads(pool=True)``; 29 September retrieval diagnosis).
@@ -127,8 +135,8 @@ class QueryPool(nn.Module):
     cannot even fit the training sites over the full KB). The request is in the earlier
     tokens. The pool has ``heads`` learned attention queries over the normalized
     query-layer states of every position up to and including the call (causal: nothing
-    after it); the pooled heads are projected and added to the call state,
-    ``h_call + out(pooled)``. ``out`` starts at zero, so an untrained pool returns the
+    after it); the pooled heads are projected and added to the call state in units of
+    its scale, ``h_call + rms(h_call) out(pooled)``. ``out`` starts at zero, so an untrained pool returns the
     call state exactly (the query of earlier readers), and its attention starts uniform
     (the prefix mean). A call-conditioned attention (query from the call state) fit the
     training sites as well but generalized worse (held-out R@8 0.23 vs 0.48)."""
@@ -148,7 +156,8 @@ class QueryPool(nn.Module):
         row is the call's own state. Returns the pooled query state (width,)."""
         x = self.norm(prefix.float())
         att = torch.softmax(self.score(x), 0)                 # (T, heads)
-        return prefix[-1].float() + self.out((att.t() @ x).reshape(-1))
+        call = prefix[-1].float()
+        return call + rms(call) * self.out((att.t() @ x).reshape(-1))
 
 
 class QueryFormer(nn.Module):
@@ -157,7 +166,7 @@ class QueryFormer(nn.Module):
     cross-attend over the query-layer states of the call's causal prefix (up to and
     including the call), then attend to each other; pre-LN blocks with MLPs. Each
     space's latents are projected and added to the call state, so each space gets its
-    own query state (``h_call + out_s(z_s)``). The projections start at zero: an
+    own query state (``h_call + rms(h_call) out_s(z_s)``). The projections start at zero: an
     untrained former returns the call state exactly for every space. Unlike
     ``QueryPool`` its attention is conditioned on the call, so the calls of one
     episode can ask for different things."""
@@ -195,7 +204,9 @@ class QueryFormer(nn.Module):
         z = z + self.self_attn(q, q, q, need_weights=False)[0]
         z = (z + self.mlps[1](z))[0]
         call = prefix[-1].float()
-        return {s: call + self.out[s](z[i * self.latents:(i + 1) * self.latents].reshape(-1))
+        scale = rms(call)
+        return {s: call + scale * self.out[s](z[i * self.latents:(i + 1) * self.latents]
+                                              .reshape(-1))
                 for i, s in enumerate(self.spaces)}
 
 

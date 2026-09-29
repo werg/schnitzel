@@ -1432,6 +1432,24 @@ def test_query_former_is_causal_call_conditioned_and_trains(tmp_path):
         torch.testing.assert_close(ctx.reader.reread(read.state, values, scales), read.span)
 
 
+@pytest.mark.parametrize('module', ['pool', 'former'])
+def test_query_modules_act_in_units_of_the_call_state(module):
+    """Scaling the prefix scales the query state: the module's output is added in units
+    of the call state's RMS, so it matters as much at layer 16 (RMS ~ 2) as at 8 (0.01)."""
+    from schnitz.kb.stack import KeyHeads
+    torch.manual_seed(0)
+    heads = KeyHeads(HIDDEN, 16, **{module: True})
+    with torch.no_grad():
+        for p in getattr(heads, module).parameters():
+            p.normal_(0, 0.3)
+    x = torch.randn(6, HIDDEN)
+    small, large = heads.query_state(x), heads.query_state(100.0 * x)
+    for s in (SPACES if module == 'former' else [None]):
+        a, b = (small[s], large[s]) if s else (small, large)
+        torch.testing.assert_close(b, 100.0 * a, rtol=1e-2, atol=1e-2)
+        assert not torch.allclose(a, x[-1], atol=1e-3)
+
+
 def test_heads_without_a_former_load_into_a_former_reader():
     from schnitz.kb.stack import KeyHeads
     torch.manual_seed(0)
