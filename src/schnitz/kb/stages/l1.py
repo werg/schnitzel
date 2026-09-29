@@ -332,8 +332,11 @@ class Frozen:
 
     def __init__(self, lm, query_layer: int, autocast=None, train_below: int = 0,
                  checkpointing: bool = False, train: str = 'all', lora: int = 0,
-                 lora_alpha: float | None = None):
+                 lora_alpha: float | None = None, query_only: bool = False):
         self.parent = None
+        # --decoder-query-only: the trained layers formulate the query only; the task pass
+        # (``final``) runs the parent decoder, so the reader cannot learn the answers
+        self.query_only = query_only and train_below > 0
         self.own = torch.nn.ModuleList()
         self.lora = torch.nn.ModuleDict()
         if train not in ('all', 'attention'):
@@ -406,6 +409,8 @@ class Frozen:
         return box['h'].float()
 
     def final(self, x: torch.Tensor) -> torch.Tensor:
+        if self.query_only:
+            return self.parent.final(x)
         with self.autocast():
             return self.inner(inputs_embeds=x, use_cache=False).last_hidden_state
 
@@ -1253,7 +1258,8 @@ def parent_kl(ctx: Context, ep: Episode) -> torch.Tensor | None:
     next-token distributions on the episode's no-read context (empty memory spans, no
     prefix) at its loss positions, mean over positions."""
     parent = ctx.frozen.parent
-    if parent is None or not ctx.frozen.trains or ep.targets.numel() == 0:
+    if parent is None or ctx.frozen.query_only or not ctx.frozen.trains \
+            or ep.targets.numel() == 0:
         return None
     from schnitz.kb.losses import kl
     x = ctx.frozen.embed(ep.ids)[None]
@@ -1895,6 +1901,7 @@ def train(args) -> None:
                     train_below=resolve_train_below(args),
                     train=getattr(args, 'decoder_train', 'all'),
                     lora=getattr(args, 'decoder_lora', 0),
+                    query_only=getattr(args, 'decoder_query_only', False),
                     checkpointing=args.decoder_checkpoint)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
@@ -2404,6 +2411,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                    help='--decoder-train-below: train every copied layer, or only the '
                         'full-attention ones (the only layers that move information to the '
                         'call position from far)')
+    t.add_argument('--decoder-query-only', action='store_true',
+                   help='--decoder-train-below: the trained layers formulate the query only; '
+                        'the task pass reads with the parent decoder (29 Sep: with the task '
+                        'loss, LoRA on all layers memorized the training answers)')
     t.add_argument('--decoder-lora', type=int, default=0,
                    help='--decoder-train-below: rank of LoRA adapters on the trained copies\' '
                         'linear modules, their base weights frozen (0: train the copies)')

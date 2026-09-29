@@ -1498,3 +1498,29 @@ def test_decoder_train_attention_trains_only_attention_copies(tmp_path):
     ids = {id(p) for p in frozen.trainable_parameters()}
     assert ids == {id(p) for i in (1, 3) for p in frozen.own[i].parameters()}
     assert set(frozen.state()) == {'decoder_layers'}
+
+
+def test_decoder_query_only_reads_with_the_parent(tmp_path):
+    """--decoder-query-only: the trained layers shape the queries (the retrieval loss
+    reaches them) but the task pass reads with the parent decoder, so the task loss
+    reaches them only through the queries and the reader cannot learn the answers."""
+    lm, _ = tiny_lm()
+    frozen = l1.Frozen(lm, 4, train_below=4, lora=4, query_only=True)
+    for p in frozen.trainable_parameters():
+        p.requires_grad_(True)
+    with torch.no_grad():
+        for p in frozen.lora.parameters():
+            p.normal_(0, 0.1)
+    x = frozen.embed(torch.tensor(IDS))[None]
+    with torch.no_grad():
+        torch.testing.assert_close(frozen.final(x), frozen.parent.final(x), rtol=0, atol=0)
+        assert not torch.equal(frozen.mid(x), frozen.parent.mid(x))
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    ctx = l1.Context(frozen, reader(), {'ds': kb})
+    ep = episode(IDS, [3, 10], [6, 13])
+    assert l1.parent_kl(ctx, ep) is None
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in frozen.trainable_parameters())
+    assert all(p.grad is None for p in lm.parameters())
