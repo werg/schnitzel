@@ -1201,3 +1201,6 @@ log your decisions and changes of direction"), newest last.
   cannot run on cached decoder states: it keeps the decoder in the loop. Inverse-cloze
   retrieval data, a KB-size curriculum and mined hard negatives are the next K2
   additions once decoder-formulated queries retrieve above chance.
+- 29 September (owner): a deeper query layer is tested as a required arm: the query is
+  read at layer 12 with layers < 12 trainable (`--query-layer`, default 8), next to
+  layer 8 with and without the prefix pool.
