@@ -261,9 +261,9 @@ def test_generation_executes_a_read_when_the_call_is_emitted(torch_conv):
     assert attempt.generated == len(script)
     paren = 4 + 3                        # prompt, then '<|tool_call_start|>' '[' 'memory_search(' ')'
     assert attempt.calls == [paren] and attempt.tokens[paren] == 22
-    # the query is the query-layer state at ')' from a pass over exactly the prefix
+    # the read gets the query-layer states of exactly the prefix, the state at ')' last
     prefix = embed([1, 2, 3, 4, 10, 20, 21, 22])
-    torch.testing.assert_close(calls[0], frozen.mid(prefix[None])[0][-1])
+    torch.testing.assert_close(calls[0], frozen.mid(prefix[None])[0])
     # the span sits between <|mem|> and <|/mem|> in a tool message, then a new assistant turn
     mem = attempt.mems[0]
     assert attempt.tokens[mem] == MEM and attempt.tokens[mem + 1:mem + 4] == [None] * 3

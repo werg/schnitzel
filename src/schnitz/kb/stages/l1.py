@@ -121,13 +121,14 @@ from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, prod
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
                              L1Reader, ReadConfig, TeacherSite, current_ids, producer_index,
                              source_index, splice)
-from schnitz.kb.stack import SPACES, KeyHeads
+from schnitz.kb.stack import KEY_WIDTH, SPACES, KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.memory_transcripts import render_ids, render_text
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
 
 MEM, MEM_END = SPAN_TOKENS['mem'][0], SPAN_TOKENS['mem_end'][0]
+KEY_WIDTH_ALL = max(KEY_WIDTH.values())    # every space's keys share one width (256)
 MEM_ID = SPAN_TOKENS['mem'][1]
 BG_ID = SPAN_TOKENS['bg'][1]
 MEMORY_NAMES = {t['name'] for t in MEMORY_TOOLS}
@@ -504,6 +505,7 @@ class KeyTeacher:
     cache: object                  # teacher_keys.TeacherKeys
     tau: float = 0.05
     positives: int = 0
+    align: bool = False            # --key-align-weight > 0: sites carry the teacher basis
 
     def site(self, ctx: Context, ep: Episode, j: int) -> TeacherSite:
         """The teacher of search site j of ``ep`` (KeyError for a site not in the
@@ -529,7 +531,8 @@ class KeyTeacher:
             index = ctx.index[ep.kb]
             positives = {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())]
                          for s in index}
-        return TeacherSite(query, keys, self.tau, positives)
+        return TeacherSite(query, keys, self.tau, positives,
+                           self.cache.basis(KEY_WIDTH_ALL) if self.align else None)
 
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
@@ -584,13 +587,16 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                                  device=h.device))
                         continue
                     with ctx.autocast():
-                        read = ctx.reader.fixed_read(h[index[ep.calls[j]]],
+                        read = ctx.reader.fixed_read(h[:int(index[ep.calls[j]]) + 1],
                                                      donors[j % len(donors)])
                     reads.append(read)
                     spans.append(read.span.float())
                     continue
                 with ctx.autocast():
-                    read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
+                    # the call's causal prefix, the call last (the query pool attends over
+                    # it; without a pool the call's own state is the query state)
+                    read = ctx.reader.read(h[:int(index[ep.calls[j]]) + 1], [ctx.kbs[ep.kb]],
+                                           [ep.kb],
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            alternatives=ctx.alternatives(ep, j),
                                            neutral=ctx.neutral(ep, j),
@@ -1186,6 +1192,9 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     nll_total, aux_total, balance_total, teacher_total = 0.0, 0.0, 0.0, 0.0
     teacher_weight = getattr(args, 'key_teacher_weight', 0.0) \
         if ctx.key_teacher is not None else 0.0
+    align_weight = getattr(args, 'key_align_weight', 0.0) \
+        if ctx.key_teacher is not None else 0.0
+    align_total = 0.0
     negatives = batch_negatives(ctx, episodes, args.inbatch_negatives,
                                 rng or random.Random(step)) if args.inbatch_negatives else {}
     if producer is not None:
@@ -1231,6 +1240,11 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             aux_mean = torch.stack(aux).mean()
             terms.append(weight * aux_mean / len(episodes))
             aux_total += aux_mean.item() / len(episodes)
+        aligns = [r.teacher_align for r in reads if r.teacher_align is not None]
+        if aligns:
+            align_mean = torch.stack(aligns).mean()
+            terms.append(align_weight * align_mean / len(episodes))
+            align_total += align_mean.item() / len(episodes)
         kls = [r.teacher_kl for r in reads if r.teacher_kl is not None]
         if kls:
             kl_mean = torch.stack(kls).mean()
@@ -1313,6 +1327,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         out['balance'] = balance_total
     if ctx.key_teacher is not None:
         out['teacher_kl'] = teacher_total
+        if align_weight:
+            out['teacher_align'] = align_total
     if not args.retrieval_only:
         out['nll'] = nll_total / tokens
     return out
@@ -1416,7 +1432,7 @@ class ReadAnchor:
             if ep.episode_id not in self.texts or not ep.calls:
                 continue
             embeds = ctx.frozen.embed(ep.ids[:ep.calls[0] + 1])
-            h = ctx.frozen.mid(embeds[None])[0][ep.calls[0]]
+            h = ctx.frozen.mid(embeds[None])[0]          # the causal prefix of call 0
             with ctx.autocast():
                 read = ctx.reader.read(h, [ctx.kbs[ep.kb]], [ep.kb], ep.query_time, cache)
             kb = ctx.kbs[ep.kb]
@@ -1428,7 +1444,7 @@ class ReadAnchor:
             scales = {s: list(read.spaces[s].scales) for s in values}
             if not values:
                 continue
-            probe = {'state': h, 'values': values, 'scales': scales, 'keys': keys,
+            probe = {'state': read.state, 'values': values, 'scales': scales, 'keys': keys,
                      'ids': self.texts[ep.episode_id]}
             probe['anchored'] = self._logits(probe, read.span.detach().float())
             self.probes.append(probe)
@@ -1543,7 +1559,9 @@ def load_init_reader(reader: L1Reader, path: Path, full: bool = False) -> list[s
                                             if full else ())
     wanted = {k: v for k, v in state.items() if k.startswith(prefixes)}
     own = reader.state_dict()
-    missing = [k for k in own if k.startswith('keys.') and k not in wanted]
+    # a K2 run without a query pool leaves this reader's pool at its initialization
+    missing = [k for k in own if k.startswith('keys.') and not k.startswith('keys.pool.')
+               and k not in wanted]
     if missing:
         raise ValueError(f'{path} has no key heads ({len(missing)} missing, e.g. {missing[0]})')
     for k, v in wanted.items():
@@ -1698,12 +1716,14 @@ def load_key_teacher(args, views) -> KeyTeacher:
         raise ValueError('--key-teacher needs leaf banks (items with one record each), '
                          'not superposed rows')
     teacher = KeyTeacher(TeacherKeys(args.key_teacher), args.key_teacher_tau,
-                         args.key_teacher_positives)
+                         args.key_teacher_positives,
+                         align=getattr(args, 'key_align_weight', 0.0) > 0)
     print(json.dumps({'key_teacher': str(args.key_teacher),
                       'model': teacher.cache.manifest.get('model'),
                       'sites': len(teacher.cache.sites), 'records': len(teacher.cache.record_ids),
                       'weight': args.key_teacher_weight, 'tau': args.key_teacher_tau,
-                      'positives': args.key_teacher_positives}), flush=True)
+                      'positives': args.key_teacher_positives,
+                      'align_weight': getattr(args, 'key_align_weight', 0.0)}), flush=True)
     return teacher
 
 
@@ -1736,7 +1756,8 @@ def train(args) -> None:
                         op_hidden=dims['hidden'], layers=dims['layers'],
                         key_hidden=args.key_hidden, gate_offset=args.gate_offset,
                         max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
-                        read_combine=args.read_combine)
+                        read_combine=args.read_combine,
+                        query_pool=getattr(args, 'query_pool', False))
     banks_manifest = json.loads((args.banks / 'banks.json').read_text())
     if args.item_lr is None:     # the read phase moves free rows faster than leaf items
         args.item_lr = ROWS_ITEM_LR if 'rows' in banks_manifest and not args.rows_from_stack \
@@ -2179,6 +2200,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--key-teacher-positives', type=int, default=0,
                    help='teacher top-k records of the KB per site added as retrieval '
                         'positives at weight 0.5 (neutral records left out)')
+    t.add_argument('--key-align-weight', type=float, default=0.0,
+                   help='with --key-teacher: weight of the alignment of the query key and the '
+                        'listed items\' keys to the teacher embeddings projected on the '
+                        'records\' top 256 principal directions (1 - cos; 10 in the 29 Sep '
+                        'diagnosis); unlike the list losses it generalizes to unseen documents')
+    t.add_argument('--query-pool', action='store_true',
+                   help='query state = call state + a learned attention pool over the '
+                        'query-layer states of the call\'s causal prefix (starts as the call '
+                        'state; 29 Sep: the call state alone carries no request)')
     t.add_argument('--inbatch-negatives', type=int, default=64,
                    help='per space: target items of the batch\'s other slots (same KB only) '
                         'scored as negatives in the retrieval loss (0: off)')

@@ -238,6 +238,20 @@ class TeacherKeys:
         self.sites = json.loads((self.root / 'sites.json').read_text())
         self.site_row = {(s['episode_id'], int(s['call'])): i for i, s in enumerate(self.sites)}
 
+    def basis(self, width: int = 256) -> torch.Tensor:
+        """(teacher width, ``width``): the records' top ``width`` right singular vectors
+        (uncentered), the subspace the retrieval heads' keys align to
+        (``read.teacher_alignment``, ``--key-align-weight``). On recall-text r8 the
+        teacher's own ranking in it keeps its quality (validation R@1/8/64
+        0.74/0.83/0.90 against 0.74/0.84/0.90 in the full space)."""
+        cached = getattr(self, '_basis', None)
+        if cached is None or cached.shape[1] != width:
+            vh = torch.linalg.svd(self.records.float(), full_matrices=False).Vh[:width]
+            basis = torch.zeros(self.records.shape[1], width)   # fewer directions: zero columns
+            basis[:, :vh.shape[0]] = vh.t()
+            cached = self._basis = basis
+        return cached
+
     def site(self, episode_id: str, call: int) -> int:
         row = self.site_row.get((episode_id, int(call)))
         if row is None:

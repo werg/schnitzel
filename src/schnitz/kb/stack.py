@@ -116,13 +116,50 @@ class SuperpositionOperator(nn.Module):
             max_pairs=max_pairs)
 
 
+class QueryPool(nn.Module):
+    """Attention pooling of the query state over the call's causal prefix
+    (``KeyHeads(pool=True)``; 29 September retrieval diagnosis).
+
+    The query-layer state at the closing parenthesis of ``memory_search()`` carries
+    almost nothing of the request: the call token sits at a fixed template position and
+    the frozen decoder was never trained to put a query there (recall-text r8, layer 8:
+    sites sharing a target document are no closer than unrelated ones, and heads on it
+    cannot even fit the training sites over the full KB). The request is in the earlier
+    tokens. The pool has ``heads`` learned attention queries over the normalized
+    query-layer states of every position up to and including the call (causal: nothing
+    after it); the pooled heads are projected and added to the call state,
+    ``h_call + out(pooled)``. ``out`` starts at zero, so an untrained pool returns the
+    call state exactly (the query of earlier readers), and its attention starts uniform
+    (the prefix mean). A call-conditioned attention (query from the call state) fit the
+    training sites as well but generalized worse (held-out R@8 0.23 vs 0.48)."""
+
+    def __init__(self, width: int, heads: int = 4):
+        super().__init__()
+        self.heads = heads
+        self.norm = nn.LayerNorm(width)
+        self.score = nn.Linear(width, heads)
+        self.out = nn.Linear(heads * width, width)
+        for layer in (self.score, self.out):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, prefix: torch.Tensor) -> torch.Tensor:
+        """``prefix`` (T, width): the query-layer states of positions 0..call; the last
+        row is the call's own state. Returns the pooled query state (width,)."""
+        x = self.norm(prefix.float())
+        att = torch.softmax(self.score(x), 0)                 # (T, heads)
+        return prefix[-1].float() + self.out((att.t() @ x).reshape(-1))
+
+
 class KeyHeads(nn.Module):
     """Per-space item keys (from an item's values) and query keys (from the decoder's
     middle-layer state at a ``memory_search()`` call), unit-normalized; scores are
-    cosine times a learned scale per space."""
+    cosine times a learned scale per space. ``pool``: the query state is the call's
+    state plus a ``QueryPool`` of its causal prefix (``query_state``)."""
 
-    def __init__(self, query_width: int, hidden: int = 512):
+    def __init__(self, query_width: int, hidden: int = 512, pool: bool = False):
         super().__init__()
+        self.pool = QueryPool(query_width) if pool else None
         self.item = nn.ModuleDict({
             name: nn.Sequential(nn.LayerNorm(width), nn.Linear(width, hidden), nn.SiLU(),
                                 nn.Linear(hidden, KEY_WIDTH[name]))
@@ -133,6 +170,22 @@ class KeyHeads(nn.Module):
             for name in SPACES})
         self.log_scale = nn.ParameterDict({name: nn.Parameter(torch.tensor(math.log(10.0)))
                                            for name in SPACES})
+
+    def query_state(self, state: torch.Tensor) -> torch.Tensor:
+        """The query state of a call: ``state`` is the call's own query-layer state
+        (width,) or the states of its causal prefix (T, width), the call last. Without
+        a pool the call's state; with one the ``QueryPool`` output (a single state is a
+        prefix of one position)."""
+        if self.pool is None:
+            return state[-1] if state.ndim == 2 else state
+        return self.pool(state if state.ndim == 2 else state[None])
+
+    def load_state_dict(self, state, strict: bool = True, assign: bool = False):
+        """Heads saved without a pool (earlier readers, ``key_heads_init.pt``) load into
+        pooled heads with the pool at its initialization (the call state exactly)."""
+        if self.pool is not None and not any(k.startswith('pool.') for k in state):
+            state = {**state, **{f'pool.{k}': v for k, v in self.pool.state_dict().items()}}
+        return super().load_state_dict(state, strict=strict, assign=assign)
 
     def item_key(self, space: str, values: torch.Tensor) -> torch.Tensor:
         """``values`` (m, width) or (B, m, width) -> unit key(s); mean over positions."""

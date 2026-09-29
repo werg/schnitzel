@@ -1164,3 +1164,85 @@ def test_key_optimizer_resumes_with_moments_of_any_device(tmp_path):
     again.load_state_dict(state)
     assert all(m.device.type == 'cpu' for m, _, _ in again.state.values())
     assert again.step(kb, 'A', ids, keys, [torch.ones_like(k) for k in keys]) == 2
+
+
+# -- the query pool (29 September retrieval diagnosis) --------------------------------------
+def test_untrained_query_pool_is_the_call_state_bit_for_bit(tmp_path):
+    kb = make_kb(tmp_path)
+    plain, pooled = reader(), reader(query_pool=True)
+    pooled.load_state_dict({**pooled.state_dict(), **plain.state_dict()})
+    prefix = torch.randn(7, HIDDEN)
+    for state in (prefix, prefix[-1]):
+        a = plain.read(state, [kb], ['ds'], 3, ItemCache(train=False))
+        b = pooled.read(state, [kb], ['ds'], 3, ItemCache(train=False))
+        assert torch.equal(a.span, b.span) and torch.equal(a.state, b.state)
+        assert torch.equal(a.state, prefix[-1])
+        assert all(a.spaces[s].refs == b.spaces[s].refs for s in SPACES)
+
+
+def test_key_heads_without_a_pool_load_into_pooled_heads():
+    from schnitz.kb.stack import KeyHeads
+    torch.manual_seed(0)
+    old = KeyHeads(HIDDEN, 16)
+    new = KeyHeads(HIDDEN, 16, pool=True)
+    pool = {k: v.clone() for k, v in new.pool.state_dict().items()}
+    new.load_state_dict(old.state_dict())
+    assert all(torch.equal(v, new.pool.state_dict()[k]) for k, v in pool.items())
+    assert torch.equal(new.query['A'][1].weight, old.query['A'][1].weight)
+    x = torch.randn(5, HIDDEN)
+    torch.testing.assert_close(new.query_state(x), x[-1], rtol=0, atol=0)
+
+
+def test_query_pool_trains_and_sees_only_the_causal_prefix(tmp_path):
+    ctx, _ = context(tmp_path, query_pool=True)
+    with torch.no_grad():                  # a trained pool: nonzero attention and output
+        for p in ctx.reader.keys.pool.parameters():
+            p.normal_(0, 0.3)
+    ep = episode(IDS, [3, 10], [6, 13])
+    early = list(IDS)
+    early[1] = 31                          # before both calls: changes both queries
+    later = list(IDS)
+    later[5] = 32                          # after call 1, before call 2: query 2 only
+    after = list(IDS)
+    after[11], after[16:] = 33, [40, 41, 42, 43]   # after call 2 and the targets: nothing
+
+    def states(ids):
+        with torch.no_grad():
+            _, _, reads, _ = l1.run_episode(ctx, episode(ids, [3, 10], [6, 13]),
+                                            ItemCache(train=False))
+        return [r.state for r in reads]
+    base, a, b, c = states(IDS), states(early), states(later), states(after)
+    assert not torch.equal(base[0], a[0]) and not torch.equal(base[1], a[1])
+    assert torch.equal(base[0], b[0]) and not torch.equal(base[1], b[1])
+    assert all(torch.equal(x, y) for x, y in zip(base, c))
+    # the pooled query is not the call state alone: an earlier state moves it
+    x = torch.randn(6, HIDDEN)
+    y = x.clone()
+    y[0] += 1.0
+    assert not torch.equal(ctx.reader.keys.query_state(x), ctx.reader.keys.query_state(y))
+    # the retrieval loss reaches the pool and the query heads
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    for p in ctx.reader.keys.pool.parameters():
+        assert p.grad is not None and p.grad.abs().sum() > 0
+    assert ctx.reader.keys.query['A'][1].weight.grad.abs().sum() > 0
+
+
+def test_fresh_pool_gets_gradients_through_its_output(tmp_path):
+    """At initialization (``out`` zero) the pool is the call state and the first
+    gradient reaches ``out``, so the pool starts training."""
+    ctx, _ = context(tmp_path, query_pool=True)
+    ep = episode(IDS, [3, 10], [6, 13])
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    assert ctx.reader.keys.pool.out.weight.grad.abs().sum() > 0
+
+
+def test_init_reader_without_a_pool_loads_into_a_pooled_reader(tmp_path):
+    k2 = reader()
+    torch.save({'reader': k2.state_dict()}, tmp_path / 'reader.pt')
+    fresh = reader(query_pool=True)
+    pool = {k: v.clone() for k, v in fresh.keys.pool.state_dict().items()}
+    l1.load_init_reader(fresh, tmp_path / 'reader.pt')
+    assert all(torch.equal(v, fresh.keys.pool.state_dict()[k]) for k, v in pool.items())
+    assert torch.equal(fresh.keys.query['A'][1].weight, k2.keys.query['A'][1].weight)

@@ -270,6 +270,19 @@ applies to every stage.
    The teacher is a precomputed cache and training-only supervision: reads still
    query from the decoder state and search stored latent keys (invariant 1).
    There is no separate key-table distillation.
+   *Query pool and alignment (29 September).* The decoder state at the call's
+   closing parenthesis carries almost none of the request (the frozen decoder was
+   never trained to put a query there), so with `--query-pool` the query state is
+   the call state plus a learned attention pool over the query-layer states of the
+   call's causal prefix (up to and including the call; four learned attention
+   queries, output projection starting at zero, so an untrained pool is the call
+   state exactly). The list losses (retrieval loss, teacher KL) alone fit the
+   training documents but stay near chance on unseen ones. With the teacher,
+   `--key-align-weight` adds 1 - cos between our keys and the teacher embeddings
+   projected on the teacher records' top 256 principal directions: the query key
+   against the site's teacher query, the listed items' keys against their records'
+   embeddings. Aligning both towers to the teacher's subspace makes our cosine rank
+   like the teacher's, also for documents no training site named.
 5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
    short warm-up: first a long read-side phase in which the rows are free
    learnable parameters trained by reads alone, until they have drifted far from
@@ -554,7 +567,9 @@ inputs are. Training data is regenerated where the format changes (owner:
     random init with span statistics from the records), keys from the initial
     item-key heads; one `kb_store` KB per dataset, item time = `created_at`.
   - *Read*: query state = the frozen decoder's state after `--query-layer` (8 of
-    16) layers at the token holding the call's closing parenthesis; query heads per
+    16) layers at the token holding the call's closing parenthesis, with
+    `--query-pool` plus a learned attention pool over the same layer's states of the
+    call's causal prefix (`stack.QueryPool`); query heads per
     space; exact top-k over the live keys of the episode's own KB only (candidates
     A/B/C/D 8/16/32/64), time <= the episode's query time; scores from the item-key
     heads applied to the candidates' current values; gates
