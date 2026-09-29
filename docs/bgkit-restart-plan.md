@@ -1097,3 +1097,10 @@ log your decisions and changes of direction"), newest last.
   was regenerated in place, identical apart from `neutral` (same sources.jsonl);
   `memory-recall-text-r8-20260928v3` too (the old one is `...v3-noneutral`). The r2
   and parallel transcripts are not regenerated yet.
+- 29 September: the r6 QA read phase finished its 2000 steps. It had the frozen reader,
+  no contrast and no gold reads. At step 2000: retrieved 1.598 nats, shuffled 1.795,
+  text context 1.535, no context 2.125. Content was 0.197 nats (0.206 at step 1750,
+  a plateau), with gold reads 0.158. Reads close 89% of the gap to text context, but
+  about a third of that gain carries content. The recall-text read phase crashed at
+  step ~800 when its transcripts were regenerated with neutral items under it. It
+  resumes from its checkpoint on the new transcripts.
