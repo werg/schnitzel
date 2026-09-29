@@ -1330,3 +1330,11 @@ log your decisions and changes of direction"), newest last.
   600: validation search recall 0.20/0.16/0.43/0.40 (A-D), against 0.14/0.10/0.39/0.40
   for the pool. So the in-network route works, just slower to start. The combined
   arm (module + backbone) is running.
+- 29 September: the module + backbone query arms (unscaled, uncentred, L16 centred,
+  L12) stayed at chance through 150-300 steps. Arm (a) was also near chance at step
+  300 before reaching 0.43/0.40 at 600, so arms now run at least 600 steps. The
+  backbone-only arms (layer 12; the final layer) run next, with module gradient and
+  output norms logged. K1 rebalance at step 13000: only_C 0.467, only_D 0.309 (from
+  0.443/0.277 at 10500), stack 0.817. B4 at step 6500: call accuracy 0.92, x4
+  stop_missing back to 0.20. Disk: the superseded recall read-teacher dir was deleted
+  (metrics kept).
