@@ -1104,3 +1104,12 @@ log your decisions and changes of direction"), newest last.
   about a third of that gain carries content. The recall-text read phase crashed at
   step ~800 when its transcripts were regenerated with neutral items under it. It
   resumes from its checkpoint on the new transcripts.
+- 29 September: neutral items did not rescue recall-text retrieval. In retrieval-only
+  training on the plain windows, validation search recall stayed at 0-3% per space
+  at step 200, and the loss rose from 1.36 to 1.51-1.62. Next is the planned fallback,
+  run in two steps. (a) A diagnostic: can a text-embedding teacher
+  (Qwen3-Embedding-0.6B) retrieve the right records from the causal prefix at all,
+  on recall-text, parallel, citance and r6 QA? (b) Optional teacher distillation of
+  the query and item-key heads (`--key-teacher`), a listwise KL to the teacher's
+  cosines over the retrieval loss's candidate list. Text is supervision only; reads
+  stay latent. The diagnostic run is stopped.
