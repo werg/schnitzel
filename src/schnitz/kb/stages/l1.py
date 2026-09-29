@@ -928,6 +928,33 @@ def retrieval_weight(args, step: int) -> float:
     return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
 
 
+def soft_schedule(args, step: int, items: int, keep: int) -> dict | None:
+    """``--soft-read`` at 0-based ``step``: {'candidates', 'tau'} of the soft read, or
+    None for the sparse read. Without ``--soft-anneal`` constant; with it the candidate
+    count falls geometrically from ``--soft-candidates`` (0: ``items``, the largest
+    KB's items) to ``keep`` and tau rises geometrically from ``--soft-tau`` to
+    ``--soft-tau-end`` over the anneal steps, after which reads are sparse."""
+    if not getattr(args, 'soft_read', False):
+        return None
+    start = args.soft_candidates or items
+    anneal = getattr(args, 'soft_anneal', 0)
+    if not anneal:
+        return {'candidates': args.soft_candidates, 'tau': args.soft_tau}
+    t = step / anneal
+    if t >= 1:
+        return None
+    count = max(keep, round(math.exp((1 - t) * math.log(max(start, 1)) + t * math.log(keep))))
+    tau = args.soft_tau * (args.soft_tau_end / args.soft_tau) ** t
+    return {'candidates': count, 'tau': tau}
+
+
+def set_soft(config, schedule: dict | None) -> None:
+    """Apply ``soft_schedule``'s value to a ``ReadConfig`` (None: the sparse read)."""
+    config.soft_read = schedule is not None
+    if schedule is not None:
+        config.soft_candidates, config.soft_tau = int(schedule['candidates']), float(schedule['tau'])
+
+
 def gold_read_rate(args, step: int) -> float:
     """Share of training episodes read from their slots' own items (``--gold-reads``,
     annealed linearly to 0 over ``--gold-anneal`` steps; 0 anneal: constant): R, the
@@ -2020,7 +2047,12 @@ def train(args) -> None:
 
     def run_eval() -> dict:
         nonlocal previous
-        report = evaluate(ctx, eval_eps, texts, tok, previous)
+        soft = config.soft_read     # evaluations read sparsely (the target read)
+        config.soft_read = False
+        try:
+            report = evaluate(ctx, eval_eps, texts, tok, previous)
+        finally:
+            config.soft_read = soft
         previous = report.pop('_per_episode')
         if anchor is not None:
             report['read_anchor'] = anchor.drift()
@@ -2030,6 +2062,8 @@ def train(args) -> None:
         log_record({'step': 0, 'eval': run_eval()})
     order: list[int] = []
     window: dict[str, list] = {}
+    soft_items = max((st['items'] for spaces in storage.values() for st in spaces.values()),
+                     default=1)
     started = time.time()
 
     def rekey() -> None:     # the search's key cache from the current item-key heads
@@ -2047,6 +2081,12 @@ def train(args) -> None:
             if ep is not None:
                 batch.append(ep)
         phase = phase_at(schedule, step, args.read_warmup)
+        if getattr(args, 'soft_read', False):
+            set_soft(config, soft_schedule(args, step, soft_items, max(keep.values())))
+            window.setdefault('soft_read', []).append(float(config.soft_read))
+            if config.soft_read:
+                window.setdefault('soft_tau', []).append(config.soft_tau)
+                window.setdefault('soft_candidates', []).append(config.soft_candidates)
         names = phase_set(phase, args, l1b_set)
         if args.consolidate_every and views and phase in ('l1a', 'w') \
                 and (step + 1) % args.consolidate_every == 0:
@@ -2080,7 +2120,9 @@ def train(args) -> None:
         if step % args.log_every == 0:
             log_record({'step': step, 'phase': phase, **_mean(window), 'skipped': dict(skipped),
                         'usage': {k: u.stats() for k, u in usage.items()} if args.log_usage
-                        else None, 'elapsed_s': round(time.time() - started)})
+                        else None, 'elapsed_s': round(time.time() - started),
+                        **({'peak_gb': round(torch.cuda.max_memory_allocated() / 2**30, 3)}
+                           if torch.cuda.is_available() else {})})
             window = {}
         if args.export_rows_every and step % args.export_rows_every == 0:
             log_record({'step': step, **export_snapshot(ctx, reader, args.output / 'snapshots',
@@ -2221,6 +2263,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         'listed items\' keys to the teacher embeddings projected on the '
                         'records\' top 256 principal directions (1 - cos; 10 in the 29 Sep '
                         'diagnosis); unlike the list losses it generalizes to unseen documents')
+    t.add_argument('--soft-read', action='store_true',
+                   help='soft superposed training reads (a query-training aid): gates '
+                        'softmax(--soft-tau * cos) over --soft-candidates per space, all read; '
+                        'evaluations stay sparse')
+    t.add_argument('--soft-candidates', type=int, default=256,
+                   help='--soft-read: candidates per space (0: every item of the KB)')
+    t.add_argument('--soft-tau', type=float, default=10.0,
+                   help='--soft-read: temperature on the cosine (start of the anneal)')
+    t.add_argument('--soft-tau-end', type=float, default=100.0,
+                   help='--soft-read with --soft-anneal: tau at the end of the anneal')
+    t.add_argument('--soft-anneal', type=int, default=0,
+                   help='--soft-read: steps over which candidates fall to --keep and tau '
+                        'rises to --soft-tau-end; sparse reads after (0: constant soft read)')
     t.add_argument('--query-pool', action='store_true',
                    help='query state = call state + a learned attention pool over the '
                         'query-layer states of the call\'s causal prefix (starts as the call '

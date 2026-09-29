@@ -2,6 +2,7 @@
 CPU, tiny models, no downloads."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -1314,3 +1315,62 @@ def test_init_reader_without_a_pool_loads_into_a_pooled_reader(tmp_path):
     l1.load_init_reader(fresh, tmp_path / 'reader.pt')
     assert all(torch.equal(v, fresh.keys.pool.state_dict()[k]) for k, v in pool.items())
     assert torch.equal(fresh.keys.query['A'][1].weight, k2.keys.query['A'][1].weight)
+
+
+# -- soft superposed read (owner, 29 September; --soft-read) --------------------------------
+SOFT_RECORDS = tuple((f'r{i}', 1) for i in range(1, 7)) + (('r9', 5),)
+
+
+def test_sparse_read_is_unchanged_when_soft_is_off(tmp_path):
+    kb = make_kb(tmp_path, records=SOFT_RECORDS)
+    state = torch.randn(HIDDEN)
+    a = reader().read(state, [kb], ['ds'], 3, ItemCache(train=False),
+                      targets=targets_of(kb, ['r1']))
+    b = reader(soft_candidates=0, soft_tau=3.0).read(state, [kb], ['ds'], 3,
+                                                      ItemCache(train=False),
+                                                      targets=targets_of(kb, ['r1']))
+    assert torch.equal(a.span, b.span) and torch.equal(a.aux, b.aux)
+    for s in SPACES:
+        assert a.spaces[s].refs == b.spaces[s].refs and a.spaces[s].scored == b.spaces[s].scored
+        assert torch.equal(a.spaces[s].gates, b.spaces[s].gates)
+
+
+@pytest.mark.parametrize('combine', ['r', 's_s'])
+def test_soft_read_reads_every_candidate_at_softmax_gates(tmp_path, combine):
+    kb = make_kb(tmp_path, records=SOFT_RECORDS)
+    r = reader(soft_read=True, soft_candidates=0, soft_tau=5.0, read_combine=combine,
+               max_reps=4)
+    state = torch.randn(HIDDEN)
+    cache = ItemCache(train=True)
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets_of(kb, ['r1']))
+    for s in SPACES:
+        info = read.spaces[s]
+        assert len(info.refs) == 6 and info.refs == info.scored     # r9 is later: causal
+        q = r.keys.query_key(s, state)
+        keys = torch.stack([r.keys.item_key(s, cache.get(kb, s, [i])[0][0]) for _, i in info.refs])
+        want = torch.softmax(5.0 * (q @ keys.t()), -1).detach()
+        torch.testing.assert_close(info.gates, want)                # all nonzero, sum one
+        assert float(info.gates.min()) > 0
+        assert info.mass == pytest.approx(1.0, abs=1e-5)            # gate x stored mass 1
+    assert read.n <= 4                                              # the span stays capped
+    read.span.sum().backward()      # a task-like loss reaches the query through the gates
+    assert r.keys.query['A'][1].weight.grad.abs().sum() > 0
+
+
+def test_soft_schedule_anneals_to_the_sparse_read():
+    from types import SimpleNamespace
+    args = SimpleNamespace(soft_read=True, soft_candidates=0, soft_tau=10.0,
+                           soft_tau_end=100.0, soft_anneal=100)
+    first, mid = l1.soft_schedule(args, 0, 1000, 4), l1.soft_schedule(args, 50, 1000, 4)
+    assert first == {'candidates': 1000, 'tau': 10.0}
+    assert mid['candidates'] == round(math.sqrt(1000 * 4)) and mid['tau'] == pytest.approx(
+        math.sqrt(1000.0))
+    assert l1.soft_schedule(args, 100, 1000, 4) is None
+    args.soft_anneal = 0
+    assert l1.soft_schedule(args, 10 ** 6, 1000, 4) == {'candidates': 0, 'tau': 10.0}
+    assert l1.soft_schedule(SimpleNamespace(soft_read=False), 0, 1000, 4) is None
+    config = ReadConfig()
+    l1.set_soft(config, mid)
+    assert config.soft_read and config.soft_candidates == mid['candidates']
+    l1.set_soft(config, None)
+    assert not config.soft_read

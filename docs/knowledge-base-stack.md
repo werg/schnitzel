@@ -270,13 +270,21 @@ applies to every stage.
    The teacher is a precomputed cache and training-only supervision: reads still
    query from the decoder state and search stored latent keys (invariant 1).
    There is no separate key-table distillation.
-   *Query pool and alignment (29 September).* The decoder state at the call's
-   closing parenthesis carries almost none of the request (the frozen decoder was
-   never trained to put a query there), so with `--query-pool` the query state is
-   the call state plus a learned attention pool over the query-layer states of the
-   call's causal prefix (up to and including the call; four learned attention
-   queries, output projection starting at zero, so an untrained pool is the call
-   state exactly). The list losses (retrieval loss, teacher KL) alone fit the
+   *The model formulates its query (owner, 29 September).* The frozen decoder's
+   state at the call's closing parenthesis carries almost none of the request (it
+   was never trained to put a query there), and the path that produces the query
+   must not be frozen: in K2 and L1 the reader decoder's own layers below the query
+   layer train (`--decoder-train-below query`, i.e. N = `--query-layer`; a number
+   still works), and in K2 (`--retrieval-only`) the retrieval loss, the teacher KL
+   and the alignment reach them, with the parent-preservation KL as in L1a. The
+   query layer is configurable (`--query-layer`, default 8; 12 is the deeper
+   arm). The writer keeps the parent decoder. Consumers of such a reader (L2, B9)
+   must load its decoder layers; until that is built they refuse the checkpoint.
+   *Query pool (optional aid).* With `--query-pool` the query state is the call
+   state plus a learned attention pool over the query-layer states of the call's
+   causal prefix (up to and including the call; four learned attention queries,
+   output projection starting at zero, so an untrained pool is the call state
+   exactly). The list losses (retrieval loss, teacher KL) alone fit the
    training documents but stay near chance on unseen ones. With the teacher,
    `--key-align-weight` adds 1 - cos between our keys and the teacher embeddings
    projected on the teacher records' top 256 principal directions: the query key

@@ -100,6 +100,13 @@ class ReadConfig:
     # the call token's own state carries almost nothing of the request); off keeps stored
     # configs' meaning
     query_pool: bool = False
+    # soft superposed read (owner, 29 September; a query-training aid): a training read
+    # takes ``soft_candidates`` per space (0: every item the search can return) with gates
+    # softmax(soft_tau * cos) over them, all nonzero, so the task loss reaches the query
+    # through every candidate's weight; the trainer anneals it toward the sparse read
+    soft_read: bool = False
+    soft_candidates: int = 256
+    soft_tau: float = 10.0
 
 
 class ItemCache:
@@ -461,12 +468,12 @@ class L1Reader(nn.Module):
                 refs = cache.gold(s, [r for r in wanted if r not in banned], banned) \
                     if superposed else [r for r in wanted if r not in banned]
             elif superposed:
-                refs = cache.search(kbs, allowed, s, q.detach(), c.candidates[s], query_time,
+                refs = cache.search(kbs, allowed, s, q.detach(), self._width(s), query_time,
                                     banned)
             else:
                 live = all(kb.writable and kb.is_live(s) for kb in kbs)
                 options = {'exclude': {i for _, i in banned}} if banned else {}
-                hits = search_kbs(kbs, allowed, s, q.detach()[None], c.candidates[s],
+                hits = search_kbs(kbs, allowed, s, q.detach()[None], self._width(s),
                                   query_time=query_time, live=live, **options)
                 refs = [r for r in zip(hits.datasets[0], hits.ids[0]) if r not in banned]
             got = [(ref, values) for ref, (values, time)
@@ -507,8 +514,12 @@ class L1Reader(nn.Module):
                         recall_at.update({f'{k}_{s}': v for k, v in at.items()})
                     if kl is not None:
                         kls.append(kl)
-                scored_gates = self.gates(s, scores)
-                keep = min(c.keep.get(s, len(got)), len(got))
+                if c.soft_read:     # every candidate is read, gates sum to one per space
+                    scored_gates = torch.softmax(c.soft_tau * (q[None] @ keys.t())[0], -1)
+                    keep = len(got)
+                else:
+                    scored_gates = self.gates(s, scores)
+                    keep = min(c.keep.get(s, len(got)), len(got))
                 order = torch.topk(scores.detach(), keep).indices.sort().values.tolist()
                 got = [got[i] for i in order]
                 refs = [refs[i] for i in order]
@@ -565,6 +576,14 @@ class L1Reader(nn.Module):
         return Read(span, info, aux_loss, n, recall_at, state.detach(),
                     torch.stack(kls).mean() if kls else None,
                     torch.stack(aligns).mean() if aligns else None)
+
+    def _width(self, space: str) -> int:
+        """Candidates searched in ``space``: the sparse read's ``candidates``, or with
+        ``soft_read`` ``soft_candidates`` (0: all)."""
+        c = self.config
+        if not c.soft_read:
+            return c.candidates[space]
+        return c.soft_candidates if c.soft_candidates > 0 else 1 << 30
 
     def _alignment(self, space: str, q: Tensor, refs: Sequence[Ref], keys: Tensor,
                    teacher: TeacherSite, cache, by_dataset, query_time: int,
