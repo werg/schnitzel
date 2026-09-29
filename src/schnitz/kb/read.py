@@ -268,6 +268,7 @@ class Read:
     state: Tensor | None = None   # the query-layer state the read was made for (detached)
     teacher_kl: Tensor | None = None  # mean over spaces of the key-teacher KL (TeacherSite)
     teacher_align: Tensor | None = None  # mean over spaces of the teacher alignment (basis)
+    queries: dict = field(default_factory=dict)   # per space: the unit query key (detached)
 
 
 @dataclass
@@ -575,7 +576,8 @@ class L1Reader(nn.Module):
             span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
         return Read(span, info, aux_loss, n, recall_at, state.detach(),
                     torch.stack(kls).mean() if kls else None,
-                    torch.stack(aligns).mean() if aligns else None)
+                    torch.stack(aligns).mean() if aligns else None,
+                    {s: q.detach() for s, q in queries.items()})
 
     def _width(self, space: str) -> int:
         """Candidates searched in ``space``: the sparse read's ``candidates``, or with

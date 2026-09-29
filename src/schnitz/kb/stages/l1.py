@@ -1530,6 +1530,27 @@ class ReadAnchor:
         return {'kl': round(sum(values) / len(values), 6), 'probes': len(values)}
 
 
+def query_cosines(episodes: list[list[dict]]) -> dict:
+    """Per space: the mean cosine between the query keys of different calls of one
+    episode (``within``; calls should ask for different things) and between the first
+    calls of different episodes (``across``)."""
+    out = {}
+    spaces = sorted({s for reads in episodes for q in reads for s in q})
+    for s in spaces:
+        within, firsts = [], []
+        for reads in episodes:
+            keys = [q[s].float() for q in reads if s in q]
+            if keys:
+                firsts.append(keys[0])
+            within += [float(keys[i] @ keys[j]) for i in range(len(keys))
+                       for j in range(i + 1, len(keys))]
+        across = [float(firsts[i] @ firsts[j]) for i in range(len(firsts))
+                  for j in range(i + 1, len(firsts))]
+        out[s] = {'within': round(sum(within) / len(within), 4) if within else None,
+                  'across': round(sum(across) / len(across), 4) if across else None}
+    return out
+
+
 @torch.no_grad()
 def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
              previous: dict | None = None) -> dict:
@@ -1544,6 +1565,8 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
     stats: dict[str, list] = {}
     gold_stats: dict[str, list] = {}
     got = {'retrieved': [], 'gold': []}
+    queries_by: list[list[dict]] = []    # per episode, per retrieved read: query keys
+    drifts: list[float] = []
     per_episode: dict[str, tuple[str, float]] = {}
     gates_by: dict[str, dict[str, list]] = {}
     for ep in episodes:
@@ -1555,6 +1578,7 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
                         ctx.written if name == 'retrieved' else None, cache)
             if name == 'retrieved':
                 per_episode[ep.episode_id] = (ep.kb, nll.item() / max(n, 1))
+                queries_by.append([r.queries for r in reads if r.queries])
                 for read in reads:
                     for s, info in read.spaces.items():
                         if len(info.gates):
@@ -1563,6 +1587,9 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
         tokens += n
         empty = [torch.zeros(0, ctx.reader.config.span_width) for _ in ep.mems]
         sums['noctx'] += run_episode(ctx, ep, cache, 'fixed', empty)[0].item()
+        drift = parent_kl(ctx, ep)          # the reader decoder's drift (trained layers)
+        if drift is not None:
+            drifts.append(float(drift))
         text_ep = layout(ep.row, tok, texts, writes=ep.rendered_writes)
         if int(text_ep.targets.numel()) != n:
             raise ValueError('the text arm changes the target tokens')
@@ -1579,6 +1606,9 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
     report['reads'] = _mean(stats)
     report['gold_reads'] = _mean(gold_stats)
     report['span_reps'] = distribution(stats.get('n', []))
+    report['query_cos'] = query_cosines(queries_by)
+    if drifts:
+        report['parent_kl'] = round(sum(drifts) / len(drifts), 6)
     report['written_items'] = {name: len(spaces.get('D', ())) for name, spaces in ctx.written.items()
                                if spaces.get('D')}
     metrics = superposition_metrics(ctx, gates_by)
