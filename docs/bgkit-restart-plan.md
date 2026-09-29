@@ -1345,3 +1345,12 @@ log your decisions and changes of direction"), newest last.
   than the layer-8 arm (a) at the same point. Cold run data moved to
   /mnt/external/sdkb-archive/runs/cold-20260929 (root disk 161 GB free). Hot runs
   stay on the NVMe and finished ones move there asynchronously (owner).
+- 29 September: K1 is stopped at its plateau, with the checkpoint of step 15500 kept as
+  `k1-stack-step15500.pt`. Stack captured went 0.826 -> 0.825 over steps
+  15000-15500, only_A 0.828, only_B 0.68, only_C 0.48, only_D 0.32; the rebalance
+  lifted C/D from 0.44/0.28. D stays below 0.35. The capacity/distillation remedy for
+  C/D is deferred: D serves as a coarse index space until the retrieval and read
+  stages show whether its content matters. Retrieval is the critical path, and the
+  freed GPU share (0.24) goes to it. These codecs are used for the next bank builds.
+  Query arms at step 600: layer 12 (c) 0.14/0.14/0.37/0.51 (A-D) vs layer 8 (a)
+  0.20/0.16/0.43/0.40; the final-layer arm (f) runs.
