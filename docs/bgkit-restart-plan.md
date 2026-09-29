@@ -1305,3 +1305,9 @@ log your decisions and changes of direction"), newest last.
       with the parent KL.
   Arm (a), with trainable layers 0-7 (lr 3e-5, KL 0.1), learns but slowly: search
   recall 0.10-0.11 in C/D at step 300, against 0.39-0.40 with the pool at step 600.
+- 29 September (owner): a dedicated query-formulation layer on top is acceptable. The
+  prefix pool is promoted to a proper block: one attention block computed only at the
+  call position over the causal prefix states (multi-head, pre-LN, residual onto the
+  call state, small MLP, optionally reading layers 8 and 12), zero-initialized, then
+  the per-space key projections. It becomes arm (e). `--pool-distill` stays the
+  alternative that ends without an extra block. Cost: one position per call.
