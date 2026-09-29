@@ -1323,3 +1323,10 @@ log your decisions and changes of direction"), newest last.
   projections, the LLM-embedder recipe), module only on a frozen backbone, and the
   layer-8 / layer-12 trainable-below arms. Measured: search recall on unseen
   documents, query diversity across calls within an episode, generation drift, cost.
+- 29 September: K1 hit its own CUDA cap at step ~11075 (23.7 of 24.3 GB at
+  fraction 0.2; the rebalanced single-space terms raise peak use). It resumes from
+  step 11000 at fraction 0.24 with multi-record batch 2 (was 3). Query arm (a)
+  (trainable layers 0-7, layer-8 query, no pool) caught up with the pool by step
+  600: validation search recall 0.20/0.16/0.43/0.40 (A-D), against 0.14/0.10/0.39/0.40
+  for the pool. So the in-network route works, just slower to start. The combined
+  arm (module + backbone) is running.
