@@ -1,6 +1,6 @@
 """Losses shared by the knowledge-base stages (docs/knowledge-base-stack.md, 5.2):
-KL between readings, the retrieval auxiliary loss and the reward for spread-out
-use of the KB."""
+KL between readings, the retrieval auxiliary loss, its key-teacher distillation term and
+the reward for spread-out use of the KB."""
 from __future__ import annotations
 
 import torch
@@ -28,6 +28,15 @@ def retrieval_loss(scores: torch.Tensor, positive: torch.Tensor,
     stats = {f'recall@{k}': float(hits[:, :k].any(-1).float().mean()) for k in ks
              if k <= s.shape[-1]}
     return loss, stats
+
+
+def teacher_kl(scores: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+    """KL(softmax(teacher) || softmax(scores)) over one candidate list (last dimension):
+    the key-teacher distillation term. ``teacher`` is the teacher's logits (cosine over
+    its temperature) and carries no gradient; exactly 0 when the two are equal."""
+    log_t = torch.log_softmax(teacher.detach().float(), -1)
+    log_s = torch.log_softmax(scores.float(), -1)
+    return (log_t.exp() * (log_t - log_s)).sum(-1).mean()
 
 
 class UsageEMA:

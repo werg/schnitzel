@@ -51,7 +51,7 @@ of a step accumulate before one sparse live update per touched (KB, space).
 """
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -59,7 +59,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from schnitz.kb.losses import retrieval_loss
+from schnitz.kb.losses import retrieval_loss, teacher_kl
 from schnitz.kb.stack import KEY_WIDTH, SPACES, KeyHeads, Stack, SuperpositionOperator, read_count
 from schnitz.mlp_matrix import MLPMatrix
 from schnitz.kb_store import KnowledgeBase, search_kbs
@@ -71,6 +71,7 @@ DEFAULT_CANDIDATES = {'A': 8, 'B': 16, 'C': 32, 'D': 64}
 DEFAULT_KEEP = {'A': 2, 'B': 2, 'C': 3, 'D': 4}
 
 Ref = tuple[str, str]    # (dataset, item id) within one space
+MINED_WEIGHT = 0.5       # a teacher-mined positive's weight in the retrieval loss
 
 
 @dataclass
@@ -252,6 +253,22 @@ class Read:
     n: int = 0
     recall_at: dict = field(default_factory=dict)
     state: Tensor | None = None   # the query-layer state the read was made for (detached)
+    teacher_kl: Tensor | None = None  # mean over spaces of the key-teacher KL (TeacherSite)
+
+
+@dataclass
+class TeacherSite:
+    """A text-embedding teacher for one search site (``schnitz.kb.teacher_keys``;
+    training supervision only, never used to retrieve). ``query``: the unit teacher
+    embedding of the site's causal prefix; ``keys(space, refs)``: the unit teacher
+    embedding of each item's record, None for an item without one (written items,
+    rows); ``tau``: the teacher's temperature; ``positives`` (per space): teacher-mined
+    extra positives of the retrieval loss at weight ``MINED_WEIGHT`` (never the slot's
+    own positives, which keep weight 1, nor neutral or excluded items)."""
+    query: Tensor
+    keys: Callable[[str, Sequence[Ref]], list[Tensor | None]]
+    tau: float = 0.05
+    positives: Mapping[str, Sequence[Ref]] | None = None
 
 
 def current_ids(kb: KnowledgeBase, space: str) -> list[str]:
@@ -344,7 +361,8 @@ class L1Reader(nn.Module):
              producer: Producer | None = None,
              weights: Mapping[str, float] | None = None,
              alternatives: Mapping[str, Sequence[Ref]] | None = None,
-             neutral: Mapping[str, Sequence[Ref]] | None = None) -> Read:
+             neutral: Mapping[str, Sequence[Ref]] | None = None,
+             teacher: TeacherSite | None = None) -> Read:
         """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
         they are the read). ``alternatives`` (per space): other items that alone hold
@@ -374,22 +392,32 @@ class L1Reader(nn.Module):
         from the KB's items: the search runs over the rows, targets, negatives and
         exclusions name the KB's items and are mapped to the rows covering them (positives
         weighted by their share of the row's mass; a row covering a neutral item is
-        neutral unless it covers a positive), and ``producer`` is the cache's."""
+        neutral unless it covers a positive), and ``producer`` is the cache's.
+
+        ``teacher`` (``TeacherSite``, training only): per space, over the retrieval
+        loss's list (scored candidates, missed positives, in-batch negatives; no neutral
+        item), ``Read.teacher_kl`` is KL(softmax(teacher cos / tau) || softmax(scores))
+        on the items with a teacher embedding (mean over spaces; the caller weights it),
+        and the teacher's mined positives join the loss at ``MINED_WEIGHT``; recall@k
+        is still over the slot's own positives. Retrieval itself never sees the teacher."""
         c = self.config
         allowed = set(allowed)
         denied = [kb.dataset for kb in kbs if kb.dataset not in allowed]
         if denied:
             raise PermissionError(f'not authorized to read {denied}')
         by_dataset = {kb.dataset: kb for kb in kbs}
+        if teacher is not None and getattr(cache, 'superposed', False):
+            raise ValueError('the key teacher needs leaf items, not superposed rows')
         for what, named in (('target', targets), ('alternative', alternatives),
-                            ('negative', negatives), ('neutral', neutral)):
+                            ('negative', negatives), ('neutral', neutral),
+                            ('teacher positive', teacher.positives if teacher else None)):
             for dataset, _ in (r for rs in (named or {}).values() for r in rs):
                 if dataset not in allowed or dataset not in by_dataset:
                     raise PermissionError(f'{what} item of {dataset!r} is not readable here')
         superposed = getattr(cache, 'superposed', False)
         if superposed:
             producer = None                  # the cache recomputes rows from their leaves
-        reads, masses, info, aux, recall_at = {}, {}, {}, [], {}
+        reads, masses, info, aux, recall_at, kls = {}, {}, {}, [], {}, []
         read_positions, read_spaces, read_gates, entries, queries = [], [], [], [], {}
         for s in self.spaces:
             q = self.keys.query_key(s, state)
@@ -437,11 +465,17 @@ class L1Reader(nn.Module):
                     if superposed and idle:
                         idle = cache.gold(s, idle, banned)
                     idle = {r for r in idle if r not in positive}
-                    loss, at = self._retrieval_loss(s, q, refs, scores, positive, by_dataset,
-                                                    cache, query_time, others, idle)
+                    mined = {r: MINED_WEIGHT for r in dict.fromkeys(
+                        (teacher.positives or {}).get(s, ()) if teacher is not None else ())
+                        if r not in positive and r not in idle and r not in banned}
+                    loss, at, kl = self._retrieval_loss(s, q, refs, scores, positive,
+                                                        by_dataset, cache, query_time, others,
+                                                        idle, mined, teacher)
                     if loss is not None:
                         aux.append(loss)
                         recall_at.update({f'{k}_{s}': v for k, v in at.items()})
+                    if kl is not None:
+                        kls.append(kl)
                 scored_gates = self.gates(s, scores)
                 keep = min(c.keep.get(s, len(got)), len(got))
                 order = torch.topk(scores.detach(), keep).indices.sort().values.tolist()
@@ -497,7 +531,8 @@ class L1Reader(nn.Module):
                                    state)
         else:
             span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
-        return Read(span, info, aux_loss, n, recall_at, state.detach())
+        return Read(span, info, aux_loss, n, recall_at, state.detach(),
+                    torch.stack(kls).mean() if kls else None)
 
     def _item_keys(self, space: str, cache, by_dataset, refs: Sequence[Ref],
                    values: Sequence[Tensor], device) -> Tensor:
@@ -631,19 +666,28 @@ class L1Reader(nn.Module):
 
     def _retrieval_loss(self, space, q, refs, scores, wanted: Mapping[Ref, float], by_dataset,
                         cache, query_time, negatives: Sequence[Ref] = (),
-                        neutral: Collection[Ref] = frozenset()):
+                        neutral: Collection[Ref] = frozenset(),
+                        mined: Mapping[Ref, float] | None = None,
+                        teacher: TeacherSite | None = None):
         """Over the scored candidates, plus the positives the search missed and
         ``negatives`` not already among them (in-batch negatives), each scored from its
         current values; items later than the query time are left out. ``wanted`` maps each
         positive to its weight (1 for the slot's own items; a covering row's share).
         ``neutral`` items (never positives) are neither: scored candidates among them
-        leave the list and negatives among them are not added."""
+        leave the list and negatives among them are not added. ``mined``: extra
+        (teacher-mined) positives with their weights, missed ones added like the slot's;
+        recall@k counts ``wanted`` only. ``teacher``: also returns the KL of the list's
+        scores to the teacher's (items with a teacher embedding; None below two).
+        Returns (loss, recall@k, KL), (None, {}, None) without a positive."""
         if neutral:
             keep = [k for k, r in enumerate(refs) if r not in neutral or r in wanted]
             if len(keep) < len(refs):
                 refs = [refs[k] for k in keep]
                 scores = scores[torch.tensor(keep, dtype=torch.long, device=scores.device)]
             negatives = [r for r in negatives if r not in neutral]
+        own = wanted
+        if mined:
+            wanted = {**{r: w for r, w in mined.items() if r not in own}, **own}
         seen = set(refs)
         extra = [r for r in wanted if r not in seen]
         extra += [r for r in dict.fromkeys(negatives) if r not in seen and r not in wanted]
@@ -657,11 +701,27 @@ class L1Reader(nn.Module):
         if pairs:
             more = self.keys.scores(space, q[None], torch.stack([k for _, k in pairs]))[0]
             scores = torch.cat([scores, more])
-        positive = torch.tensor([wanted.get(r, 0.0) for r in refs] + [p for p, _ in pairs],
+        listed = list(refs) + [r for r, _ in kept]
+        positive = torch.tensor([wanted.get(r, 0.0) for r in listed],
                                 device=q.device, dtype=torch.float)
         if not bool((positive > 0).any()):
-            return None, {}
-        return retrieval_loss(scores[None], positive[None])
+            return None, {}, None
+        loss, stats = retrieval_loss(scores[None], positive[None])
+        if own is not wanted:     # recall@k over the list without mined extras, own positives
+            idx = [k for k, r in enumerate(listed) if k < len(refs) or r in own
+                   or r not in wanted]
+            mine = torch.tensor([own.get(listed[k], 0.0) for k in idx], device=q.device)
+            at = torch.tensor(idx, device=scores.device)
+            stats = retrieval_loss(scores.detach()[at][None], mine[None])[1]
+        kl = None
+        if teacher is not None:
+            embedded = teacher.keys(space, listed)
+            idx = [k for k, e in enumerate(embedded) if e is not None]
+            if len(idx) >= 2:
+                emb = torch.stack([embedded[k] for k in idx]).to(q.device).float()
+                target = emb @ teacher.query.to(q.device).float() / teacher.tau
+                kl = teacher_kl(scores[torch.tensor(idx, device=scores.device)], target)
+        return loss, stats, kl
 
     @torch.no_grad()
     def rekey(self, kb: KnowledgeBase, batch: int = 4096) -> int:
