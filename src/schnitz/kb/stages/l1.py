@@ -1412,6 +1412,13 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     out['grad_norm'] = {name: round(grad_norm(group), 4) for name, group in
                         (('keys', ctx.reader.keys.parameters()),
                          ('decoder', ctx.frozen.trainable_parameters()))}
+    module = ctx.reader.keys.former or ctx.reader.keys.pool   # the query module, if any
+    if module is not None:
+        out['grad_norm']['query_module'] = round(grad_norm(module.parameters()), 4)
+        outs = list(module.out.values()) if isinstance(module.out, torch.nn.ModuleDict) \
+            else [module.out]
+        out['query_module_out_norm'] = round(float(torch.stack(
+            [layer.weight.detach().float().norm() for layer in outs]).norm()), 4)
     out['grad_norm']['total'] = round(float(torch.nn.utils.clip_grad_norm_(params, args.clip)), 4)
     optimizer.step()
     change_units = getattr(args, 'l1b_change_units', 4)

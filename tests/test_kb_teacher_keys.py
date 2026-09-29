@@ -338,6 +338,8 @@ def test_alignment_trains_the_heads_and_is_logged(tmp_path):
     opt = torch.optim.AdamW(ctx.reader.trainable(), lr=1e-3)
     out = l1.train_step(ctx, [ep], opt, args, 0, rng=random.Random(0))
     assert out['teacher_align'] > 0
+    # the query module's gradient and output-projection norm are logged
+    assert out['grad_norm']['query_module'] > 0 and out['query_module_out_norm'] == 0.0
 
 
 def test_centered_alignment_removes_the_common_direction_attractor():
