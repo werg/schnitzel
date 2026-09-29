@@ -280,17 +280,36 @@ applies to every stage.
    query layer is configurable (`--query-layer`, default 8; 12 is the deeper
    arm). The writer keeps the parent decoder. Consumers of such a reader (L2, B9)
    must load its decoder layers; until that is built they refuse the checkpoint.
-   *Query pool (optional aid).* With `--query-pool` the query state is the call
-   state plus a learned attention pool over the query-layer states of the call's
-   causal prefix (up to and including the call; four learned attention queries,
-   output projection starting at zero, so an untrained pool is the call state
-   exactly). The list losses (retrieval loss, teacher KL) alone fit the
+   *Query pool (reference scaffold).* With `--query-pool` the query state is the
+   call state plus a learned attention pool over the query-layer states of the
+   call's causal prefix (up to and including the call; four learned attention
+   queries, output projection starting at zero, so an untrained pool is the call
+   state exactly). It is not conditioned on the call, so the calls of one episode
+   get nearly the same query; it stays only as a reference.
+   *Query formulation (owner, 29 September).* The end state is query
+   functionality inside the network with a projection on top: a trained backbone
+   (`--decoder-train-below query`: the reader's own copies of the layers below the
+   query layer; `--decoder-lora R`: LoRA on those copies, base weights frozen;
+   `--decoder-train attention`: only the copied full-attention layers, since in
+   LFM2.5-350M layers 2, 5, 8, 10, 12, 14 are the only ones that move information
+   to the call position from far), optionally with a query module
+   (`--query-former`: per space a call-conditioned latent cross-attends over the
+   call's causal prefix, then the latents attend to each other; pre-LN, MLPs, a
+   zero-initialized per-space output added in units of the call state's RMS, so an
+   untrained module is the call-state query exactly). The query layer can be the
+   final one (`--query-layer 16`). The query pool and the former add their output
+   in units of the call state's RMS (0.01 at layer 8, about 2 at layer 16).
+   The list losses (retrieval loss, teacher KL) alone fit the
    training documents but stay near chance on unseen ones. With the teacher,
    `--key-align-weight` adds 1 - cos between our keys and the teacher embeddings
    projected on the teacher records' top 256 principal directions: the query key
    against the site's teacher query, the listed items' keys against their records'
    embeddings. Aligning both towers to the teacher's subspace makes our cosine rank
-   like the teacher's, also for documents no training site named.
+   like the teacher's, also for documents no training site named. With
+   `--key-align-center` both towers are centered (per-tower teacher means, basis of
+   the centered records): uncentered teacher queries share a common direction
+   (mean pairwise cosine 0.53) that a constant query key already scores 0.27
+   against, and the final-layer query keys collapsed onto it.
 5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
    short warm-up: first a long read-side phase in which the rows are free
    learnable parameters trained by reads alone, until they have drifted far from
