@@ -1311,3 +1311,15 @@ log your decisions and changes of direction"), newest last.
   call state, small MLP, optionally reading layers 8 and 12), zero-initialized, then
   the per-space key projections. It becomes arm (e). `--pool-distill` stays the
   alternative that ends without an extra block. Cost: one position per call.
+- 29 September (owner): query formulation = an attention module plus a trained
+  backbone. The plain attentive pool is not conditioned on the call, so every call in
+  an episode gets nearly the same query, which fails multi-hop; it stays only as a
+  reference. Main arm: a 2-block cross-attention module (per-space latents
+  conditioned on the call-token state, cross-attending over the causal prefix, then
+  self-attention among the latents and an MLP, zero-initialized) on top of a
+  fine-tuned backbone (LoRA or reader layer copies up to a deep query layer, final
+  layer first, parent KL), trained jointly with the retrieval loss, teacher KL and
+  key alignment. Comparison arms: backbone only (the final-layer call token plus
+  projections, the LLM-embedder recipe), module only on a frozen backbone, and the
+  layer-8 / layer-12 trainable-below arms. Measured: search recall on unseen
+  documents, query diversity across calls within an episode, generation drift, cost.
