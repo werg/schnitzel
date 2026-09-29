@@ -1192,3 +1192,12 @@ log your decisions and changes of direction"), newest last.
   (query = call state + a zero-initialized learned attention pool over the prefix,
   so an untrained pool equals the old query) and `--key-align-weight`. This also
   explains why r6 QA seemed to retrieve: its small KBs make recall near chance-high.
+- 29 September (owner): the model must formulate its query. The path that produces the
+  query cannot be frozen. The primary retrieval fix is therefore trainable decoder
+  layers below the query layer (`--decoder-train-below`, the reader's own layer
+  copies, KL to the parent; the writer keeps its weights), trained by the retrieval
+  loss, the teacher KL and key alignment, also in retrieval-only (K2) training. The
+  learned prefix pool (`--query-pool`) stays an optional aid. It follows that K2
+  cannot run on cached decoder states: it keeps the decoder in the loop. Inverse-cloze
+  retrieval data, a KB-size curriculum and mined hard negatives are the next K2
+  additions once decoder-formulated queries retrieve above chance.
