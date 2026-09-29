@@ -1198,6 +1198,12 @@ def parent_kl(ctx: Context, ep: Episode) -> torch.Tensor | None:
     return kl(logits, target)
 
 
+def grad_norm(params) -> float:
+    """The L2 norm of the gradients of ``params`` (those that have one), before clipping."""
+    grads = [p.grad.detach().float().norm() for p in params if p.grad is not None]
+    return float(torch.stack(grads).norm()) if grads else 0.0
+
+
 def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0,
                usage: dict | None = None, *, phase: str | None = None,
                trainable: list | None = None, writer: Writer | None = None,
@@ -1337,7 +1343,10 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         out['l1b'] = producer.backward()
         out['l1b_backward_s'] = round(time.time() - t0, 3)
     params = trainable if trainable is not None else ctx.reader.trainable()
-    torch.nn.utils.clip_grad_norm_(params, args.clip)
+    out['grad_norm'] = {name: round(grad_norm(group), 4) for name, group in
+                        (('keys', ctx.reader.keys.parameters()),
+                         ('decoder', ctx.frozen.own.parameters()))}
+    out['grad_norm']['total'] = round(float(torch.nn.utils.clip_grad_norm_(params, args.clip)), 4)
     optimizer.step()
     change_units = getattr(args, 'l1b_change_units', 4)
     if producer is not None and change_units >= 0:
