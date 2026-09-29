@@ -1009,7 +1009,7 @@ def load_reader(model, banks: Path, reader_state: Path | None, seed: int):
     state = None
     if reader_state is not None:
         state = torch.load(reader_state, map_location='cpu', weights_only=False)
-        if 'decoder_layers' in state:
+        if 'decoder_layers' in state or 'decoder_lora' in state:
             # the reader's queries come from its own decoder layers (--decoder-train-below),
             # which this consumer does not load yet: refuse rather than query with the parent's
             raise NotImplementedError(f'{reader_state} was trained with its own decoder layers '

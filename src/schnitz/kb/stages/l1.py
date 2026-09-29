@@ -291,30 +291,94 @@ def reader_decoder(lm, below: int, checkpointing: bool = False):
     return out, own
 
 
+class LoRA(torch.nn.Module):
+    """A low-rank delta on one linear module's output (``--decoder-lora``), always on:
+    it sits on the reader's own layer copies only, never on the writer's decoder. ``up``
+    starts at zero, so an untrained adapter changes nothing."""
+
+    def __init__(self, module: torch.nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.scale = alpha / rank
+        self.down = torch.nn.Linear(module.in_features, rank, bias=False)
+        self.up = torch.nn.Linear(rank, module.out_features, bias=False)
+        torch.nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.up.weight)
+        self.to(module.weight.device)
+        module.register_forward_hook(self._hook)
+
+    def _hook(self, module, inputs, output):
+        delta = self.up(self.down(inputs[0].to(self.down.weight.dtype))) * self.scale
+        return output + delta.to(output.dtype)
+
+
+def attention_layers(lm) -> list[int]:
+    """Indices of the decoder's full-attention layers (LFM2: ``layer_types``); the other
+    layers (short convolutions) cannot move information to the call position from far."""
+    types = getattr(lm.config, 'layer_types', None)
+    if types is None:
+        return list(range(len(lm.model.layers)))
+    return [i for i, t in enumerate(types) if 'attention' in t]
+
+
 class Frozen:
     """The reader's decoder: embeddings (protocol hooks included), the hidden state after
     ``query_layer`` layers (a truncated pass), final hidden states and LM-head logits.
     Frozen unless ``train_below`` > 0 (``--decoder-train-below``): then its layers below
-    that index are the reader's own trainable copies (``own``; ``reader_decoder``) and
-    ``parent`` is the untouched decoder (the parent-preservation KL)."""
+    that index are the reader's own copies (``own``; ``reader_decoder``) and ``parent``
+    is the untouched decoder (the parent-preservation KL). What trains
+    (``trainable_parameters``): the copies (``train='all'``), only the copied
+    full-attention layers (``'attention'``), or with ``lora`` > 0 rank-``lora``
+    adapters on every linear module of the trained copies, their base weights frozen."""
 
     def __init__(self, lm, query_layer: int, autocast=None, train_below: int = 0,
-                 checkpointing: bool = False):
+                 checkpointing: bool = False, train: str = 'all', lora: int = 0,
+                 lora_alpha: float | None = None):
         self.parent = None
         self.own = torch.nn.ModuleList()
+        self.lora = torch.nn.ModuleDict()
+        if train not in ('all', 'attention'):
+            raise ValueError(f'decoder train is all or attention, not {train!r}')
+        self.train = train
+        self.trained_layers: list[int] = []
         if train_below > 0:
             self.parent = Frozen(lm, query_layer, autocast)
             lm, self.own = reader_decoder(lm, train_below, checkpointing)
+            self.trained_layers = [i for i in range(train_below)
+                                   if train == 'all' or i in attention_layers(lm)]
+            if lora > 0:
+                for i in self.trained_layers:
+                    for name, module in self.own[i].named_modules():
+                        if isinstance(module, torch.nn.Linear):
+                            self.lora[f'{i}.{name}'.replace('.', '__')] = LoRA(
+                                module, lora, lora_alpha or 2.0 * lora)
         self.lm, self.inner = lm, lm.model
         self.query_layer = query_layer
         self.autocast = autocast or (lambda: torch.autocast('cpu', enabled=False))
         if not 1 <= query_layer <= len(self.inner.layers):
             raise ValueError('query layer out of range')
 
+    def trainable_parameters(self) -> list:
+        """The reader decoder's trainable parameters (the ``decoder`` set)."""
+        if len(self.lora):
+            return list(self.lora.parameters())
+        return [p for i in self.trained_layers for p in self.own[i].parameters()]
+
+    def state(self) -> dict:
+        """The reader decoder's trained state for a checkpoint."""
+        if len(self.lora):
+            return {'decoder_lora': self.lora.state_dict()}
+        return {'decoder_layers': self.own.state_dict()}
+
+    def load(self, state: dict) -> None:
+        if len(self.lora):
+            self.lora.load_state_dict(state['decoder_lora'])
+        else:
+            self.own.load_state_dict(state['decoder_layers'])
+
     @property
     def trains(self) -> bool:
-        """Whether any of the reader's own decoder layers currently takes gradients."""
-        return any(p.requires_grad for p in self.own.parameters())
+        """Whether any of the reader decoder's trainable parameters takes gradients."""
+        return any(p.requires_grad for p in self.trainable_parameters())
 
     @property
     def device(self):
@@ -1044,7 +1108,7 @@ def parameter_sets(reader: L1Reader, writer_model=None, write_ops=None, prefix=N
             **producer_params(writer_model, reader.stack),
             'write': [] if write_ops is None else list(write_ops.parameters()),
             'prefix': [] if prefix is None else list(prefix.parameters()),
-            'decoder': [] if decoder is None else list(decoder.own.parameters())}
+            'decoder': [] if decoder is None else decoder.trainable_parameters()}
 
 
 def phase_set(phase: str, args, l1b_set=()) -> tuple[str, ...]:
@@ -1345,7 +1409,7 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     params = trainable if trainable is not None else ctx.reader.trainable()
     out['grad_norm'] = {name: round(grad_norm(group), 4) for name, group in
                         (('keys', ctx.reader.keys.parameters()),
-                         ('decoder', ctx.frozen.own.parameters()))}
+                         ('decoder', ctx.frozen.trainable_parameters()))}
     out['grad_norm']['total'] = round(float(torch.nn.utils.clip_grad_norm_(params, args.clip)), 4)
     optimizer.step()
     change_units = getattr(args, 'l1b_change_units', 4)
@@ -1819,6 +1883,8 @@ def train(args) -> None:
     # copies; the writer keeps running (and keeps the weights of) the parent decoder
     frozen = Frozen(lm, args.query_layer, model.core.autocast,
                     train_below=resolve_train_below(args),
+                    train=getattr(args, 'decoder_train', 'all'),
+                    lora=getattr(args, 'decoder_lora', 0),
                     checkpointing=args.decoder_checkpoint)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
@@ -1839,7 +1905,8 @@ def train(args) -> None:
                         key_hidden=args.key_hidden, gate_offset=args.gate_offset,
                         max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
                         read_combine=args.read_combine,
-                        query_pool=getattr(args, 'query_pool', False))
+                        query_pool=getattr(args, 'query_pool', False),
+                        query_former=getattr(args, 'query_former', False))
     banks_manifest = json.loads((args.banks / 'banks.json').read_text())
     if args.item_lr is None:     # the read phase moves free rows faster than leaf items
         args.item_lr = ROWS_ITEM_LR if 'rows' in banks_manifest and not args.rows_from_stack \
@@ -1905,7 +1972,7 @@ def train(args) -> None:
         if prefix is not None:
             prefix.load_state_dict(state['null_prefix'])
         if len(frozen.own):
-            frozen.own.load_state_dict(state['decoder_layers'])
+            frozen.load(state)
         if key_optimizer is not None:
             key_optimizer.load_state_dict(state.get('key_optimizer', {}))
         step = state['step']
@@ -2061,7 +2128,7 @@ def train(args) -> None:
                     **({'null_prefix': prefix.state_dict()} if prefix is not None else {}),
                     # the reader decoder's own layers (the writer's weights are not saved
                     # here: they are the parent decoder's, unchanged)
-                    **({'decoder_layers': frozen.own.state_dict(),
+                    **({**frozen.state(),
                         'decoder_train_below': args.decoder_train_below}
                        if len(frozen.own) else {}),
                     **({'write_ops': write_ops.state_dict(),
@@ -2315,6 +2382,17 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--soft-anneal', type=int, default=0,
                    help='--soft-read: steps over which candidates fall to --keep and tau '
                         'rises to --soft-tau-end; sparse reads after (0: constant soft read)')
+    t.add_argument('--query-former', action='store_true',
+                   help='query formulation module: per space call-conditioned latents '
+                        'cross-attending over the call\'s causal prefix, then self-attention '
+                        'and MLPs; zero-initialized output (starts as the call state)')
+    t.add_argument('--decoder-train', choices=('all', 'attention'), default='all',
+                   help='--decoder-train-below: train every copied layer, or only the '
+                        'full-attention ones (the only layers that move information to the '
+                        'call position from far)')
+    t.add_argument('--decoder-lora', type=int, default=0,
+                   help='--decoder-train-below: rank of LoRA adapters on the trained copies\' '
+                        'linear modules, their base weights frozen (0: train the copies)')
     t.add_argument('--query-pool', action='store_true',
                    help='query state = call state + a learned attention pool over the '
                         'query-layer states of the call\'s causal prefix (starts as the call '
