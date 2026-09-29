@@ -1255,3 +1255,10 @@ log your decisions and changes of direction"), newest last.
   `--dump-hits`. The B3 span caches at level s1 are complete, so B4 restarts from
   step 2500 with `--slot-spans spans-b3-s1 --slot-cap 64`: write prefixes' memory
   slots are filled with latent spans instead of left empty.
+- 29 September: K1 plateaued. Captured went 0.807 -> 0.809 -> 0.811 at steps
+  9000-10000, with only_A 0.806 and only_D 0.28, so A carries nearly everything.
+  It restarts from step 10000 with single-space weight 1.0 (was 0.5) and dropout
+  A=0.75, B=0.4, C=0.25, D=0.25 (was 0.5/0.3/0.25/0.25), to push B-D toward equal
+  information. Watch only_C/only_D rise without the stack dropping. Query arms so
+  far: the prefix pool (arm b) lifts validation search recall to 0.39/0.40 in C/D
+  by step 600, while the decoder-only arm (a) is still at chance.
