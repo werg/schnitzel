@@ -270,6 +270,22 @@ applies to every stage.
    The teacher is a precomputed cache and training-only supervision: reads still
    query from the decoder state and search stored latent keys (invariant 1).
    There is no separate key-table distillation.
+   *K2 data (29 September; built, not yet trained).* Three additions, each off unless
+   asked for. (a) Inverse-cloze transcripts (`scripts/prepare_inverse_cloze.py`, see the
+   dataset guide). One search per episode. The cue is a sentence of a record, or for
+   citances and parallel versions a different description of the same content. The
+   positives are the record and its redundant copies, and the near-duplicates are
+   neutral. The transcripts use the source corpus's KB. (b) A KB-size curriculum
+   (`l1 subkb`). It cuts small KBs from a bank, one per episode or per batch group:
+   the slots' records plus distractors up to `--size`, chosen at random, teacher-mined
+   (`--distractors teacher`, near misses from the teacher-keys cache) or mixed. The
+   stored items are copied with their ids and provenance, never re-encoded. Each sub-KB
+   is its own authorization domain, cut from one parent. The stages run small to full
+   size, each started with `--init-reader` from the previous one. (c) Hard negatives.
+   `l1 hard-negatives` mines per-site records from the teacher's near misses and from
+   the reader's own top wrong hits (`train --dump-hits`). It never takes a site's
+   positives or neutral records. `train --hard-negatives FILE` adds them to that
+   episode's in-batch negatives. Without the flag the step is unchanged, bit for bit.
 5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
    short warm-up: first a long read-side phase in which the rows are free
    learnable parameters trained by reads alone, until they have drifted far from

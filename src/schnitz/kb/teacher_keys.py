@@ -254,10 +254,12 @@ class TeacherKeys:
 
     def mined(self, episode_id: str, call: int, k: int, kb: str | None = None,
               skip: Iterable[str] = ()) -> list[str]:
-        """The site's teacher top-``k`` record ids of its KB (``kb`` checks it), leaving
-        out ``skip`` (e.g. neutral records) before counting."""
+        """The site's teacher top-``k`` record ids of its KB (``kb`` checks it; a sub-KB of
+        the site's KB, ``schnitz.kb.subkb``, is accepted: the caller keeps only the records
+        it holds), leaving out ``skip`` (e.g. neutral records) before counting."""
+        from schnitz.kb.subkb import parent_kb
         n = self.site(episode_id, call)
-        if kb is not None and self.sites[n]['kb'] != kb:
+        if kb is not None and self.sites[n]['kb'] not in (kb, parent_kb(kb)):
             raise PermissionError(f'teacher site of {self.sites[n]["kb"]!r}, not {kb!r}')
         skip = set(skip)
         out = []

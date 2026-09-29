@@ -1228,3 +1228,23 @@ log your decisions and changes of direction"), newest last.
   The key-dependent shares of the write-side superposition likewise pull input keys
   toward rows they help. Test it next to the decoder-formulated query arms, on
   recall-text with a subsampled KB.
+- 29 September: the K2 data side of option 2 is built, not yet trained. It is ready for
+  when decoder-formulated queries retrieve above chance.
+  - *Inverse-cloze transcripts.* Each has one search. The cue is a sentence of a record,
+    or for citances an abstract sentence, a held-out citance or a sibling citance (made
+    neutral). Positives are the record and its redundant copies; near-duplicates are
+    neutral. Cues are split by document or paper, unseen in training.
+    `memory-inverse-cloze-recall-text-r8-20260929v3` and `-citance-recall-` have
+    4000/300 episodes each, on the source corpora's KBs.
+  - *`l1 subkb`.* Small KBs cut from a bank, one per episode or per batch group: the
+    slots' records plus random, teacher-mined or mixed distractors up to `--size`.
+    Stored items are copied, never re-encoded.
+  - *`l1 hard-negatives`.* It mines teacher near misses and the reader's own wrong hits
+    (`train --dump-hits`). `train --hard-negatives FILE` adds them to the in-batch
+    negatives. Without the flag the step is bit-identical.
+
+  One choice: a transcript-level builder, not a new task corpus, so the records stay in
+  the existing KB and span cache. Size matters for grouping. A recall-text r8 episode's
+  slots name 13-21 records, and a group of 8 episodes about 140, so per-batch groups
+  need `--size` above that. An inverse-cloze slot has a median of 6 positives. The
+  planned curriculum is 64 -> 1k -> the full 13k+ per episode.

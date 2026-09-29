@@ -329,6 +329,60 @@ LFM2.5-350M render check on 200 per split:
   - One citance is far from enough to reconstruct an abstract. To make several
     citances the positives, the reader must use the alternatives.
 
+## Inverse-cloze retrieval transcripts (29 September)
+
+`scripts/prepare_inverse_cloze.py` builds retrieval-only transcripts for K2 from any
+`tasks-*` corpus (generator `schnitz.inverse_cloze`, tests in
+`tests/test_inverse_cloze.py`). It works at the transcript level: the output
+`memory-inverse-cloze-<corpus>-<tag>` names the source corpus as its `input` and the
+corpus's KB as its `kb`. So `l1 build` banks the records into the same KB and span cache
+as the corpus's own transcripts, and nothing is written twice. A new task corpus would
+be a new KB, and its bank would re-run the writer over the same records.
+
+- **Episode.** System prompt, a user turn with a cue, one `memory_search()` call and its
+  slot. There is no answer turn, so the call is the only assistant (loss) token.
+  `task_family` is `inverse_cloze`. The slot's `record_ids` name one record, its
+  `alternatives` every positive and its `neutral` the near-duplicates. Rows pass the
+  transcript builder's audit (`Builder.audit`), and 200 per split are rendered through
+  the LFM2.5 chat template (`--render-check`).
+- **Cues by corpus type** (detected from the records):
+  - *verbatim* (recall-text windows, r6 passages, synthetic-people bios). The cue is a
+    whole sentence of the record, 8-40 words, never one cut by a window edge. Sentences
+    with names and numbers are preferred. Without such a sentence, the cue is a 12-24
+    word span of the record. Positives are the records of the same document (article,
+    person) that contain the cue verbatim. `neutral` is the rest of that group.
+  - *citance*. The cue is another description of the cited paper: one or two sentences
+    of its abstract (never stored), a held-out citing paper's citance (never stored), or
+    another stored citance of the paper (`sibling`, weights 0.4/0.3/0.3). A sibling's
+    record becomes `neutral`, because matching it is lexical. Positives are every other
+    stored citance of the paper. Cues under 8 words or with inline LaTeX are skipped.
+  - *parallel*. The cue is one or two verses of the never-stored target translation
+    (WEB/BBE, from the corpus's episodes), without verse numbers or reference.
+    Positives are every stored translation's record covering those verses. `neutral`
+    is the chapter's other records.
+- **Ambiguity filter.** A cue is dropped when a record outside its group, in the same
+  KB, contains at least half of its word 8-grams (templates, boilerplate, repeated
+  verses).
+- **Split.** Cues are split by group, following the source corpus's own split.
+  Validation cues come only from documents, papers, chapters or people that a source
+  validation episode uses and no source training episode does.
+
+Generated 29 September (seed 0, 4000/300, all rows audited, render check clean on 200
+per split):
+
+- `memory-inverse-cloze-recall-text-r8-20260929v3`.
+  - Train: 949 documents; 3615 sentence cues and 385 span cues. Validation: 116 unseen
+    documents.
+  - Per slot: median 6 positives and 59 neutral records. Median cue length is 20 words.
+  - The slots name 63,696 train and 8047 validation records of the 71,807.
+- `memory-inverse-cloze-citance-recall-20260929v3`.
+  - Train: 1908 cited papers; 1973 abstract, 1234 sibling and 793 held-out citance cues.
+    Validation: 295 of the 300 validation papers.
+  - Per slot: median 12 positives. Median cue length is 22 words.
+
+The same command also runs on parallel-recall, r6-mixed and synth-people-r32. These
+were checked with 200/50 episodes and are not generated yet.
+
 ## Stored-only measurement
 
 Evaluation has a separate write phase, serializes payload precision, reopens the bank,

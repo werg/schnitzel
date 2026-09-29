@@ -94,7 +94,16 @@ content nats over the shuffled controls), recall, effective items per read and t
 share of reads that retrieve written items. Without ``--writes``, ``memory_write``
 calls and their acknowledgements are left out of the render.
 
-Entry point: ``scripts/train.py l1 build|rows|train|teacher-keys ...``. Training-only; the decoder
+K2 data (29 September; CPU commands, no model): ``subkb`` cuts small KBs from a bank for
+a KB-size curriculum (``schnitz.kb.subkb``: per episode or per batch group, the slots'
+records plus ``--size`` random, teacher-mined or mixed distractors, stored items copied,
+transcripts rewritten onto the sub-KBs); ``hard-negatives`` mines per-site negatives
+from a teacher cache and/or the reader's own wrong hits (``schnitz.kb.hard_negatives``;
+``train --dump-hits FILE`` writes those hits at every save), which ``train
+--hard-negatives FILE`` adds to each episode's in-batch negatives (without the flag the
+step is unchanged, bit for bit).
+
+Entry point: ``scripts/train.py l1 build|rows|train|teacher-keys|subkb|hard-negatives ...``. Training-only; the decoder
 parts run in ``sdkb-bgkit``.
 """
 from __future__ import annotations
@@ -1213,13 +1222,23 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     gold_rate = 0.0 if args.retrieval_only else gold_read_rate(args, step)
     gold_rng = random.Random(f'gold:{step}')
     gold_count = 0
+    # --hard-negatives / --dump-hits (``schnitz.kb.hard_negatives``): None when off, so the
+    # episode's negatives are exactly the in-batch ones
+    hard = getattr(ctx, 'hard_negatives', None)
+    hits = getattr(ctx, 'hit_sink', None)
     for i, ep in enumerate(episodes):
         mode = 'gold' if gold_rate and gold_rng.random() < gold_rate else 'retrieve'
         gold_count += mode == 'gold'
+        own = negatives.get(ep.kb)
+        if hard is not None:
+            own = hard.extend(ctx, ep, own)
         nll, _, reads, spans = run_episode(ctx, ep, cache, mode,
                                            retrieval_only=args.retrieval_only,
-                                           negatives=negatives.get(ep.kb), producer=producer,
+                                           negatives=own, producer=producer,
                                            teacher=ctx.key_teacher is not None)
+        if hits is not None and mode == 'retrieve':
+            from schnitz.kb.hard_negatives import collect_hits
+            collect_hits(hits, ctx, ep, reads, getattr(args, 'dump_hits_top', 16), step)
         terms = [] if nll is None else [nll / tokens]
         if kl_weight > 0:
             kl_value = parent_kl(ctx, ep)
@@ -1861,6 +1880,13 @@ def train(args) -> None:
     ctx.key_optimizer = key_optimizer
     if args.key_teacher is not None:
         ctx.key_teacher = load_key_teacher(args, views)
+    if getattr(args, 'hard_negatives', None) is not None:
+        from schnitz.kb.hard_negatives import HardNegatives
+        ctx.hard_negatives = HardNegatives.load(args.hard_negatives)
+        print(json.dumps({'hard_negatives': str(args.hard_negatives),
+                          'sites': len(ctx.hard_negatives)}), flush=True)
+    if getattr(args, 'dump_hits', None) is not None:
+        ctx.hit_sink = {}
     tok = model.tok
     writer = Writer(model, stack, frozen.embed, batch=args.write_batch) \
         if args.writes or 'l1b' in phases else None
@@ -1965,6 +1991,9 @@ def train(args) -> None:
                         'superpose': dataclasses.asdict(superpose)} if write_ops is not None
                        else {})}, pending)
         pending.replace(state_path)
+        if getattr(ctx, 'hit_sink', None) is not None:
+            from schnitz.kb.hard_negatives import dump_hits
+            dump_hits(args.dump_hits, ctx.hit_sink, step)
         for kb in kbs.values():
             for old in kb.live_checkpoints():
                 if old != tag:
@@ -2058,9 +2087,10 @@ def train(args) -> None:
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    """Arguments of all actions (``build``, ``rows``, ``train``, ``teacher-keys``) on one
-    parser."""
-    parser.add_argument('action', choices=('build', 'rows', 'train', 'teacher-keys'))
+    """Arguments of all actions (``build``, ``rows``, ``train``, ``teacher-keys``, ``subkb``,
+    ``hard-negatives``) on one parser."""
+    parser.add_argument('action', choices=('build', 'rows', 'train', 'teacher-keys', 'subkb',
+                                           'hard-negatives'))
     parser.add_argument('--transcripts', type=Path, nargs='+',
                         help='memory transcript directories (v1 or v2; build and train)')
     parser.add_argument('--checkpoint', type=Path)
@@ -2093,8 +2123,25 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                                  'records/s against 5-7 at 16 on the shared GPU (28 Sep, 96 '
                                  'records), so the default stays batched for bank-scale '
                                  'builds that no L1b phase replays')
-    build_args.add_argument('--distractors', type=int, default=0,
-                            help='extra records per KB beyond those the transcripts name')
+    build_args.add_argument('--distractors', type=_distractors, default=0,
+                            help='build: extra records per KB beyond those the transcripts '
+                                 'name (a count); subkb: random|teacher|mixed (default random)')
+    sub = parser.add_argument_group('subkb (KB-size curriculum: small KBs cut from --banks, '
+                                    'schnitz.kb.subkb)')
+    sub.add_argument('--size', type=int,
+                     help='records per sub-KB: the group\'s slot records and alternatives, '
+                          'then distractors up to this size')
+    sub.add_argument('--group-size', type=int, default=1,
+                     help='episodes sharing one sub-KB (1: per episode; the batch size: per '
+                          'batch)')
+    sub.add_argument('--with-neutral', action='store_true',
+                     help='also store the slots\' neutral records (default: left out)')
+    hn = parser.add_argument_group('hard-negatives (schnitz.kb.hard_negatives; --output is '
+                                   'the JSON file)')
+    hn.add_argument('--hits', type=Path,
+                    help='a reader hits dump (l1 train --dump-hits) to mine from')
+    hn.add_argument('--hard-negatives-k', type=int, default=16,
+                    help='hard negatives per search site (reader hits first, then teacher)')
     tk = parser.add_argument_group('teacher-keys (text-embedding teacher cache for --key-teacher)')
     tk.add_argument('--teacher-model', default='Qwen/Qwen3-Embedding-0.6B',
                     help='text-embedding model (Qwen3-Embedding style: last-token pooling)')
@@ -2182,6 +2229,15 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--inbatch-negatives', type=int, default=64,
                    help='per space: target items of the batch\'s other slots (same KB only) '
                         'scored as negatives in the retrieval loss (0: off)')
+    t.add_argument('--hard-negatives', type=Path,
+                   help='mined hard negatives (l1 hard-negatives): per search site extra '
+                        'records scored as negatives in its retrieval loss (own KB only; '
+                        'positives and neutral records never)')
+    t.add_argument('--dump-hits', type=Path,
+                   help='write each training site\'s top wrong hits (records) to this JSON '
+                        'at every save, for l1 hard-negatives --hits')
+    t.add_argument('--dump-hits-top', type=int, default=16,
+                   help='wrong hits kept per site in --dump-hits')
     t.add_argument('--init-reader', type=Path,
                    help='K2 reader.pt: start from its key heads and gate offsets (K2 -> L1a)')
     t.add_argument('--init-reader-full', action='store_true',
@@ -2286,6 +2342,59 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--no-operator-checkpoint', action='store_true')
 
 
+def _distractors(value: str):
+    """``--distractors``: a count (build) or a distractor mode (subkb)."""
+    from schnitz.kb.subkb import MODES
+    if value.isdigit():
+        return int(value)
+    if value in MODES:
+        return value
+    raise argparse.ArgumentTypeError(f'a count or one of {MODES}')
+
+
+def subkb(args) -> None:
+    """Small KBs cut from ``--banks`` for a KB-size curriculum (``schnitz.kb.subkb``)."""
+    from schnitz.kb import subkb as sk
+    if args.banks is None or args.size is None:
+        raise SystemExit('subkb needs --banks and --size')
+    if isinstance(args.distractors, int) and args.distractors:
+        raise SystemExit('subkb --distractors takes random|teacher|mixed')
+    mode = 'random' if isinstance(args.distractors, int) else args.distractors
+    manifest = json.loads((args.banks / 'banks.json').read_text())
+    limits = {'train': args.limit if args.limit is not None else manifest.get('limit'),
+              'validation': args.eval_limit if args.eval_limit is not None
+              else manifest.get('eval_limit')}
+    out = sk.build(args.banks, args.output, transcripts=args.transcripts, limits=limits,
+                   size=args.size, mode=mode, group_size=args.group_size, seed=args.seed,
+                   teacher_dir=args.key_teacher, with_neutral=args.with_neutral,
+                   log=lambda x: print(x, flush=True))
+    sizes = [v['records'] for v in out['kbs'].values()]
+    print(json.dumps({'subkbs': len(sizes),
+                      'records_mean': round(sum(sizes) / max(len(sizes), 1), 1),
+                      'transcripts': out['transcripts'], 'counts': out['counts']}), flush=True)
+
+
+def hard_negatives(args) -> None:
+    """Per-site hard negatives (``schnitz.kb.hard_negatives``) for ``train --hard-negatives``
+    from a teacher-keys cache (``--key-teacher``) and/or a reader hits dump (``--hits``)."""
+    from schnitz.kb import hard_negatives as hn
+    from schnitz.kb.teacher_keys import TeacherKeys
+    if not args.transcripts or (args.key_teacher is None and args.hits is None):
+        raise SystemExit('hard-negatives needs --transcripts and --key-teacher and/or --hits')
+    rows = [row for split, limit in (('train', args.limit), ('validation', args.eval_limit))
+            for row in Transcripts(args.transcripts, split, limit)]
+    teacher = TeacherKeys(args.key_teacher) if args.key_teacher is not None else None
+    hits = hn.load_hits(args.hits) if args.hits is not None else None
+    sites = hn.mine(rows, teacher=teacher, hits=hits, k=args.hard_negatives_k)
+    hn.save(args.output, sites, {'transcripts': [str(d) for d in args.transcripts],
+                                 'teacher': str(args.key_teacher) if args.key_teacher else None,
+                                 'hits': str(args.hits) if args.hits else None,
+                                 'k': args.hard_negatives_k})
+    print(json.dumps({'hard_negatives': str(args.output), 'sites': len(sites),
+                      'records_mean': round(sum(len(s['records']) for s in sites)
+                                            / max(len(sites), 1), 2)}), flush=True)
+
+
 def teacher_keys(args) -> None:
     """The text-embedding teacher cache for ``--key-teacher`` (``schnitz.kb.teacher_keys``):
     the records of ``--banks`` (else ``record_sources`` of the transcripts) and every
@@ -2322,6 +2431,12 @@ def run(args) -> None:
     if args.action == 'teacher-keys':
         teacher_keys(args)
         return
+    if args.action == 'subkb':
+        subkb(args)
+        return
+    if args.action == 'hard-negatives':
+        hard_negatives(args)
+        return
     if args.eval_limit is None:
         args.eval_limit = 256
     if args.action == 'rows':
@@ -2333,6 +2448,8 @@ def run(args) -> None:
         if getattr(args, name) is None:
             raise SystemExit(f'{args.action} needs --{name.replace("_", "-")}')
     if args.action == 'build':
+        if not isinstance(args.distractors, int):
+            raise SystemExit('build --distractors takes a count (random|teacher|mixed: subkb)')
         args.batch_size = args.batch_size or 32
         build(args)
     else:
