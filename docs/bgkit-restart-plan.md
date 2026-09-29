@@ -1187,6 +1187,8 @@ log your decisions and changes of direction"), newest last.
     0.36/0.39/0.66/0.73 (R@5 0.41/0.26/0.44/0.29), already 0.30/0.40/0.57/0.61 at
     step 300; rank -> 101; parent KL 0.12, text NLL 0.46; query-key cosine within an
     episode 0.85, across episodes 0.13; 10.6 s/step, 7.0 GB. Best arm.
+  - f12: the same at layer 12 (LoRA on layers 0-11): 0.14/0.27/0.56/0.76; rank -> 90;
+    parent KL 0.12, text NLL 0.44; 11.0 s/step, 7.0 GB.
   - e+f with the query former: at layer 16 and 12 the former collapsed onto
     content-free queries (query-key cosine 1.000 across episodes, anti-correlated
     between the calls of one episode; former state effective rank 1.0) and stayed at
