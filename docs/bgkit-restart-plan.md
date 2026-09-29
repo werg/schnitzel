@@ -1142,3 +1142,14 @@ log your decisions and changes of direction"), newest last.
   training-only supervision. Caches: `kb-read-recall/teacher-keys` and
   `kb-read-parallel/teacher-keys`. Diagnostic caches for citance and r6 are under
   `teacher-diag/`.
+- 29 September: the teacher diagnostic shows the recall-text retrieval is feasible
+  from the causal prefix. Qwen3-Embedding-0.6B gets validation R@1/5/20/64 of
+  0.74/0.81/0.86/0.90, against our heads at chance. The other probes: parallel
+  0.33/0.57/0.71/0.86, citance 0.69/0.91/1.00/1.00, r6 QA 0.77/0.93/0.98/0.98. The
+  failure is in the learned heads. The superseded runs are stopped: the rows-based
+  gold-read runs, recall-text (which crashed on resume from a KeyOptimizer
+  device-mismatch bug, now fixed) and parallel. New read phases run on the LEAF
+  banks (no rows until retrieval works) with teacher-distilled keys: KL weight 1,
+  tau 0.05, 4 mined positives. They also use gold reads 0.5 annealed over 1500
+  steps, contrast 1 at margin 0.5 and null prefix 4, for 3000 steps:
+  `kb-read-recall/read-teacher` and `kb-read-parallel/read-teacher`.
