@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from schnitz.kb.losses import retrieval_loss
+from schnitz.kb import read as read_mod
 from schnitz.kb.read import ItemCache, L1Reader, ReadConfig, current_ids, splice
 from schnitz.kb import producer
 from schnitz.kb.stages import l1
@@ -1149,3 +1150,17 @@ def test_only_reader_layers_below_n_get_gradients(tmp_path, checkpointing):
     kl.backward()
     assert all(p.grad is not None for p in ctx.frozen.own.parameters())
     assert all(p.grad is None for p in lm.parameters())
+
+
+def test_key_optimizer_resumes_with_moments_of_any_device(tmp_path):
+    kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(3)))
+    opt = read_mod.KeyOptimizer(1e-2)
+    ids = kb._row_ids['A'][:2]
+    keys = [it.key for it in kb.read('A', ids, live=True)]
+    opt.step(kb, 'A', ids[:1], keys[:1], [torch.ones_like(keys[0])])
+    state = opt.state_dict()
+    state['state'] = {k: (m.double(), v.double(), t) for k, (m, v, t) in state['state'].items()}
+    again = read_mod.KeyOptimizer(1e-2)
+    again.load_state_dict(state)
+    assert all(m.device.type == 'cpu' for m, _, _ in again.state.values())
+    assert again.step(kb, 'A', ids, keys, [torch.ones_like(k) for k in keys]) == 2

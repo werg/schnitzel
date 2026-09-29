@@ -206,8 +206,9 @@ class KeyOptimizer:
         names = [f'{kb.dataset}/{space}/{i}' for i in ids]
         zero = torch.zeros(key.shape[1], dtype=key.dtype)
         old = [self.state.get(n, (zero, zero, 0)) for n in names]
-        m = torch.stack([o[0] for o in old]).to(key.device, key.dtype)
-        v = torch.stack([o[1] for o in old]).to(key.device, key.dtype)
+        # moments may sit on another device (a resumed checkpoint): gather on the key's
+        m = torch.stack([o[0].to(key.device, key.dtype) for o in old])
+        v = torch.stack([o[1].to(key.device, key.dtype) for o in old])
         t = torch.tensor([o[2] + 1 for o in old], dtype=torch.float64)
         c1 = (1 - b1 ** t).to(key.device, key.dtype)[:, None]
         c2 = (1 - b2 ** t).to(key.device, key.dtype)[:, None]
@@ -227,7 +228,8 @@ class KeyOptimizer:
         return {'lr': self.lr, 'state': {k: (m, v, t) for k, (m, v, t) in self.state.items()}}
 
     def load_state_dict(self, state: Mapping) -> None:
-        self.state = dict(state.get('state', {}))
+        # moments live on the CPU, as ``step`` keeps them (a checkpoint may map them to CUDA)
+        self.state = {k: (m.cpu(), v.cpu(), t) for k, (m, v, t) in state.get('state', {}).items()}
 
 
 @dataclass
