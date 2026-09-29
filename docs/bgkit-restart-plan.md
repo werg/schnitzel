@@ -1292,3 +1292,16 @@ log your decisions and changes of direction"), newest last.
   from step 10500. At step 10500 the rebalanced run had not moved C/D yet (only_C
   0.443, only_D 0.277). Disk was below 40 GB free, so the superseded parallel
   read-teacher run dir was deleted (metrics kept).
+- 29 September (owner): the query should live in the network with a projection on top,
+  and the prefix pool is only a scaffold. A likely reason for the degenerate call
+  state: LFM2.5-350M's layers are mostly short convolutions (kernel 3, local), with
+  full attention only at layers 2, 5, 8, 10, 12 and 14. The layer-8 query has passed
+  just two attention layers, and nothing in pretraining rewards gathering the request
+  at a call-closing token. Next arms:
+  (1) a deeper query (layer 12, after four attention layers);
+  (2) `--pool-distill`: the pool as a teacher for the call-state query, annealed out
+      of the read;
+  (3) training only the attention layers below the query layer, at a higher rate
+      with the parent KL.
+  Arm (a), with trainable layers 0-7 (lr 3e-5, KL 0.1), learns but slowly: search
+  recall 0.10-0.11 in C/D at step 300, against 0.39-0.40 with the pool at step 600.
