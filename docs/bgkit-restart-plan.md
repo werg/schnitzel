@@ -1163,3 +1163,13 @@ log your decisions and changes of direction"), newest last.
   ~98 records for 8-64 candidates. A debugging agent is checking the query-state and
   key degeneracy, the score scale (a cosine without temperature gives a flat
   softmax), the gradients and clipping, and the head capacity.
+- 29 September, 03:34: host memory ran out. B4 and the span-cache build started
+  automatically after B3 while two L1 read-teacher runs (cuda 0.12 each), K1 and a
+  debugging agent's GPU work were running. earlyoom (10% limit) killed the
+  coordinating Claude session, both read-teacher runs (recall at step ~350, parallel
+  at 500) and the span-cache build. B4 and K1 survived. Recovery: the span-cache
+  build resumes (resumable), and the retrieval debugging resumes under one GPU
+  process at cuda <= 0.06. The read-teacher runs stay stopped until the retrieval
+  fix lands, since their retrieval is at chance anyway. Rule from now on: count
+  every running job, armed waiter and agent before a GPU launch, and keep >= 25 GB
+  available after all of them.
