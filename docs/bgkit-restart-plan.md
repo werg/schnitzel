@@ -1153,3 +1153,13 @@ log your decisions and changes of direction"), newest last.
   tau 0.05, 4 mined positives. They also use gold reads 0.5 annealed over 1500
   steps, contrast 1 at margin 0.5 and null prefix 4, for 3000 steps:
   `kb-read-recall/read-teacher` and `kb-read-parallel/read-teacher`.
+- 29 September: teacher-key read phases at step 250. On recall-text the leaf banks
+  let R carry content: gold reads 2.246 nats against gold-shuffled 3.077, 0.83 nats
+  of content, up from 0.22 on rows. But retrieval stays at chance even under teacher
+  distillation: validation search recall 0-6% per space, and the teacher KL barely
+  falls (1.10 -> 1.06). The heads cannot fit a supervised ranking, which points to a
+  bug or a structural problem in the retrieval path, not in the tasks. r6 QA's
+  apparent retrieval (0.57-0.93) may be chance too, because its per-domain KBs hold
+  ~98 records for 8-64 candidates. A debugging agent is checking the query-state and
+  key degeneracy, the score scale (a cosine without temperature gives a flat
+  softmax), the gradients and clipping, and the head capacity.
