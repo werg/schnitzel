@@ -1173,3 +1173,22 @@ log your decisions and changes of direction"), newest last.
   fix lands, since their retrieval is at chance anyway. Rule from now on: count
   every running job, armed waiter and agent before a GPU launch, and keep >= 25 GB
   available after all of them.
+- 29 September, ~07:52: the root disk filled (916 GB, 1.3 GB left). The cause was
+  run copies, diagnostic KBs and the retrieval-debug state dumps. B4 (step ~2500) and
+  K1 (step ~8500) crashed while saving; their atomic saves left the previous
+  checkpoints intact (b4/writer.pt of 06:59, kb-k1/stack.pt of 07:06). The span-cache
+  build also stopped. I freed 53 GB by deleting superseded run directories (their
+  metrics kept as `<dir>-metrics.jsonl`): the K2 diagnostics, the rows-based read
+  and read-gold runs, kb-l1c-smoke, b3-smoke and the debug dumps. B4, K1 and the
+  span-cache build resume from their checkpoints.
+- 29 September: retrieval root cause (debugging agent, offline on recall-text r8).
+  The query state at the `memory_search()` call token is nearly the same at every
+  site: centred effective rank 2.6, against 60 for the mean over the user-message
+  tokens. It does not carry the request, so the query and item keys collapse
+  (pairwise cosine 0.95-0.9997) and even teacher distillation cannot fit. Offline,
+  a learned attention pool over the causal prefix plus alignment to the teacher's
+  principal subspace reaches validation recall@8 0.47-0.57 on unseen documents.
+  The call token gives 0.00, and the teacher 0.84. Fix in progress: `--query-pool`
+  (query = call state + a zero-initialized learned attention pool over the prefix,
+  so an untrained pool equals the old query) and `--key-align-weight`. This also
+  explains why r6 QA seemed to retrieve: its small KBs make recall near chance-high.
