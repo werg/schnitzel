@@ -1218,3 +1218,13 @@ log your decisions and changes of direction"), newest last.
   Other options held: small KBs with mined distractors as a focused stage;
   adversarially written distractors as a robustness probe only; redundancy sweeps
   (r2 vs r8, r4 vs r32).
+- 29 September (owner idea, queued as option 1b): superposition in small or easy KBs
+  as a query-training aid. A soft, query-weighted superposed read gives the query a
+  dense gradient from the task loss, not only from the retrieval loss on a few
+  selected items: gates softmax(tau q.k) over all rows of a small KB, or over a wide
+  candidate set, superposed into R's input. Coarse rows (large fields) first give a
+  region-level signal, then finer levels (coarse to fine). Temperature and candidate
+  count anneal toward the sparse top-k read, since extreme sparsity stays the goal.
+  The key-dependent shares of the write-side superposition likewise pull input keys
+  toward rows they help. Test it next to the decoder-formulated query arms, on
+  recall-text with a subsampled KB.
