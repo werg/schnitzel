@@ -414,6 +414,17 @@ applies to every stage.
      reader decoder) on each episode's no-read context at its loss positions. With
      the decoder training, query passes run with gradients (checkpointed), so the
      retrieval loss reaches those layers too; the contrast term applies to them.
+     *Soft superposed read (owner, 29 September; a query-training aid):*
+     `--soft-read` makes each training read take `--soft-candidates` per space
+     (0: every item) with gates softmax(`--soft-tau` x cos), all nonzero, and R
+     reads the whole gate-weighted superposition (gate x stored mass, so mass and
+     numerator stay as in invariant 5; the span length stays capped by
+     `read_count`). The task loss then reaches the query through every
+     candidate's weight. `--soft-anneal N` moves the candidates geometrically to
+     the sparse `--keep` and tau to `--soft-tau-end` over N steps, after which
+     reads are sparse; evaluations always read sparsely, and with the flag off
+     the sparse read is bit-identical. (Coarse rows first on a rows banks dir is
+     not built.)
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
