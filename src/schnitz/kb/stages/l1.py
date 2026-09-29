@@ -39,6 +39,14 @@ target items of the batch's other slots in the same KB, never another KB's) supe
 routing; a slot's ``neutral`` records (near-duplicates of its positives) are neither
 positives nor negatives of it. recall@k per space is logged. ``--init-reader`` starts from a K2 run's key
 heads and gate offsets (K2 -> L1a; the search keys are refreshed from them).
+``--key-teacher DIR`` (K2 and L1a, leaf banks) distills a text-embedding teacher into
+the retrieval heads: per read and space, ``--key-teacher-weight`` x KL(softmax(teacher
+cos / ``--key-teacher-tau``) || softmax(scores)) over the retrieval loss's candidate
+list, optionally with the teacher's top records as extra positives
+(``--key-teacher-positives``). The cache (``teacher-keys``: record embeddings and one
+query embedding per search site from the site's causal prefix text,
+``schnitz.kb.teacher_keys``) is training supervision only; reads still query from the
+decoder state and search stored latent keys (invariant 1).
 
 Content dependence (all off by default): ``--contrast-weight`` adds per episode
 weight x relu(``--contrast-margin`` + NLL_retrieved - NLL_shuffled), the shuffled arm
@@ -86,7 +94,7 @@ content nats over the shuffled controls), recall, effective items per read and t
 share of reads that retrieve written items. Without ``--writes``, ``memory_write``
 calls and their acknowledgements are left out of the render.
 
-Entry point: ``scripts/train.py l1 build|train ...``. Training-only; the decoder
+Entry point: ``scripts/train.py l1 build|rows|train|teacher-keys ...``. Training-only; the decoder
 parts run in ``sdkb-bgkit``.
 """
 from __future__ import annotations
@@ -111,8 +119,8 @@ from schnitz.kb.bank import (SpanCache, Transcripts, build_caches, kb_dir, read_
 from schnitz.kb.decoder import LEVELS, length_factors
 from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, producer_params
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
-                             L1Reader, ReadConfig, current_ids, producer_index, source_index,
-                             splice)
+                             L1Reader, ReadConfig, TeacherSite, current_ids, producer_index,
+                             source_index, splice)
 from schnitz.kb.stack import SPACES, KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
@@ -396,6 +404,7 @@ class Context:
         # outputs over this KB's items, the leaves) are what reads see
         self.views = views or {}
         self.key_optimizer = None      # learned keys (``read.KeyOptimizer``), set by train
+        self.key_teacher: KeyTeacher | None = None   # --key-teacher, set by train
         # item id -> (producer, sources) of the current items, per KB and space
         self.origin = {name: {s: producer_index(kb, s) for s in kb.spaces}
                        for name, kb in kbs.items()}
@@ -487,10 +496,47 @@ class Context:
         return {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())] for s in index}
 
 
+@dataclasses.dataclass
+class KeyTeacher:
+    """``--key-teacher``: a text-embedding teacher cache (``schnitz.kb.teacher_keys``)
+    distilled into the retrieval heads at training reads (``L1Reader.read``'s
+    ``teacher``), with its temperature and the number of teacher-mined positives."""
+    cache: object                  # teacher_keys.TeacherKeys
+    tau: float = 0.05
+    positives: int = 0
+
+    def site(self, ctx: Context, ep: Episode, j: int) -> TeacherSite:
+        """The teacher of search site j of ``ep`` (KeyError for a site not in the
+        cache). Items get their record's embedding when they are one bank record's
+        codec item; written items get none. Mined positives: the teacher's top
+        records of the episode's KB, the slot's neutral records left out."""
+        query = self.cache.query(ep.episode_id, j)
+        origin = ctx.origin
+
+        def keys(space: str, refs):
+            out = []
+            for dataset, item_id in refs:
+                producer, sources = origin[dataset][space].get(item_id, (None, ()))
+                out.append(self.cache.record(sources[0])
+                           if producer == 'codec' and len(sources) == 1 else None)
+            return out
+        positives = None
+        if self.positives > 0:
+            slot = ep.slots[j]
+            names = self.cache.mined(ep.episode_id, j, self.positives, kb=ep.kb,
+                                     skip=set(slot.get('neutral') or ())
+                                     - set(slot['record_ids']) - set(slot.get('alternatives') or ()))
+            index = ctx.index[ep.kb]
+            positives = {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())]
+                         for s in index}
+        return TeacherSite(query, keys, self.tau, positives)
+
+
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
                 spans: list[torch.Tensor] | None = None, retrieval_only: bool = False,
                 negatives: dict | None = None, producer=None,
-                weights: dict[str, float] | None = None, donors: list | None = None):
+                weights: dict[str, float] | None = None, donors: list | None = None,
+                teacher: bool = False):
     """Task NLL (summed over target tokens) of one transcript and its reads.
 
     ``mode`` 'retrieve' or 'gold' computes each read at its call from the exact causal
@@ -506,8 +552,10 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
     ``negatives`` (per space, the episode's own KB only): in-batch negatives of the
     retrieval loss. ``producer`` (L1b): read items' values from their sources. Reads
     never retrieve the episode's own write items (``Context.own_writes``). ``weights``:
-    per-item gate multipliers (item id -> w; B9's gold weight)."""
+    per-item gate multipliers (item id -> w; B9's gold weight). ``teacher``: retrieved
+    reads get the site's key teacher (``ctx.key_teacher``; training only)."""
     exclude = ctx.own_writes(ep)
+    teach = teacher and ctx.key_teacher is not None and mode == 'retrieve'
     embeds = ctx.frozen.embed(ep.ids)
     reads = []
     if mode == 'fixed':
@@ -550,7 +598,9 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                            exclude=exclude,
                                            producer=None if mode == 'gold'
                                            or getattr(cache, 'superposed', False) else producer,
-                                           weights=weights)
+                                           weights=weights,
+                                           teacher=ctx.key_teacher.site(ctx, ep, j) if teach
+                                           else None)
                 reads.append(read)
                 spans.append(read.span.float().detach() if retrieval_only
                              else read.span.float())
@@ -1133,7 +1183,9 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     tokens = sum(int(ep.targets.numel()) for ep in episodes)
     weight = retrieval_weight(args, step)
     stats: dict[str, list] = {}
-    nll_total, aux_total, balance_total = 0.0, 0.0, 0.0
+    nll_total, aux_total, balance_total, teacher_total = 0.0, 0.0, 0.0, 0.0
+    teacher_weight = getattr(args, 'key_teacher_weight', 0.0) \
+        if ctx.key_teacher is not None else 0.0
     negatives = batch_negatives(ctx, episodes, args.inbatch_negatives,
                                 rng or random.Random(step)) if args.inbatch_negatives else {}
     if producer is not None:
@@ -1166,7 +1218,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         gold_count += mode == 'gold'
         nll, _, reads, spans = run_episode(ctx, ep, cache, mode,
                                            retrieval_only=args.retrieval_only,
-                                           negatives=negatives.get(ep.kb), producer=producer)
+                                           negatives=negatives.get(ep.kb), producer=producer,
+                                           teacher=ctx.key_teacher is not None)
         terms = [] if nll is None else [nll / tokens]
         if kl_weight > 0:
             kl_value = parent_kl(ctx, ep)
@@ -1178,6 +1231,12 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             aux_mean = torch.stack(aux).mean()
             terms.append(weight * aux_mean / len(episodes))
             aux_total += aux_mean.item() / len(episodes)
+        kls = [r.teacher_kl for r in reads if r.teacher_kl is not None]
+        if kls:
+            kl_mean = torch.stack(kls).mean()
+            if teacher_weight:
+                terms.append(teacher_weight * kl_mean / len(episodes))
+            teacher_total += kl_mean.item() / len(episodes)
         if args.balance_weight and not args.retrieval_only:
             balance = _balance(ctx, reads, usage, cache)
             if balance is not None:
@@ -1252,6 +1311,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
                 **counts, **_mean(stats), 'step_s': round(time.time() - started, 3)})
     if args.balance_weight and not args.retrieval_only:
         out['balance'] = balance_total
+    if ctx.key_teacher is not None:
+        out['teacher_kl'] = teacher_total
     if not args.retrieval_only:
         out['nll'] = nll_total / tokens
     return out
@@ -1630,6 +1691,22 @@ ITEM_LR = 3e-3          # live items of a leaf bank (L1a, K2) and leaves under t
 ROWS_ITEM_LR = 1e-2     # free rows in the read phase (smoke: 3e-2 overfits after 100 steps)
 
 
+def load_key_teacher(args, views) -> KeyTeacher:
+    """``--key-teacher``: the cache written by ``teacher-keys``; leaf banks only."""
+    from schnitz.kb.teacher_keys import TeacherKeys
+    if views:
+        raise ValueError('--key-teacher needs leaf banks (items with one record each), '
+                         'not superposed rows')
+    teacher = KeyTeacher(TeacherKeys(args.key_teacher), args.key_teacher_tau,
+                         args.key_teacher_positives)
+    print(json.dumps({'key_teacher': str(args.key_teacher),
+                      'model': teacher.cache.manifest.get('model'),
+                      'sites': len(teacher.cache.sites), 'records': len(teacher.cache.record_ids),
+                      'weight': args.key_teacher_weight, 'tau': args.key_teacher_tau,
+                      'positives': args.key_teacher_positives}), flush=True)
+    return teacher
+
+
 def train(args) -> None:
     model = load_model(args)
     lm = model.decoder.base_lm
@@ -1782,6 +1859,8 @@ def train(args) -> None:
             anchor_kb.close()
     ctx = Context(frozen, reader, kbs, views=views, prefix=prefix)
     ctx.key_optimizer = key_optimizer
+    if args.key_teacher is not None:
+        ctx.key_teacher = load_key_teacher(args, views)
     tok = model.tok
     writer = Writer(model, stack, frozen.embed, batch=args.write_batch) \
         if args.writes or 'l1b' in phases else None
@@ -1831,6 +1910,10 @@ def train(args) -> None:
         return ep
 
     train_rows = Transcripts(args.transcripts, 'train', args.limit)
+    if ctx.key_teacher is not None:      # refuse a cache that misses a training site
+        for row in train_rows:
+            for j in range(len(slots_of(row))):
+                ctx.key_teacher.cache.site(row['episode_id'], j)
     eval_eps = [ep for ep in map(episode, Transcripts(args.transcripts, 'validation',
                                                       args.eval_limit)) if ep is not None]
     eval_skip, skipped = dict(skipped), {}
@@ -1975,8 +2058,9 @@ def train(args) -> None:
 
 
 def add_args(parser: argparse.ArgumentParser) -> None:
-    """Arguments of all actions (``build``, ``rows``, ``train``) on one parser."""
-    parser.add_argument('action', choices=('build', 'rows', 'train'))
+    """Arguments of all actions (``build``, ``rows``, ``train``, ``teacher-keys``) on one
+    parser."""
+    parser.add_argument('action', choices=('build', 'rows', 'train', 'teacher-keys'))
     parser.add_argument('--transcripts', type=Path, nargs='+',
                         help='memory transcript directories (v1 or v2; build and train)')
     parser.add_argument('--checkpoint', type=Path)
@@ -1984,8 +2068,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--reader-state', type=Path, help='B3 writer.pt (merged decoder); later B4')
     parser.add_argument('--codecs', type=Path, help='K1 stack.pt; random init when omitted')
     parser.add_argument('--limit', type=int, help='train transcripts per directory')
-    parser.add_argument('--eval-limit', type=int, default=256,
-                        help='validation transcripts per directory')
+    parser.add_argument('--eval-limit', type=int,
+                        help='validation transcripts per directory (256; teacher-keys: '
+                             'the banks\' own)')
     parser.add_argument('--query-layer', type=int, default=8)
     parser.add_argument('--key-hidden', type=int, default=512)
     parser.add_argument('--cuda-fraction', type=float, default=0.15)
@@ -2010,6 +2095,16 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                                  'builds that no L1b phase replays')
     build_args.add_argument('--distractors', type=int, default=0,
                             help='extra records per KB beyond those the transcripts name')
+    tk = parser.add_argument_group('teacher-keys (text-embedding teacher cache for --key-teacher)')
+    tk.add_argument('--teacher-model', default='Qwen/Qwen3-Embedding-0.6B',
+                    help='text-embedding model (Qwen3-Embedding style: last-token pooling)')
+    tk.add_argument('--teacher-batch-tokens', type=int, default=16384,
+                    help='padded tokens per embedding batch')
+    tk.add_argument('--teacher-query-tokens', type=int, default=1024,
+                    help='query prefix tokens kept (its end)')
+    tk.add_argument('--teacher-record-tokens', type=int, default=512)
+    tk.add_argument('--teacher-top', type=int, default=256,
+                    help='teacher top records stored per site (mined positives)')
     sup = parser.add_argument_group('superposed KB (rows; --rows-from-stack)')
     sup.add_argument('--field', help='field size per space for the row count, e.g. '
                                      'A=8,B=16,C=16,D=16 (rows = ceil(overlap / field x leaves))')
@@ -2071,7 +2166,19 @@ def add_args(parser: argparse.ArgumentParser) -> None:
                         '--retrieval-floor (0: constant)')
     t.add_argument('--retrieval-floor', type=float, default=0.0)
     t.add_argument('--retrieval-only', action='store_true',
-                   help='K2: only the retrieval loss; trains key heads and item keys')
+                   help='K2: only the retrieval loss (and --key-teacher\'s KL); trains key '
+                        'heads and item keys')
+    t.add_argument('--key-teacher', type=Path,
+                   help='text-embedding teacher cache (l1 teacher-keys) distilled into the '
+                        'retrieval heads at training reads (K2 and L1a; leaf banks)')
+    t.add_argument('--key-teacher-weight', type=float, default=1.0,
+                   help='weight of KL(softmax(teacher cos / tau) || softmax(scores)) over '
+                        'the retrieval loss\'s candidate list, per read and space')
+    t.add_argument('--key-teacher-tau', type=float, default=0.05,
+                   help='teacher temperature')
+    t.add_argument('--key-teacher-positives', type=int, default=0,
+                   help='teacher top-k records of the KB per site added as retrieval '
+                        'positives at weight 0.5 (neutral records left out)')
     t.add_argument('--inbatch-negatives', type=int, default=64,
                    help='per space: target items of the batch\'s other slots (same KB only) '
                         'scored as negatives in the retrieval loss (0: off)')
@@ -2179,7 +2286,44 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--no-operator-checkpoint', action='store_true')
 
 
+def teacher_keys(args) -> None:
+    """The text-embedding teacher cache for ``--key-teacher`` (``schnitz.kb.teacher_keys``):
+    the records of ``--banks`` (else ``record_sources`` of the transcripts) and every
+    search site of the first ``--limit`` train and ``--eval-limit`` validation
+    transcripts (with ``--banks`` their defaults are the banks' own)."""
+    from schnitz.kb import teacher_keys as tk
+    records, transcripts = None, args.transcripts
+    limit, eval_limit = args.limit, args.eval_limit
+    meta = {}
+    if args.banks is not None:
+        records, manifest = tk.bank_records(args.banks)
+        transcripts = transcripts or [Path(d) for d in manifest['transcripts']]
+        limit = limit if limit is not None else manifest['limit']
+        eval_limit = eval_limit if eval_limit is not None else manifest['eval_limit']
+        meta['banks'] = str(args.banks)
+    if not transcripts:
+        raise SystemExit('teacher-keys needs --transcripts or --banks')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        torch.cuda.set_per_process_memory_fraction(args.cuda_fraction)
+    embedder = tk.TextEmbedder(args.teacher_model, device,
+                               batch_tokens=args.teacher_batch_tokens,
+                               query_tokens=args.teacher_query_tokens,
+                               record_tokens=args.teacher_record_tokens)
+    out = tk.build(args.output, embedder, transcripts,
+                   {'train': limit, 'validation': eval_limit}, records,
+                   top=args.teacher_top, meta=meta,
+                   log=lambda x: print(json.dumps(x), flush=True))
+    print(json.dumps({'teacher_keys': str(args.output), 'records': out['records'],
+                      'sites': out['sites']}), flush=True)
+
+
 def run(args) -> None:
+    if args.action == 'teacher-keys':
+        teacher_keys(args)
+        return
+    if args.eval_limit is None:
+        args.eval_limit = 256
     if args.action == 'rows':
         if args.banks is None:
             raise SystemExit('rows needs --banks')
