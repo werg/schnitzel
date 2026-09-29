@@ -1262,3 +1262,21 @@ log your decisions and changes of direction"), newest last.
   information. Watch only_C/only_D rise without the stack dropping. Query arms so
   far: the prefix pool (arm b) lifts validation search recall to 0.39/0.40 in C/D
   by step 600, while the decoder-only arm (a) is still at chance.
+- 29 September (owner idea, discussion): multi-key and multi-query retrieval per space.
+  Write side: spaces with a smaller per-record width write several sub-records (the
+  same total width per space), each with its own learned key projection, kept apart
+  by a diversity penalty. Read side: several independently learned query heads per
+  space, each retrieving its own field, combined by R. Queued as options, cheapest
+  first:
+  (i) multi-query heads per space (read side only, no storage change): h heads,
+      union of the per-head top-k, a diversity penalty, recall at a fixed read
+      budget;
+  (ii) multi-key items: per-segment keys within a record, matched late-interaction
+      style (max over segment keys), with the record read whole; suits verbatim cues
+      that match part of a record;
+  (iii) cross-space complementarity: spaces read different records (MMR-style
+      exclusion across spaces), so one read covers more records;
+  (iv) the write-side split into sub-records. It changes storage and must train each
+      sub-record to be useful alone, so that no partial selection is served from a
+      full-record code (invariant 6).
+  All of them wait for the query-formulation arms.
