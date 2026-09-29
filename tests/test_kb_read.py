@@ -1152,6 +1152,74 @@ def test_only_reader_layers_below_n_get_gradients(tmp_path, checkpointing):
     assert all(p.grad is None for p in lm.parameters())
 
 
+@pytest.mark.parametrize('layer', [2, 3])
+def test_the_query_comes_from_the_configured_layer(tmp_path, layer):
+    lm, _ = tiny_lm()
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    ctx = l1.Context(l1.Frozen(lm, layer), reader(), {'ds': kb})
+    ep = episode(IDS, [3, 10], [6, 13])
+    with torch.no_grad():
+        _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=False))
+        x = ctx.frozen.embed(ep.ids[:4])[None]
+        hidden = lm.model(inputs_embeds=x, output_hidden_states=True).hidden_states
+    torch.testing.assert_close(reads[0].state, hidden[layer][0, 3].float())
+    assert not torch.equal(reads[0].state, hidden[layer - 1][0, 3].float())
+
+
+def test_train_below_query_is_the_query_layer():
+    from types import SimpleNamespace
+    args = SimpleNamespace(decoder_train_below='query', query_layer=12)
+    assert l1.resolve_train_below(args) == 12 and args.decoder_train_below == 12
+    assert l1.train_below('query') == 'query' and l1.train_below('8') == 8
+    assert l1.resolve_train_below(SimpleNamespace(decoder_train_below=0, query_layer=8)) == 0
+
+
+@pytest.mark.parametrize('pool', [False, True])
+def test_k2_trains_the_query_layers_not_the_parent(tmp_path, pool):
+    """Owner, 29 September: the model formulates its query. In K2 (--retrieval-only) the
+    retrieval loss, the teacher KL and the alignment reach the reader's own decoder layers
+    below the query layer; the parent (the writer's decoder) is untouched."""
+    import random
+    from schnitz.kb import teacher_keys as tk
+    from test_kb_teacher_keys import HashEmbedder, corpus, transcript
+    lm, _ = tiny_lm()
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    frozen = l1.Frozen(lm, 3, train_below=3)
+    for p in frozen.own.parameters():
+        p.requires_grad_(True)
+    ctx = l1.Context(frozen, reader(query_pool=pool), {'ds': kb})
+    d = corpus(tmp_path, [transcript('e', (['r1'], ['r2']))])
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    ctx.key_teacher = l1.KeyTeacher(tk.TeacherKeys(tmp_path / 'teacher'), 0.05, align=True)
+    ep = episode(IDS, [3, 10], [6, 13])
+    ep.episode_id = 'e'
+    for term in ('aux', 'teacher_kl', 'teacher_align'):
+        ctx.frozen.own.zero_grad(set_to_none=True)
+        ctx.reader.zero_grad(set_to_none=True)
+        _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                        teacher=True)
+        torch.stack([getattr(r, term) for r in reads]).mean().backward()
+        for layer in ctx.frozen.own:
+            assert any(p.grad is not None and p.grad.abs().sum() > 0
+                       for p in layer.parameters()), term
+        assert all(p.grad is None for p in lm.parameters())
+    ctx.frozen.own.zero_grad(set_to_none=True)
+    ctx.reader.zero_grad(set_to_none=True)
+    parent = {k: v.clone() for k, v in lm.state_dict().items()}
+    own = [p.detach().clone() for p in ctx.frozen.own.parameters()]
+    args = train_args(retrieval_only=True, retrieval_weight=1.0, key_teacher_weight=1.0,
+                      key_align_weight=10.0, decoder_train_below=3, lr=1e-3,
+                      l1b_codec_lr=1e-4, l1b_writer_lr=1e-5, decoder_lr=1e-3)
+    sets = l1.parameter_sets(ctx.reader, decoder=ctx.frozen)
+    sets.update(codecs=[], writer=[])
+    trainable = l1.set_phase(sets, l1.phase_set('l1a', args))
+    opt = torch.optim.AdamW(l1.optimizer_groups(sets, args))
+    out = l1.train_step(ctx, [ep], opt, args, 0, rng=random.Random(0), trainable=trainable)
+    assert 'decoder_kl' in out                       # parent preservation also in K2
+    assert any(not torch.equal(a, b) for a, b in zip(own, ctx.frozen.own.parameters()))
+    assert all(torch.equal(v, lm.state_dict()[k]) for k, v in parent.items())
+
+
 def test_key_optimizer_resumes_with_moments_of_any_device(tmp_path):
     kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(3)))
     opt = read_mod.KeyOptimizer(1e-2)

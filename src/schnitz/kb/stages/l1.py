@@ -1132,6 +1132,21 @@ def contrast_term(ctx: Context, ep: Episode, nll: torch.Tensor, donor_reads: lis
     return term, {'contrast': term.item(), 'content_nats_train': (shuf - ret).item()}
 
 
+def train_below(text: str) -> int | str:
+    """``--decoder-train-below``: a layer count, or ``query`` (the ``--query-layer``,
+    resolved by ``resolve_train_below``)."""
+    return text if text == 'query' else int(text)
+
+
+def resolve_train_below(args) -> int:
+    """``--decoder-train-below query`` -> the query layer (owner, 29 September: the
+    layers that formulate the query train); a number stays."""
+    below = getattr(args, 'decoder_train_below', 0)
+    if below == 'query':
+        below = args.decoder_train_below = int(args.query_layer)
+    return int(below)
+
+
 def decoder_replay_kl(args) -> float:
     """``--decoder-replay-kl``: 0.1 by default when the decoder trains, else 0."""
     if not getattr(args, 'decoder_train_below', 0):
@@ -1202,7 +1217,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     requests: list[WriteRequest] = []
     contrast_weight = 0.0 if args.retrieval_only else getattr(args, 'contrast_weight', 0.0)
     donor_of = contrast_donors(episodes) if contrast_weight > 0 else [None] * len(episodes)
-    kl_weight = 0.0 if args.retrieval_only else decoder_replay_kl(args)
+    # the parent-preservation KL also in K2: the query-formulating layers are the decoder's
+    kl_weight = decoder_replay_kl(args)
     done: dict[int, list] = {}       # episode index -> its reads (donor material)
     pending: dict[int, tuple] = {}   # episodes waiting for their donor's reads
     contrast: dict[str, list] = {}
@@ -1736,7 +1752,7 @@ def train(args) -> None:
     # --decoder-train-below: the reader decoder's lower layers are its own trainable
     # copies; the writer keeps running (and keeps the weights of) the parent decoder
     frozen = Frozen(lm, args.query_layer, model.core.autocast,
-                    train_below=args.decoder_train_below,
+                    train_below=resolve_train_below(args),
                     checkpointing=args.decoder_checkpoint)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
@@ -2288,11 +2304,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--decoder-checkpoint', action='store_true',
                    help='recompute frozen decoder layers in backward')
-    t.add_argument('--decoder-train-below', type=int, default=0,
+    t.add_argument('--decoder-train-below', type=train_below, default=0,
                    help='train the reader decoder\'s layers below N (their own copies; '
                         'embeddings, the layers from N up, final norm and LM head stay frozen, '
-                        'and the writer keeps the parent decoder\'s weights) in l1a and r; '
-                        '0: frozen. Starting point for LFM2.5-350M (16 layers): 8')
+                        'and the writer keeps the parent decoder\'s weights) in l1a, r and '
+                        'K2 (--retrieval-only: the retrieval, teacher and alignment terms '
+                        'train them, so the decoder formulates the query); \'query\': the '
+                        '--query-layer (every layer below the query state); 0: frozen')
     t.add_argument('--decoder-lr', type=float, default=3e-5,
                    help='--decoder-train-below: the decoder layers\' learning rate')
     t.add_argument('--decoder-replay-kl', type=float,
