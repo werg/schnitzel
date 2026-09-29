@@ -1338,3 +1338,10 @@ log your decisions and changes of direction"), newest last.
   0.443/0.277 at 10500), stack 0.817. B4 at step 6500: call accuracy 0.92, x4
   stop_missing back to 0.20. Disk: the superseded recall read-teacher dir was deleted
   (metrics kept).
+- 29 September: the query-module arm with a layer-12 query (ef12) stayed at chance
+  through 600 steps (0.00-0.03). The module path is parked until its gradient/output
+  norms are understood. The backbone-only layer-12 arm (c: query at layer 12,
+  trainable layers 0-11) already reaches 0.04/0.13/0.17/0.00 at step 150, faster
+  than the layer-8 arm (a) at the same point. Cold run data moved to
+  /mnt/external/sdkb-archive/runs/cold-20260929 (root disk 161 GB free). Hot runs
+  stay on the NVMe and finished ones move there asynchronously (owner).
