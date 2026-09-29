@@ -1287,3 +1287,8 @@ log your decisions and changes of direction"), newest last.
   distillation from A's reconstruction; (3) otherwise, D as a coarse index space
   (coarse to fine). The write-side sub-record split stays deferred; per-segment
   keys (option ii) cover the retrieval-granularity part of it.
+- 29 September: K1 (rebalanced) crashed at step ~10575 with CUDA OOM (a transient
+  shared-memory peak while B4, K1 and the query-arm run shared the GPU) and resumes
+  from step 10500. At step 10500 the rebalanced run had not moved C/D yet (only_C
+  0.443, only_D 0.277). Disk was below 40 GB free, so the superseded parallel
+  read-teacher run dir was deleted (metrics kept).
