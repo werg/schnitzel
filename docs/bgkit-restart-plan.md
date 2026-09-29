@@ -1104,3 +1104,32 @@ log your decisions and changes of direction"), newest last.
   about a third of that gain carries content. The recall-text read phase crashed at
   step ~800 when its transcripts were regenerated with neutral items under it. It
   resumes from its checkpoint on the new transcripts.
+- 29 September: can a text embedder find these records from the causal prefix
+  alone? Setup: Qwen3-Embedding-0.6B (fp16, frozen, instruction-prefixed query).
+  The query is the causal prefix at each search site, rendered as text: system,
+  user, earlier turns, with earlier memory results as a placeholder. It has no
+  target and no slot contents (invariant 2). The candidates are every record the
+  L1 bank build banks for 1000 train + 32 validation transcripts, no later than
+  the query time. Neutral records are left out. A hit is any slot record or
+  alternative in the top k. Recall@1/5/20/64 on validation sites:
+  - recall-text r8: 0.74/0.81/0.86/0.90 (70 sites, 13,114 records).
+  - parallel-recall: 0.33/0.57/0.71/0.86 (51 sites, 12,371 records).
+  - citance-recall: 0.69/0.91/1.00/1.00 (32 sites, 9,481 records).
+  - r6-mixed: 0.77/0.93/0.98/0.98 (44 sites, about 98 records per domain KB).
+
+  On the first 1000 train transcripts the numbers agree:
+  - recall-text: 0.74/0.79/0.86/0.90 (2285 sites).
+  - parallel-recall: 0.38/0.57/0.71/0.81 (1300 sites).
+  - citance-recall: 0.74/0.94/0.98/0.99 (1000 sites).
+  - r6-mixed: 0.61/0.89/0.94/0.98 (1611 sites).
+
+  So recall-text retrieval is feasible from the prefix. The title names the
+  document, and alternatives cover the windows. Its chance-level K2 result is a
+  failure of the learned heads, not of the task. Parallel-recall is harder even
+  for the teacher, because the other translations of a verse compete. K2 and L1a
+  can now distill the teacher: `--key-teacher` with a cache from
+  `l1 teacher-keys`. The loss is a KL over the retrieval loss's candidate list at
+  tau 0.05, with optional teacher-mined positives at weight 0.5. The teacher is
+  training-only supervision. Caches: `kb-read-recall/teacher-keys` and
+  `kb-read-parallel/teacher-keys`. Diagnostic caches for citance and r6 are under
+  `teacher-diag/`.
