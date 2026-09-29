@@ -1280,3 +1280,10 @@ log your decisions and changes of direction"), newest last.
       sub-record to be useful alone, so that no partial selection is served from a
       full-record code (invariant 6).
   All of them wait for the query-formulation arms.
+- 29 September (owner agreed): the coarse spaces' weakness (only_D 0.28 vs only_A 0.80
+  in K1) is codec quality, not raw bandwidth. Every space already stores 256 values
+  per rep. Order of remedies: (1) the rebalanced K1 run (single weight 1.0, A
+  dropout 0.75); (2) if C/D plateau low, more codec capacity for C/D or
+  distillation from A's reconstruction; (3) otherwise, D as a coarse index space
+  (coarse to fine). The write-side sub-record split stays deferred; per-segment
+  keys (option ii) cover the retrieval-granularity part of it.
