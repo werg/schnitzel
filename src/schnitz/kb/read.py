@@ -285,22 +285,32 @@ class TeacherSite:
     own positives, which keep weight 1, nor neutral or excluded items). ``basis``
     (teacher width, key width; ``TeacherKeys.basis``): the alignment term, the query key
     and the scored items' keys pulled toward the teacher embeddings projected on the
-    basis (``teacher_alignment``)."""
+    basis (``teacher_alignment``). ``centers`` (query mean, record mean;
+    ``TeacherKeys.centers``, ``--key-align-center``): the teacher embeddings are centered
+    per tower before the projection."""
     query: Tensor
     keys: Callable[[str, Sequence[Ref]], list[Tensor | None]]
     tau: float = 0.05
     positives: Mapping[str, Sequence[Ref]] | None = None
     basis: Tensor | None = None
+    centers: tuple[Tensor, Tensor] | None = None
 
 
-def teacher_alignment(keys: Tensor, teacher: Tensor, basis: Tensor) -> Tensor:
+def teacher_alignment(keys: Tensor, teacher: Tensor, basis: Tensor,
+                      center: Tensor | None = None) -> Tensor:
     """Mean of 1 - cos(key, unit(teacher @ basis)) over rows: our unit keys (n, key
     width) against the teacher's unit embeddings (n, teacher width) projected on
     ``basis`` (the records' top principal directions). With both towers aligned the
     score ranks as the teacher's cosine does, also for items and requests the
     retrieval loss never named (29 September: the list losses alone memorize the
-    training documents and stay at chance on unseen ones)."""
-    target = nn.functional.normalize(teacher.float() @ basis.to(teacher.device).float(), dim=-1)
+    training documents and stay at chance on unseen ones). ``center`` (teacher width) is
+    subtracted first: uncentered teacher queries share a large common direction (mean
+    pairwise cosine 0.53 on recall-text r8; one constant key scores 0.27 against all of
+    them), an attractor onto which the query keys collapsed (29 September, arm e+f)."""
+    teacher = teacher.float()
+    if center is not None:
+        teacher = teacher - center.to(teacher.device).float()
+    target = nn.functional.normalize(teacher @ basis.to(teacher.device).float(), dim=-1)
     return (1 - (keys.float() * target.to(keys.device)).sum(-1)).mean()
 
 
@@ -612,7 +622,8 @@ class L1Reader(nn.Module):
         """``teacher_alignment`` of the query key and of the keys of the scored
         candidates, the slot's positives and the in-batch negatives (items no later than
         the query time, not excluded, with a teacher embedding)."""
-        term = teacher_alignment(q[None], teacher.query[None], teacher.basis)
+        mq, mr = teacher.centers if teacher.centers is not None else (None, None)
+        term = teacher_alignment(q[None], teacher.query[None], teacher.basis, mq)
         seen = set(refs)
         extra = [r for r in dict.fromkeys([*positives, *negatives])
                  if r not in seen and r not in banned]
@@ -628,7 +639,7 @@ class L1Reader(nn.Module):
         if idx:
             term = term + teacher_alignment(keys[torch.tensor(idx, device=keys.device)],
                                             torch.stack([embedded[k] for k in idx]),
-                                            teacher.basis)
+                                            teacher.basis, mr)
         return term
 
     def _item_keys(self, space: str, cache, by_dataset, refs: Sequence[Ref],

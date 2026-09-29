@@ -338,3 +338,37 @@ def test_alignment_trains_the_heads_and_is_logged(tmp_path):
     opt = torch.optim.AdamW(ctx.reader.trainable(), lr=1e-3)
     out = l1.train_step(ctx, [ep], opt, args, 0, rng=random.Random(0))
     assert out['teacher_align'] > 0
+
+
+def test_centered_alignment_removes_the_common_direction_attractor():
+    """Teacher vectors sharing a large common direction: one constant key at that
+    direction scores well against all of them uncentered, and not at all centered."""
+    from schnitz.kb.read import teacher_alignment
+    gen = torch.Generator().manual_seed(0)
+    common = torch.nn.functional.normalize(torch.randn(24, generator=gen), dim=0)
+    teacher = torch.nn.functional.normalize(
+        10.0 * common + torch.randn(200, 24, generator=gen), dim=-1)
+    basis = torch.eye(24)
+    constant = common[None].expand(200, -1)
+    plain = float(teacher_alignment(constant, teacher, basis))
+    centered = float(teacher_alignment(constant, teacher, basis, teacher.mean(0)))
+    assert plain < 0.2 and centered > 0.9
+
+
+def test_key_teacher_center_passes_centers_and_a_centered_basis(tmp_path):
+    ctx, _ = context(tmp_path)
+    d = corpus(tmp_path, [transcript('e', (['r1'], ['r2']))])
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    cache = tk.TeacherKeys(tmp_path / 'teacher')
+    ep = episode(IDS, [3, 10], [6, 13])
+    plain = l1.KeyTeacher(cache, 0.05, align=True).site(ctx, ep, 0)
+    site = l1.KeyTeacher(cache, 0.05, align=True, center=True).site(ctx, ep, 0)
+    assert plain.centers is None and site.centers is not None
+    mq, mr = site.centers
+    torch.testing.assert_close(mq, cache.queries.float().mean(0))
+    torch.testing.assert_close(mr, cache.records.float().mean(0))
+    assert not torch.equal(site.basis, plain.basis)
+    ctx.key_teacher = l1.KeyTeacher(cache, 0.05, align=True, center=True)
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                    teacher=True)
+    assert all(r.teacher_align is not None for r in reads)

@@ -238,19 +238,27 @@ class TeacherKeys:
         self.sites = json.loads((self.root / 'sites.json').read_text())
         self.site_row = {(s['episode_id'], int(s['call'])): i for i, s in enumerate(self.sites)}
 
-    def basis(self, width: int = 256) -> torch.Tensor:
+    def basis(self, width: int = 256, centered: bool = False) -> torch.Tensor:
         """(teacher width, ``width``): the records' top ``width`` right singular vectors
-        (uncentered), the subspace the retrieval heads' keys align to
+        (uncentered, or with ``centered`` of the centered records), the subspace the retrieval heads' keys align to
         (``read.teacher_alignment``, ``--key-align-weight``). On recall-text r8 the
         teacher's own ranking in it keeps its quality (validation R@1/8/64
         0.74/0.83/0.90 against 0.74/0.84/0.90 in the full space)."""
-        cached = getattr(self, '_basis', None)
-        if cached is None or cached.shape[1] != width:
-            vh = torch.linalg.svd(self.records.float(), full_matrices=False).Vh[:width]
+        cache = self.__dict__.setdefault('_bases', {})
+        cached = cache.get((width, centered))
+        if cached is None:
+            x = self.records.float()
+            if centered:          # principal directions of the centered records
+                x = x - x.mean(0)
+            vh = torch.linalg.svd(x, full_matrices=False).Vh[:width]
             basis = torch.zeros(self.records.shape[1], width)   # fewer directions: zero columns
             basis[:, :vh.shape[0]] = vh.t()
-            cached = self._basis = basis
+            cached = cache[(width, centered)] = basis
         return cached
+
+    def centers(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The mean site query and the mean record embedding (``--key-align-center``)."""
+        return self.queries.float().mean(0), self.records.float().mean(0)
 
     def site(self, episode_id: str, call: int) -> int:
         row = self.site_row.get((episode_id, int(call)))

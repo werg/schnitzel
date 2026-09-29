@@ -570,6 +570,7 @@ class KeyTeacher:
     tau: float = 0.05
     positives: int = 0
     align: bool = False            # --key-align-weight > 0: sites carry the teacher basis
+    center: bool = False           # --key-align-center: per-tower centered alignment
 
     def site(self, ctx: Context, ep: Episode, j: int) -> TeacherSite:
         """The teacher of search site j of ``ep`` (KeyError for a site not in the
@@ -596,7 +597,8 @@ class KeyTeacher:
             positives = {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())]
                          for s in index}
         return TeacherSite(query, keys, self.tau, positives,
-                           self.cache.basis(KEY_WIDTH_ALL) if self.align else None)
+                           self.cache.basis(KEY_WIDTH_ALL, self.center) if self.align else None,
+                           self.cache.centers() if self.align and self.center else None)
 
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
@@ -1863,7 +1865,8 @@ def load_key_teacher(args, views) -> KeyTeacher:
                          'not superposed rows')
     teacher = KeyTeacher(TeacherKeys(args.key_teacher), args.key_teacher_tau,
                          args.key_teacher_positives,
-                         align=getattr(args, 'key_align_weight', 0.0) > 0)
+                         align=getattr(args, 'key_align_weight', 0.0) > 0,
+                         center=getattr(args, 'key_align_center', False))
     print(json.dumps({'key_teacher': str(args.key_teacher),
                       'model': teacher.cache.manifest.get('model'),
                       'sites': len(teacher.cache.sites), 'records': len(teacher.cache.record_ids),
@@ -2382,6 +2385,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--soft-anneal', type=int, default=0,
                    help='--soft-read: steps over which candidates fall to --keep and tau '
                         'rises to --soft-tau-end; sparse reads after (0: constant soft read)')
+    t.add_argument('--key-align-center', action='store_true',
+                   help='--key-align-weight: center the teacher queries and records (per '
+                        'tower means) before projecting; removes the common-direction '
+                        'attractor that collapsed the query keys (29 Sep)')
     t.add_argument('--query-former', action='store_true',
                    help='query formulation module: per space call-conditioned latents '
                         'cross-attending over the call\'s causal prefix, then self-attention '
