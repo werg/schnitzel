@@ -1431,3 +1431,14 @@ log your decisions and changes of direction"), newest last.
   `kb-read-recall/k2-f-long` (3000 steps, K2) to see where the recipe plateaus.
   Next, once its banks and a teacher cache are ready: K2 on the inverse-cloze corpus,
   then L1a with `--decoder-query-only` on top.
+- 30 September: first strong retrieval. K2 on inverse-cloze recall-text (arm-f recipe,
+  71,743-item KB) reaches validation search recall 0.78/0.86/0.92/0.89 (A-D) at step
+  750 on documents never trained on, up from 0.25/0.16/0.19/0.14 at step 250. The
+  cues are sentences of the stored text, which makes this easier than recall-text's
+  continuation cues. The recall-text K2 run with the same recipe is at
+  0.27/0.30/0.46/0.57 at step 450. Plan: let the inverse-cloze K2 run to a plateau,
+  then evaluate its reader zero-shot on recall-text retrieval. Then start L1a
+  content use (`--init-reader` from it, `--decoder-query-only`, gold-read warm
+  start, contrast) on recall-text, and later on citances and QA.
+  B4's dip at step 13000 recovered at 13500 (s0 student-free 0.90, s1 0.78), so no
+  change there.
