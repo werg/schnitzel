@@ -1454,3 +1454,9 @@ log your decisions and changes of direction"), newest last.
   The step-0 recall of 0 was stale keys in the copied banks (rekeyed within 25 steps).
   The gap between retrieved and gold (2.57 vs 1.16) is now the target: retrieval
   quality at the read budget, and R reading several retrieved windows.
+- 30 September: L1a on recall-text is still improving. Content through retrieval was
+  0.22 -> 0.32 -> 0.34 nats at steps 250/500/750 (retrieved 2.503, shuffled 2.847 at
+  750). Search recall is 0.61/0.80/0.83/0.86, but the positive is among the items
+  actually read only 0.39/0.51/0.59/0.64 of the time (keep 2/2/3/4, span cap 16
+  reps). That explains most of the remaining gap to gold reads (1.062). Levers once
+  the run plateaus: a better top-k ordering (hard negatives), keep, and the span cap.
