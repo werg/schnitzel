@@ -1419,3 +1419,15 @@ log your decisions and changes of direction"), newest last.
     stayed negligible), and centered alignment (uncentered teacher queries share a
     direction a constant key scores 0.27 against). The former is kept as an option
     and not pursued; the module-free backbone arm f is the recipe.
+- 30 September: the retrieval fix is merged (1085 tests). The recipe is arm f: the
+  query is the call-token state at the final layer; LoRA 16 on all reader-decoder
+  layers at 5e-4 with parent KL 1.0; centered alignment of both key towers to the
+  teacher, weight 10; teacher KL 1. In 600 K2 steps it reached validation search
+  recall 0.36/0.39/0.66/0.73 on unseen documents, against the teacher's
+  0.80-0.84 R@8. Within-episode query cosine is 0.85, across episodes 0.13. The
+  query module collapsed in every variant and is not pursued. On a 1000-record KB
+  with the task loss, the trained layers memorized training answers, so L1a
+  uses `--decoder-query-only`: the task pass reads with the parent decoder. Started
+  `kb-read-recall/k2-f-long` (3000 steps, K2) to see where the recipe plateaus.
+  Next, once its banks and a teacher cache are ready: K2 on the inverse-cloze corpus,
+  then L1a with `--decoder-query-only` on top.
