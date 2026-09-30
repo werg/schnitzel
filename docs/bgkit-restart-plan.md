@@ -1442,3 +1442,15 @@ log your decisions and changes of direction"), newest last.
   start, contrast) on recall-text, and later on citances and QA.
   B4's dip at step 13000 recovered at 13500 (s0 student-free 0.90, s1 0.78), so no
   change there.
+- 30 September: first end-to-end content through retrieval. L1a on recall-text r8
+  (`kb-l1-recall`: reader from inverse-cloze K2 step 1250, `--decoder-query-only`,
+  gold reads 0.5 annealing, contrast, null prefix; K1 codecs of step 15500), step 250,
+  32 validation episodes on unseen documents:
+  - retrieved 2.575 nats vs shuffled 2.799, so reads carry 0.22 nats of content
+    (it was 0.00 in every earlier recall-text run);
+  - gold reads 1.162 vs gold-shuffled 3.212 (2.05 nats of content);
+  - no context 3.056, text context 0.393;
+  - validation search recall 0.37/0.77/0.73/0.81 (A-D).
+  The step-0 recall of 0 was stale keys in the copied banks (rekeyed within 25 steps).
+  The gap between retrieved and gold (2.57 vs 1.16) is now the target: retrieval
+  quality at the read budget, and R reading several retrieved windows.
