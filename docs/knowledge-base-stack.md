@@ -280,6 +280,9 @@ applies to every stage.
    query layer is configurable (`--query-layer`, default 8; 12 is the deeper
    arm). The writer keeps the parent decoder. Consumers of such a reader (L2, B9)
    must load its decoder layers; until that is built they refuse the checkpoint.
+   With the task loss (L1a) the trained layers must formulate the query only
+   (`--decoder-query-only`: the task pass reads with the parent decoder): on a
+   1000-record KB they otherwise memorized the training answers within 300 steps.
    *Query pool (reference scaffold).* With `--query-pool` the query state is the
    call state plus a learned attention pool over the query-layer states of the
    call's causal prefix (up to and including the call; four learned attention

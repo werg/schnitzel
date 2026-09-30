@@ -1189,6 +1189,19 @@ log your decisions and changes of direction"), newest last.
     episode 0.85, across episodes 0.13; 10.6 s/step, 7.0 GB. Best arm.
   - f12: the same at layer 12 (LoRA on layers 0-11): 0.14/0.27/0.56/0.76; rank -> 90;
     parent KL 0.12, text NLL 0.44; 11.0 s/step, 7.0 GB.
+  - d: retrieval + task on a 1000-record recall-text KB (`banks-small-1000`), arm f's
+    recipe, 300 steps: soft superposed reads (`--soft-read`, 128 candidates, tau
+    10 -> 100 over 200 steps, then sparse) 0.24/0.41/0.67/0.83, content 0.02 nats;
+    sparse reads 0.21/0.50/0.61/0.76, content 0.01 nats. No clear difference, and soft
+    reads cost 43 s/step at 105 candidates (11 s sparse). Both memorized the training
+    answers through the reader's trained layers (train NLL 2.5 -> 0.08; validation
+    retrieved NLL 4.2-4.4 against 3.06 without memory; text arm 0.39 -> 0.23-0.25), so
+    with the task loss the trained layers must formulate the query only:
+    `--decoder-query-only` (the task pass reads with the parent decoder; built and
+    tested, not yet run).
+  Next: K2 with arm f's recipe to plateau on recall-text (and parallel), then the read
+  phase with `--decoder-query-only`. L2/B9 refuse readers with trained decoder layers
+  until loading them is built.
   - e+f with the query former: at layer 16 and 12 the former collapsed onto
     content-free queries (query-key cosine 1.000 across episodes, anti-correlated
     between the calls of one episode; former state effective rank 1.0) and stayed at
