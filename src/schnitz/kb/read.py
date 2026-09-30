@@ -96,6 +96,20 @@ class ReadConfig:
     # leaf moved by the retrieval and gate gradients, ``KeyOptimizer``), not the item-key
     # heads applied to its values; the search index is the live keys themselves
     learned_keys: bool = False
+    # the query state pools the call's causal prefix (``KeyHeads(pool=True)``, 29 September:
+    # the call token's own state carries almost nothing of the request); off keeps stored
+    # configs' meaning
+    query_pool: bool = False
+    # a query-formulation module (``KeyHeads(former=True)``, owner 29 September): per space
+    # call-conditioned latents cross-attending over the call's causal prefix
+    query_former: bool = False
+    # soft superposed read (owner, 29 September; a query-training aid): a training read
+    # takes ``soft_candidates`` per space (0: every item the search can return) with gates
+    # softmax(soft_tau * cos) over them, all nonzero, so the task loss reaches the query
+    # through every candidate's weight; the trainer anneals it toward the sparse read
+    soft_read: bool = False
+    soft_candidates: int = 256
+    soft_tau: float = 10.0
 
 
 class ItemCache:
@@ -256,6 +270,8 @@ class Read:
     recall_at: dict = field(default_factory=dict)
     state: Tensor | None = None   # the query-layer state the read was made for (detached)
     teacher_kl: Tensor | None = None  # mean over spaces of the key-teacher KL (TeacherSite)
+    teacher_align: Tensor | None = None  # mean over spaces of the teacher alignment (basis)
+    queries: dict = field(default_factory=dict)   # per space: the unit query key (detached)
 
 
 @dataclass
@@ -266,11 +282,50 @@ class TeacherSite:
     embedding of each item's record, None for an item without one (written items,
     rows); ``tau``: the teacher's temperature; ``positives`` (per space): teacher-mined
     extra positives of the retrieval loss at weight ``MINED_WEIGHT`` (never the slot's
-    own positives, which keep weight 1, nor neutral or excluded items)."""
+    own positives, which keep weight 1, nor neutral or excluded items). ``basis``
+    (teacher width, key width; ``TeacherKeys.basis``): the alignment term, the query key
+    and the scored items' keys pulled toward the teacher embeddings projected on the
+    basis (``teacher_alignment``). ``centers`` (query mean, record mean;
+    ``TeacherKeys.centers``, ``--key-align-center``): the teacher embeddings are centered
+    per tower before the projection."""
     query: Tensor
     keys: Callable[[str, Sequence[Ref]], list[Tensor | None]]
     tau: float = 0.05
     positives: Mapping[str, Sequence[Ref]] | None = None
+    basis: Tensor | None = None
+    centers: tuple[Tensor, Tensor] | None = None
+
+
+def teacher_alignment(keys: Tensor, teacher: Tensor, basis: Tensor,
+                      center: Tensor | None = None) -> Tensor:
+    """Mean of 1 - cos(key, unit(teacher @ basis)) over rows: our unit keys (n, key
+    width) against the teacher's unit embeddings (n, teacher width) projected on
+    ``basis`` (the records' top principal directions). With both towers aligned the
+    score ranks as the teacher's cosine does, also for items and requests the
+    retrieval loss never named (29 September: the list losses alone memorize the
+    training documents and stay at chance on unseen ones). ``center`` (teacher width) is
+    subtracted first: uncentered teacher queries share a large common direction (mean
+    pairwise cosine 0.53 on recall-text r8; one constant key scores 0.27 against all of
+    them), an attractor onto which the query keys collapsed (29 September, arm e+f)."""
+    teacher = teacher.float()
+    if center is not None:
+        teacher = teacher - center.to(teacher.device).float()
+    target = nn.functional.normalize(teacher @ basis.to(teacher.device).float(), dim=-1)
+    return (1 - (keys.float() * target.to(keys.device)).sum(-1)).mean()
+
+
+def _of(state: Tensor | Mapping[str, Tensor], space: str) -> Tensor:
+    """A space's query state: per space with a query former, else shared."""
+    return state[space] if isinstance(state, Mapping) else state
+
+
+def _detached(state: Tensor | Mapping[str, Tensor]):
+    return {s: v.detach() for s, v in state.items()} if isinstance(state, Mapping) \
+        else state.detach()
+
+
+def _device(state: Tensor | Mapping[str, Tensor]) -> torch.device:
+    return next(iter(state.values())).device if isinstance(state, Mapping) else state.device
 
 
 def current_ids(kb: KnowledgeBase, space: str) -> list[str]:
@@ -326,7 +381,8 @@ class L1Reader(nn.Module):
         super().__init__()
         self.config = c = config
         self.spaces = list(SPACES)
-        self.keys = KeyHeads(c.hidden, c.key_hidden)
+        self.keys = KeyHeads(c.hidden, c.key_hidden, pool=c.query_pool,
+                             former=c.query_former)
         self.gate_offset = nn.ParameterDict({s: nn.Parameter(torch.tensor(c.gate_offset))
                                              for s in self.spaces})
         self.operators = nn.ModuleDict({
@@ -365,7 +421,10 @@ class L1Reader(nn.Module):
              alternatives: Mapping[str, Sequence[Ref]] | None = None,
              neutral: Mapping[str, Sequence[Ref]] | None = None,
              teacher: TeacherSite | None = None) -> Read:
-        """One read for the query-layer ``state`` (hidden,) at a call. ``targets``
+        """One read for the query-layer ``state`` at a call: the call's own state
+        (hidden,), or the states of its causal prefix (T, hidden), the call last, which
+        the query pool (``ReadConfig.query_pool``) attends over; ``Read.state`` is the
+        resulting query state (``KeyHeads.query_state``). ``targets``
         names the slot's items per space (retrieval loss and recall; in ``gold`` mode
         they are the read). ``alternatives`` (per space): other items that alone hold
         the slot's content (redundant copies); they are extra positives of the
@@ -419,10 +478,12 @@ class L1Reader(nn.Module):
         superposed = getattr(cache, 'superposed', False)
         if superposed:
             producer = None                  # the cache recomputes rows from their leaves
-        reads, masses, info, aux, recall_at, kls = {}, {}, {}, [], {}, []
+        state = self.keys.query_state(state)     # a tensor, or {space: tensor} (former)
+        align = teacher is not None and teacher.basis is not None
+        reads, masses, info, aux, recall_at, kls, aligns = {}, {}, {}, [], {}, [], []
         read_positions, read_spaces, read_gates, entries, queries = [], [], [], [], {}
         for s in self.spaces:
-            q = self.keys.query_key(s, state)
+            q = self.keys.query_key(s, _of(state, s))
             queries[s] = q
             wanted = list(dict.fromkeys((targets or {}).get(s, ())))
             copies = [r for r in dict.fromkeys((alternatives or {}).get(s, ()))
@@ -436,12 +497,12 @@ class L1Reader(nn.Module):
                 refs = cache.gold(s, [r for r in wanted if r not in banned], banned) \
                     if superposed else [r for r in wanted if r not in banned]
             elif superposed:
-                refs = cache.search(kbs, allowed, s, q.detach(), c.candidates[s], query_time,
+                refs = cache.search(kbs, allowed, s, q.detach(), self._width(s), query_time,
                                     banned)
             else:
                 live = all(kb.writable and kb.is_live(s) for kb in kbs)
                 options = {'exclude': {i for _, i in banned}} if banned else {}
-                hits = search_kbs(kbs, allowed, s, q.detach()[None], c.candidates[s],
+                hits = search_kbs(kbs, allowed, s, q.detach()[None], self._width(s),
                                   query_time=query_time, live=live, **options)
                 refs = [r for r in zip(hits.datasets[0], hits.ids[0]) if r not in banned]
             got = [(ref, values) for ref, (values, time)
@@ -458,6 +519,10 @@ class L1Reader(nn.Module):
             else:
                 keys = self._item_keys(s, cache, by_dataset, refs, [v for _, v in got], q.device)
                 scores = self.keys.scores(s, q[None], keys)[0]
+                if align:
+                    aligns.append(self._alignment(s, q, refs, keys, teacher, cache, by_dataset,
+                                                  query_time, banned, wanted + copies,
+                                                  (negatives or {}).get(s, ())))
                 if positive:
                     others = [r for r in (negatives or {}).get(s, ()) if r not in banned]
                     if superposed and others:
@@ -478,8 +543,12 @@ class L1Reader(nn.Module):
                         recall_at.update({f'{k}_{s}': v for k, v in at.items()})
                     if kl is not None:
                         kls.append(kl)
-                scored_gates = self.gates(s, scores)
-                keep = min(c.keep.get(s, len(got)), len(got))
+                if c.soft_read:     # every candidate is read, gates sum to one per space
+                    scored_gates = torch.softmax(c.soft_tau * (q[None] @ keys.t())[0], -1)
+                    keep = len(got)
+                else:
+                    scored_gates = self.gates(s, scores)
+                    keep = min(c.keep.get(s, len(got)), len(got))
                 order = torch.topk(scores.detach(), keep).indices.sort().values.tolist()
                 got = [got[i] for i in order]
                 refs = [refs[i] for i in order]
@@ -533,8 +602,45 @@ class L1Reader(nn.Module):
                                    state)
         else:
             span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
-        return Read(span, info, aux_loss, n, recall_at, state.detach(),
-                    torch.stack(kls).mean() if kls else None)
+        return Read(span, info, aux_loss, n, recall_at, _detached(state),
+                    torch.stack(kls).mean() if kls else None,
+                    torch.stack(aligns).mean() if aligns else None,
+                    {s: q.detach() for s, q in queries.items()})
+
+    def _width(self, space: str) -> int:
+        """Candidates searched in ``space``: the sparse read's ``candidates``, or with
+        ``soft_read`` ``soft_candidates`` (0: all)."""
+        c = self.config
+        if not c.soft_read:
+            return c.candidates[space]
+        return c.soft_candidates if c.soft_candidates > 0 else 1 << 30
+
+    def _alignment(self, space: str, q: Tensor, refs: Sequence[Ref], keys: Tensor,
+                   teacher: TeacherSite, cache, by_dataset, query_time: int,
+                   banned: Collection[Ref], positives: Sequence[Ref],
+                   negatives: Sequence[Ref]) -> Tensor:
+        """``teacher_alignment`` of the query key and of the keys of the scored
+        candidates, the slot's positives and the in-batch negatives (items no later than
+        the query time, not excluded, with a teacher embedding)."""
+        mq, mr = teacher.centers if teacher.centers is not None else (None, None)
+        term = teacher_alignment(q[None], teacher.query[None], teacher.basis, mq)
+        seen = set(refs)
+        extra = [r for r in dict.fromkeys([*positives, *negatives])
+                 if r not in seen and r not in banned]
+        kept = [(r, v) for r, (v, time) in zip(extra, _fetch(cache, by_dataset, space, extra))
+                if time <= query_time] if extra else []
+        pool = list(refs) + [r for r, _ in kept]
+        if kept:
+            keys = torch.cat([keys, self._item_keys(space, cache, by_dataset,
+                                                    [r for r, _ in kept],
+                                                    [v for _, v in kept], q.device)])
+        embedded = teacher.keys(space, pool)
+        idx = [k for k, e in enumerate(embedded) if e is not None]
+        if idx:
+            term = term + teacher_alignment(keys[torch.tensor(idx, device=keys.device)],
+                                            torch.stack([embedded[k] for k in idx]),
+                                            teacher.basis, mr)
+        return term
 
     def _item_keys(self, space: str, cache, by_dataset, refs: Sequence[Ref],
                    values: Sequence[Tensor], device) -> Tensor:
@@ -574,7 +680,7 @@ class L1Reader(nn.Module):
         weight), conditioned on the query keys of all spaces, de-standardized."""
         c = self.config
         if not entries or float(sum(float(g.detach()) for _, _, g in entries)) <= 0:
-            return torch.zeros(0, c.span_width, device=state.device), 0
+            return torch.zeros(0, c.span_width, device=_device(state)), 0
         n = read_count(read_positions, read_spaces, torch.cat(read_gates), budget=c.max_reps)
         cond = torch.cat([queries[s] for s in self.spaces])[None]
         y, _ = self.read_r(entries, n, cond=cond)
@@ -586,15 +692,17 @@ class L1Reader(nn.Module):
         c = self.config
         live = [s for s in self.spaces if s in reads and float(masses[s].detach()) > 0]
         if not live:
-            return torch.zeros(0, c.span_width, device=state.device), 0
+            return torch.zeros(0, c.span_width, device=_device(state)), 0
         n = read_count(read_positions, read_spaces, torch.cat(read_gates), budget=c.max_reps)
         y, _ = self.stack.recombiner([(s, reads[s], masses[s]) for s in live], n)
         return self.stack.mean + self.stack.std * y, n
 
-    def reread(self, state: Tensor, values: Mapping[str, Sequence[Tensor]],
+    def reread(self, state: Tensor | Mapping[str, Tensor],
+               values: Mapping[str, Sequence[Tensor]],
                scales: Mapping[str, Sequence[float]],
                keys: Mapping[str, Sequence[Tensor]] | None = None) -> Tensor:
-        """The span of a read with its selection fixed: ``values[s]`` are the items read
+        """The span of a read with its selection fixed (``state``: the read's query state,
+        ``Read.state``, already pooled): ``values[s]`` are the items read
         in space s (in read order) and ``scales[s]`` their stored mass x caller weight;
         gates from the items' keys against the query heads' keys of ``state`` (as a read
         whose items are recomputed, L1b), then S_s and R. Gradients reach the values
@@ -602,7 +710,7 @@ class L1Reader(nn.Module):
         reads, masses, read_positions, read_spaces, read_gates = {}, {}, [], [], []
         entries, queries = [], {}
         for s in self.spaces:
-            q = self.keys.query_key(s, state)
+            q = self.keys.query_key(s, _of(state, s))
             queries[s] = q
             items = list(values.get(s, ()))
             if not items:
@@ -634,11 +742,12 @@ class L1Reader(nn.Module):
         (``--contrast-weight``). Same items, same gates (stored mass x weight included),
         so the same per-space counts and the same span length; the item payloads and the
         gates enter detached, so only R (and S_s), the query heads through R's condition,
-        and whatever produced ``state`` receive gradients."""
+        and whatever produced ``state`` receive gradients. ``state`` as in ``read``."""
+        state = self.keys.query_state(state)
         reads, masses, read_positions, read_spaces, read_gates = {}, {}, [], [], []
         entries, queries, info = [], {}, {}
         for s in self.spaces:
-            q = self.keys.query_key(s, state)
+            q = self.keys.query_key(s, _of(state, s))
             queries[s] = q
             got = donor.spaces.get(s)
             if got is None or not got.refs:
@@ -664,7 +773,7 @@ class L1Reader(nn.Module):
                                    state)
         else:
             span, n = self._span(reads, masses, read_positions, read_spaces, read_gates, state)
-        return Read(span, info, None, n, {}, state.detach())
+        return Read(span, info, None, n, {}, _detached(state))
 
     def _retrieval_loss(self, space, q, refs, scores, wanted: Mapping[Ref, float], by_dataset,
                         cache, query_time, negatives: Sequence[Ref] = (),

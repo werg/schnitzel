@@ -333,7 +333,9 @@ def generate(lm, embed: Callable[[list[int]], Tensor], mid: Callable[[Tensor], T
     """Generate one attempt from ``prompt`` with the frozen decoder ``lm`` (HF causal LM
     with ``inputs_embeds`` and a KV cache). ``embed(ids)`` gives input embeddings (span
     protocol rows included), ``mid(x)`` the query-layer states of a full pass over
-    ``x`` (T, width), ``read(state)`` a read (``.span`` (n, width)) for one query state.
+    ``x`` (T, width), ``read(states)`` a read (``.span`` (n, width)) for one call from
+    the query-layer states of its causal prefix (T, width), the call's own state last
+    (``L1Reader.read``: the query pool attends over them, else the last row is the query).
 
     When the model closes a tool-call block that holds only ``memory_search()`` calls,
     each call's query state is taken at its closing parenthesis from one pass over the
@@ -400,7 +402,7 @@ def generate(lm, embed: Callable[[list[int]], Tensor], mid: Callable[[Tensor], T
             reads = []
             for p in positions:
                 if len(attempt.reads) + len(reads) < max_reads:
-                    reads.append(read(states[p]))
+                    reads.append(read(states[:p + 1]))   # the causal prefix, call last
                 else:
                     reads.append(None)
             logits = push(list(proto.turn_end))

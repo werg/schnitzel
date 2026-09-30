@@ -277,3 +277,100 @@ def test_key_teacher_in_the_trainer(tmp_path):
     stranger.episode_id = 'zzz'
     with pytest.raises(KeyError):
         l1.run_episode(ctx, stranger, ItemCache(train=True), retrieval_only=True, teacher=True)
+
+
+# -- alignment to the teacher's principal subspace (--key-align-weight) ---------------------
+def test_teacher_alignment_value():
+    from schnitz.kb.read import teacher_alignment
+    basis = torch.eye(24)[:, :4]                     # the first four teacher directions
+    teacher = torch.zeros(2, 24)
+    teacher[0, 0], teacher[1, 1], teacher[1, 9] = 1.0, 1.0, 5.0   # dim 9 is projected away
+    keys = torch.zeros(2, 4)
+    keys[0, 0] = 1.0                                 # aligned: 0
+    keys[1, 2] = 1.0                                 # orthogonal: 1
+    assert float(teacher_alignment(keys, teacher, basis)) == pytest.approx(0.5)
+    assert float(teacher_alignment(keys[:1], teacher[:1], basis)) == 0.0
+
+
+def test_basis_is_the_records_principal_directions(tmp_path):
+    rows = [transcript('e', (['r1'], ['r2'])), transcript('f', (['r3'],), qt=3)]
+    d = corpus(tmp_path, rows)
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    cache = tk.TeacherKeys(tmp_path / 'teacher')
+    basis = cache.basis(8)
+    assert basis.shape == (16, 8)
+    n = cache.records.shape[0]                       # n directions, the rest zero columns
+    torch.testing.assert_close(basis[:, :n].t() @ basis[:, :n], torch.eye(n), atol=1e-5, rtol=0)
+    assert torch.equal(basis[:, n:], torch.zeros(16, 8 - n))
+    # the records lie in the span: projecting keeps their norm
+    torch.testing.assert_close((cache.records.float() @ basis).norm(dim=-1),
+                               torch.ones(n), atol=1e-3, rtol=0)
+
+
+def test_alignment_trains_the_heads_and_is_logged(tmp_path):
+    ctx, _ = context(tmp_path, query_pool=True)
+    d = corpus(tmp_path, [transcript('e', (['r1'], ['r2']))])
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    cache = tk.TeacherKeys(tmp_path / 'teacher')
+    ep = episode(IDS, [3, 10], [6, 13])
+    ctx.key_teacher = l1.KeyTeacher(cache, 0.05)     # align off: no term
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                    teacher=True)
+    assert all(r.teacher_align is None for r in reads)
+    ctx.key_teacher = l1.KeyTeacher(cache, 0.05, align=True)
+    site = ctx.key_teacher.site(ctx, ep, 0)
+    assert site.basis.shape == (16, KEY_WIDTH['A'])
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                    teacher=True)
+    align = torch.stack([r.teacher_align for r in reads]).mean()
+    assert 0 < float(align) < 4
+    align.backward()
+    for s in SPACES:
+        assert ctx.reader.keys.query[s][1].weight.grad.abs().sum() > 0
+        assert ctx.reader.keys.item[s][1].weight.grad.abs().sum() > 0
+    assert ctx.reader.keys.pool.out.weight.grad.abs().sum() > 0
+    # evaluation reads have no teacher, so no alignment
+    _, _, plain, _ = l1.run_episode(ctx, ep, ItemCache(train=False), retrieval_only=True)
+    assert all(r.teacher_align is None for r in plain)
+    ctx.reader.zero_grad(set_to_none=True)
+    args = train_args(retrieval_only=True, retrieval_weight=1.0, key_teacher_weight=1.0,
+                      key_align_weight=10.0)
+    opt = torch.optim.AdamW(ctx.reader.trainable(), lr=1e-3)
+    out = l1.train_step(ctx, [ep], opt, args, 0, rng=random.Random(0))
+    assert out['teacher_align'] > 0
+    # the query module's gradient and output-projection norm are logged
+    assert out['grad_norm']['query_module'] > 0 and out['query_module_out_norm'] == 0.0
+
+
+def test_centered_alignment_removes_the_common_direction_attractor():
+    """Teacher vectors sharing a large common direction: one constant key at that
+    direction scores well against all of them uncentered, and not at all centered."""
+    from schnitz.kb.read import teacher_alignment
+    gen = torch.Generator().manual_seed(0)
+    common = torch.nn.functional.normalize(torch.randn(24, generator=gen), dim=0)
+    teacher = torch.nn.functional.normalize(
+        10.0 * common + torch.randn(200, 24, generator=gen), dim=-1)
+    basis = torch.eye(24)
+    constant = common[None].expand(200, -1)
+    plain = float(teacher_alignment(constant, teacher, basis))
+    centered = float(teacher_alignment(constant, teacher, basis, teacher.mean(0)))
+    assert plain < 0.2 and centered > 0.9
+
+
+def test_key_teacher_center_passes_centers_and_a_centered_basis(tmp_path):
+    ctx, _ = context(tmp_path)
+    d = corpus(tmp_path, [transcript('e', (['r1'], ['r2']))])
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    cache = tk.TeacherKeys(tmp_path / 'teacher')
+    ep = episode(IDS, [3, 10], [6, 13])
+    plain = l1.KeyTeacher(cache, 0.05, align=True).site(ctx, ep, 0)
+    site = l1.KeyTeacher(cache, 0.05, align=True, center=True).site(ctx, ep, 0)
+    assert plain.centers is None and site.centers is not None
+    mq, mr = site.centers
+    torch.testing.assert_close(mq, cache.queries.float().mean(0))
+    torch.testing.assert_close(mr, cache.records.float().mean(0))
+    assert not torch.equal(site.basis, plain.basis)
+    ctx.key_teacher = l1.KeyTeacher(cache, 0.05, align=True, center=True)
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                    teacher=True)
+    assert all(r.teacher_align is not None for r in reads)

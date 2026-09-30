@@ -1362,3 +1362,60 @@ log your decisions and changes of direction"), newest last.
   projection on top (owner preference). Next: K2 on inverse-cloze recall-text with
   the arm (f) setup. Its banks (K1 codecs of step 15500, the recall-text span cache
   reused) are building in `kb-k2-ic`.
+- 29 September: why L1 retrieval did not learn, and the fix (branch
+  `worktree-agent-a313c586ea13ec5b9`). The query state was degenerate: the frozen
+  decoder's layer-8 state at the `)` of `memory_search()` carries almost none of the
+  request (pairwise cosine 0.95, effective rank 2.5 over 368 sites; sites sharing a
+  target document are no closer than unrelated ones, centered cosine -0.02 vs 0.01).
+  The trained read-teacher heads had collapsed accordingly (query-key pairwise cosine
+  0.995-0.9997 in B-D, item keys 0.996-0.999), which is why the teacher KL could not
+  fall. Ruled out: the score scale (learned, about 9.7, not flat), stale search keys
+  (rekeyed before every evaluation), the clip (Adam is invariant to it; the reader
+  decoder's gradient dominates the total norm, 7-11 against keys 2), the list/space
+  mapping. Offline fit (cached layer-8 states, full-KB softmax over 13,114 items, 1000
+  steps x 64 sites, space A R@8, held-out episodes / validation with unseen documents):
+  call state 0.03 / 0.00 (it cannot even fit the training sites: 0.29); mean of the
+  user-turn states 0.59 / 0.33; a learned attention pool over the prefix 0.48 / 0.04;
+  that pool plus alignment to the teacher's principal subspace 0.71 / 0.47 (0.73 /
+  0.57 with the L1-sized list); the teacher itself 0.80 / 0.84. The list losses alone
+  memorize training documents; the alignment term generalizes to unseen ones.
+  Fix (owner: the model formulates its query): the reader's layers up to the query
+  layer train in K2 (`--decoder-train-below query`, full copies or `--decoder-lora`),
+  with `--key-align-weight 10` and `--key-align-center`. K2 arms (retrieval-only, 600
+  steps, batch 8, full recall-text KB; validation search recall A/B/C/D over 70 sites
+  of unseen documents, from 0.01/0.00/0.00/0.06):
+  - a: layer 8, copies of layers 0-7 at 3e-5 (parent KL 1.0): 0.20/0.16/0.43/0.40;
+    call-state effective rank 2.5 -> 50 (same-document centered cosine 0.47); text-arm
+    NLL 0.39 -> 0.46; 10.7 s/step, 7.1 GB. The same at lr 1e-4 and KL 0.1 wrecked the
+    decoder (text NLL 0.96 at step 150) and was stopped.
+  - b: a plus the query pool: 0.14/0.10/0.39/0.40 (the pool did the work: call-state
+    rank 4, pooled rank 20); 11.2 s/step, 8.0 GB.
+  - c: layer 12, copies of layers 0-11: 0.14/0.14/0.37/0.51; rank 3 -> 72; parent KL
+    0.23, text NLL 0.53; 11.9 s/step, 8.5 GB.
+  - f: final layer (16), LoRA 16 on all layers at 5e-4, centered alignment:
+    0.36/0.39/0.66/0.73 (R@5 0.41/0.26/0.44/0.29), already 0.30/0.40/0.57/0.61 at
+    step 300; rank -> 101; parent KL 0.12, text NLL 0.46; query-key cosine within an
+    episode 0.85, across episodes 0.13; 10.6 s/step, 7.0 GB. Best arm.
+  - f12: the same at layer 12 (LoRA on layers 0-11): 0.14/0.27/0.56/0.76; rank -> 90;
+    parent KL 0.12, text NLL 0.44; 11.0 s/step, 7.0 GB.
+  - d: retrieval + task on a 1000-record recall-text KB (`banks-small-1000`), arm f's
+    recipe, 300 steps: soft superposed reads (`--soft-read`, 128 candidates, tau
+    10 -> 100 over 200 steps, then sparse) 0.24/0.41/0.67/0.83, content 0.02 nats;
+    sparse reads 0.21/0.50/0.61/0.76, content 0.01 nats. No clear difference, and soft
+    reads cost 43 s/step at 105 candidates (11 s sparse). Both memorized the training
+    answers through the reader's trained layers (train NLL 2.5 -> 0.08; validation
+    retrieved NLL 4.2-4.4 against 3.06 without memory; text arm 0.39 -> 0.23-0.25), so
+    with the task loss the trained layers must formulate the query only:
+    `--decoder-query-only` (the task pass reads with the parent decoder; built and
+    tested, not yet run).
+  Next: K2 with arm f's recipe to plateau on recall-text (and parallel), then the read
+  phase with `--decoder-query-only`. L2/B9 refuse readers with trained decoder layers
+  until loading them is built.
+  - e+f with the query former: at layer 16 and 12 the former collapsed onto
+    content-free queries (query-key cosine 1.000 across episodes, anti-correlated
+    between the calls of one episode; former state effective rank 1.0) and stayed at
+    chance through 600 steps. Two fixes on the way: the pool and former add their
+    output in units of the call state's RMS (at layer 16 an unscaled zero-init output
+    stayed negligible), and centered alignment (uncentered teacher queries share a
+    direction a constant key scores 0.27 against). The former is kept as an option
+    and not pursued; the module-free backbone arm f is the recipe.

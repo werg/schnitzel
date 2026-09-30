@@ -286,6 +286,49 @@ applies to every stage.
    the reader's own top wrong hits (`train --dump-hits`). It never takes a site's
    positives or neutral records. `train --hard-negatives FILE` adds them to that
    episode's in-batch negatives. Without the flag the step is unchanged, bit for bit.
+   *The model formulates its query (owner, 29 September).* The frozen decoder's
+   state at the call's closing parenthesis carries almost none of the request (it
+   was never trained to put a query there), and the path that produces the query
+   must not be frozen: in K2 and L1 the reader decoder's own layers below the query
+   layer train (`--decoder-train-below query`, i.e. N = `--query-layer`; a number
+   still works), and in K2 (`--retrieval-only`) the retrieval loss, the teacher KL
+   and the alignment reach them, with the parent-preservation KL as in L1a. The
+   query layer is configurable (`--query-layer`, default 8; 12 is the deeper
+   arm). The writer keeps the parent decoder. Consumers of such a reader (L2, B9)
+   must load its decoder layers; until that is built they refuse the checkpoint.
+   With the task loss (L1a) the trained layers must formulate the query only
+   (`--decoder-query-only`: the task pass reads with the parent decoder): on a
+   1000-record KB they otherwise memorized the training answers within 300 steps.
+   *Query pool (reference scaffold).* With `--query-pool` the query state is the
+   call state plus a learned attention pool over the query-layer states of the
+   call's causal prefix (up to and including the call; four learned attention
+   queries, output projection starting at zero, so an untrained pool is the call
+   state exactly). It is not conditioned on the call, so the calls of one episode
+   get nearly the same query; it stays only as a reference.
+   *Query formulation (owner, 29 September).* The end state is query
+   functionality inside the network with a projection on top: a trained backbone
+   (`--decoder-train-below query`: the reader's own copies of the layers below the
+   query layer; `--decoder-lora R`: LoRA on those copies, base weights frozen;
+   `--decoder-train attention`: only the copied full-attention layers, since in
+   LFM2.5-350M layers 2, 5, 8, 10, 12, 14 are the only ones that move information
+   to the call position from far), optionally with a query module
+   (`--query-former`: per space a call-conditioned latent cross-attends over the
+   call's causal prefix, then the latents attend to each other; pre-LN, MLPs, a
+   zero-initialized per-space output added in units of the call state's RMS, so an
+   untrained module is the call-state query exactly). The query layer can be the
+   final one (`--query-layer 16`). The query pool and the former add their output
+   in units of the call state's RMS (0.01 at layer 8, about 2 at layer 16).
+   The list losses (retrieval loss, teacher KL) alone fit the
+   training documents but stay near chance on unseen ones. With the teacher,
+   `--key-align-weight` adds 1 - cos between our keys and the teacher embeddings
+   projected on the teacher records' top 256 principal directions: the query key
+   against the site's teacher query, the listed items' keys against their records'
+   embeddings. Aligning both towers to the teacher's subspace makes our cosine rank
+   like the teacher's, also for documents no training site named. With
+   `--key-align-center` both towers are centered (per-tower teacher means, basis of
+   the centered records): uncentered teacher queries share a common direction
+   (mean pairwise cosine 0.53) that a constant query key already scores 0.27
+   against, and the final-layer query keys collapsed onto it.
 5. **K3 - Read-side rows, then the write fit** (owner, 28 September). Not a
    short warm-up: first a long read-side phase in which the rows are free
    learnable parameters trained by reads alone, until they have drifted far from
@@ -409,6 +452,17 @@ applies to every stage.
      reader decoder) on each episode's no-read context at its loss positions. With
      the decoder training, query passes run with gradients (checkpointed), so the
      retrieval loss reaches those layers too; the contrast term applies to them.
+     *Soft superposed read (owner, 29 September; a query-training aid):*
+     `--soft-read` makes each training read take `--soft-candidates` per space
+     (0: every item) with gates softmax(`--soft-tau` x cos), all nonzero, and R
+     reads the whole gate-weighted superposition (gate x stored mass, so mass and
+     numerator stay as in invariant 5; the span length stays capped by
+     `read_count`). The task loss then reaches the query through every
+     candidate's weight. `--soft-anneal N` moves the candidates geometrically to
+     the sparse `--keep` and tau to `--soft-tau-end` over N steps, after which
+     reads are sparse; evaluations always read sparsely, and with the flag off
+     the sparse read is bit-identical. (Coarse rows first on a rows banks dir is
+     not built.)
    - *L1b, through the sources:* for the items a read retrieves, their write is
      recomputed from the stored source with gradients (selective producer
      replay, the serialized forward exactly: invariant 3), so the task loss
@@ -570,7 +624,9 @@ inputs are. Training data is regenerated where the format changes (owner:
     random init with span statistics from the records), keys from the initial
     item-key heads; one `kb_store` KB per dataset, item time = `created_at`.
   - *Read*: query state = the frozen decoder's state after `--query-layer` (8 of
-    16) layers at the token holding the call's closing parenthesis; query heads per
+    16) layers at the token holding the call's closing parenthesis, with
+    `--query-pool` plus a learned attention pool over the same layer's states of the
+    call's causal prefix (`stack.QueryPool`); query heads per
     space; exact top-k over the live keys of the episode's own KB only (candidates
     A/B/C/D 8/16/32/64), time <= the episode's query time; scores from the item-key
     heads applied to the candidates' current values; gates

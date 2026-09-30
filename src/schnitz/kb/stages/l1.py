@@ -130,13 +130,14 @@ from schnitz.kb.producer import Producers, Writer, WriteLog, produce_items, prod
 from schnitz.kb.read import (DEFAULT_CANDIDATES, DEFAULT_KEEP, ItemCache, KeyOptimizer,
                              L1Reader, ReadConfig, TeacherSite, current_ids, producer_index,
                              source_index, splice)
-from schnitz.kb.stack import SPACES, KeyHeads
+from schnitz.kb.stack import KEY_WIDTH, SPACES, KeyHeads
 from schnitz.kb_eval import distribution, effective_count, nll_summary
 from schnitz.kb_store import DEFAULT_SPACES, KnowledgeBase, NewItem, Provenance
 from schnitz.memory_transcripts import render_ids, render_text
 from schnitz.span_tokens import MEMORY_TOOLS, SPAN_TOKENS
 
 MEM, MEM_END = SPAN_TOKENS['mem'][0], SPAN_TOKENS['mem_end'][0]
+KEY_WIDTH_ALL = max(KEY_WIDTH.values())    # every space's keys share one width (256)
 MEM_ID = SPAN_TOKENS['mem'][1]
 BG_ID = SPAN_TOKENS['bg'][1]
 MEMORY_NAMES = {t['name'] for t in MEMORY_TOOLS}
@@ -299,30 +300,97 @@ def reader_decoder(lm, below: int, checkpointing: bool = False):
     return out, own
 
 
+class LoRA(torch.nn.Module):
+    """A low-rank delta on one linear module's output (``--decoder-lora``), always on:
+    it sits on the reader's own layer copies only, never on the writer's decoder. ``up``
+    starts at zero, so an untrained adapter changes nothing."""
+
+    def __init__(self, module: torch.nn.Linear, rank: int, alpha: float):
+        super().__init__()
+        self.scale = alpha / rank
+        self.down = torch.nn.Linear(module.in_features, rank, bias=False)
+        self.up = torch.nn.Linear(rank, module.out_features, bias=False)
+        torch.nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.up.weight)
+        self.to(module.weight.device)
+        module.register_forward_hook(self._hook)
+
+    def _hook(self, module, inputs, output):
+        delta = self.up(self.down(inputs[0].to(self.down.weight.dtype))) * self.scale
+        return output + delta.to(output.dtype)
+
+
+def attention_layers(lm) -> list[int]:
+    """Indices of the decoder's full-attention layers (LFM2: ``layer_types``); the other
+    layers (short convolutions) cannot move information to the call position from far."""
+    types = getattr(lm.config, 'layer_types', None)
+    if types is None:
+        return list(range(len(lm.model.layers)))
+    return [i for i, t in enumerate(types) if 'attention' in t]
+
+
 class Frozen:
     """The reader's decoder: embeddings (protocol hooks included), the hidden state after
     ``query_layer`` layers (a truncated pass), final hidden states and LM-head logits.
     Frozen unless ``train_below`` > 0 (``--decoder-train-below``): then its layers below
-    that index are the reader's own trainable copies (``own``; ``reader_decoder``) and
-    ``parent`` is the untouched decoder (the parent-preservation KL)."""
+    that index are the reader's own copies (``own``; ``reader_decoder``) and ``parent``
+    is the untouched decoder (the parent-preservation KL). What trains
+    (``trainable_parameters``): the copies (``train='all'``), only the copied
+    full-attention layers (``'attention'``), or with ``lora`` > 0 rank-``lora``
+    adapters on every linear module of the trained copies, their base weights frozen."""
 
     def __init__(self, lm, query_layer: int, autocast=None, train_below: int = 0,
-                 checkpointing: bool = False):
+                 checkpointing: bool = False, train: str = 'all', lora: int = 0,
+                 lora_alpha: float | None = None, query_only: bool = False):
         self.parent = None
+        # --decoder-query-only: the trained layers formulate the query only; the task pass
+        # (``final``) runs the parent decoder, so the reader cannot learn the answers
+        self.query_only = query_only and train_below > 0
         self.own = torch.nn.ModuleList()
+        self.lora = torch.nn.ModuleDict()
+        if train not in ('all', 'attention'):
+            raise ValueError(f'decoder train is all or attention, not {train!r}')
+        self.train = train
+        self.trained_layers: list[int] = []
         if train_below > 0:
             self.parent = Frozen(lm, query_layer, autocast)
             lm, self.own = reader_decoder(lm, train_below, checkpointing)
+            self.trained_layers = [i for i in range(train_below)
+                                   if train == 'all' or i in attention_layers(lm)]
+            if lora > 0:
+                for i in self.trained_layers:
+                    for name, module in self.own[i].named_modules():
+                        if isinstance(module, torch.nn.Linear):
+                            self.lora[f'{i}.{name}'.replace('.', '__')] = LoRA(
+                                module, lora, lora_alpha or 2.0 * lora)
         self.lm, self.inner = lm, lm.model
         self.query_layer = query_layer
         self.autocast = autocast or (lambda: torch.autocast('cpu', enabled=False))
         if not 1 <= query_layer <= len(self.inner.layers):
             raise ValueError('query layer out of range')
 
+    def trainable_parameters(self) -> list:
+        """The reader decoder's trainable parameters (the ``decoder`` set)."""
+        if len(self.lora):
+            return list(self.lora.parameters())
+        return [p for i in self.trained_layers for p in self.own[i].parameters()]
+
+    def state(self) -> dict:
+        """The reader decoder's trained state for a checkpoint."""
+        if len(self.lora):
+            return {'decoder_lora': self.lora.state_dict()}
+        return {'decoder_layers': self.own.state_dict()}
+
+    def load(self, state: dict) -> None:
+        if len(self.lora):
+            self.lora.load_state_dict(state['decoder_lora'])
+        else:
+            self.own.load_state_dict(state['decoder_layers'])
+
     @property
     def trains(self) -> bool:
-        """Whether any of the reader's own decoder layers currently takes gradients."""
-        return any(p.requires_grad for p in self.own.parameters())
+        """Whether any of the reader decoder's trainable parameters takes gradients."""
+        return any(p.requires_grad for p in self.trainable_parameters())
 
     @property
     def device(self):
@@ -350,6 +418,8 @@ class Frozen:
         return box['h'].float()
 
     def final(self, x: torch.Tensor) -> torch.Tensor:
+        if self.query_only:
+            return self.parent.final(x)
         with self.autocast():
             return self.inner(inputs_embeds=x, use_cache=False).last_hidden_state
 
@@ -513,6 +583,8 @@ class KeyTeacher:
     cache: object                  # teacher_keys.TeacherKeys
     tau: float = 0.05
     positives: int = 0
+    align: bool = False            # --key-align-weight > 0: sites carry the teacher basis
+    center: bool = False           # --key-align-center: per-tower centered alignment
 
     def site(self, ctx: Context, ep: Episode, j: int) -> TeacherSite:
         """The teacher of search site j of ``ep`` (KeyError for a site not in the
@@ -538,7 +610,9 @@ class KeyTeacher:
             index = ctx.index[ep.kb]
             positives = {s: [(ep.kb, i) for r in names for i in index[s].get(r, ())]
                          for s in index}
-        return TeacherSite(query, keys, self.tau, positives)
+        return TeacherSite(query, keys, self.tau, positives,
+                           self.cache.basis(KEY_WIDTH_ALL, self.center) if self.align else None,
+                           self.cache.centers() if self.align and self.center else None)
 
 
 def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrieve',
@@ -593,13 +667,16 @@ def run_episode(ctx: Context, ep: Episode, cache: ItemCache, mode: str = 'retrie
                                                  device=h.device))
                         continue
                     with ctx.autocast():
-                        read = ctx.reader.fixed_read(h[index[ep.calls[j]]],
+                        read = ctx.reader.fixed_read(h[:int(index[ep.calls[j]]) + 1],
                                                      donors[j % len(donors)])
                     reads.append(read)
                     spans.append(read.span.float())
                     continue
                 with ctx.autocast():
-                    read = ctx.reader.read(h[index[ep.calls[j]]], [ctx.kbs[ep.kb]], [ep.kb],
+                    # the call's causal prefix, the call last (the query pool attends over
+                    # it; without a pool the call's own state is the query state)
+                    read = ctx.reader.read(h[:int(index[ep.calls[j]]) + 1], [ctx.kbs[ep.kb]],
+                                           [ep.kb],
                                            ep.query_time, cache, targets=ctx.targets(ep, j),
                                            alternatives=ctx.alternatives(ep, j),
                                            neutral=ctx.neutral(ep, j),
@@ -931,6 +1008,33 @@ def retrieval_weight(args, step: int) -> float:
     return args.retrieval_weight + done * (args.retrieval_floor - args.retrieval_weight)
 
 
+def soft_schedule(args, step: int, items: int, keep: int) -> dict | None:
+    """``--soft-read`` at 0-based ``step``: {'candidates', 'tau'} of the soft read, or
+    None for the sparse read. Without ``--soft-anneal`` constant; with it the candidate
+    count falls geometrically from ``--soft-candidates`` (0: ``items``, the largest
+    KB's items) to ``keep`` and tau rises geometrically from ``--soft-tau`` to
+    ``--soft-tau-end`` over the anneal steps, after which reads are sparse."""
+    if not getattr(args, 'soft_read', False):
+        return None
+    start = args.soft_candidates or items
+    anneal = getattr(args, 'soft_anneal', 0)
+    if not anneal:
+        return {'candidates': args.soft_candidates, 'tau': args.soft_tau}
+    t = step / anneal
+    if t >= 1:
+        return None
+    count = max(keep, round(math.exp((1 - t) * math.log(max(start, 1)) + t * math.log(keep))))
+    tau = args.soft_tau * (args.soft_tau_end / args.soft_tau) ** t
+    return {'candidates': count, 'tau': tau}
+
+
+def set_soft(config, schedule: dict | None) -> None:
+    """Apply ``soft_schedule``'s value to a ``ReadConfig`` (None: the sparse read)."""
+    config.soft_read = schedule is not None
+    if schedule is not None:
+        config.soft_candidates, config.soft_tau = int(schedule['candidates']), float(schedule['tau'])
+
+
 def gold_read_rate(args, step: int) -> float:
     """Share of training episodes read from their slots' own items (``--gold-reads``,
     annealed linearly to 0 over ``--gold-anneal`` steps; 0 anneal: constant): R, the
@@ -1020,7 +1124,7 @@ def parameter_sets(reader: L1Reader, writer_model=None, write_ops=None, prefix=N
             **producer_params(writer_model, reader.stack),
             'write': [] if write_ops is None else list(write_ops.parameters()),
             'prefix': [] if prefix is None else list(prefix.parameters()),
-            'decoder': [] if decoder is None else list(decoder.own.parameters())}
+            'decoder': [] if decoder is None else decoder.trainable_parameters()}
 
 
 def phase_set(phase: str, args, l1b_set=()) -> tuple[str, ...]:
@@ -1135,6 +1239,21 @@ def contrast_term(ctx: Context, ep: Episode, nll: torch.Tensor, donor_reads: lis
     return term, {'contrast': term.item(), 'content_nats_train': (shuf - ret).item()}
 
 
+def train_below(text: str) -> int | str:
+    """``--decoder-train-below``: a layer count, or ``query`` (the ``--query-layer``,
+    resolved by ``resolve_train_below``)."""
+    return text if text == 'query' else int(text)
+
+
+def resolve_train_below(args) -> int:
+    """``--decoder-train-below query`` -> the query layer (owner, 29 September: the
+    layers that formulate the query train); a number stays."""
+    below = getattr(args, 'decoder_train_below', 0)
+    if below == 'query':
+        below = args.decoder_train_below = int(args.query_layer)
+    return int(below)
+
+
 def decoder_replay_kl(args) -> float:
     """``--decoder-replay-kl``: 0.1 by default when the decoder trains, else 0."""
     if not getattr(args, 'decoder_train_below', 0):
@@ -1148,7 +1267,8 @@ def parent_kl(ctx: Context, ep: Episode) -> torch.Tensor | None:
     next-token distributions on the episode's no-read context (empty memory spans, no
     prefix) at its loss positions, mean over positions."""
     parent = ctx.frozen.parent
-    if parent is None or not ctx.frozen.trains or ep.targets.numel() == 0:
+    if parent is None or ctx.frozen.query_only or not ctx.frozen.trains \
+            or ep.targets.numel() == 0:
         return None
     from schnitz.kb.losses import kl
     x = ctx.frozen.embed(ep.ids)[None]
@@ -1157,6 +1277,12 @@ def parent_kl(ctx: Context, ep: Episode) -> torch.Tensor | None:
         target = parent.logits(parent.final(x)[0][positions])
     logits = ctx.frozen.logits(ctx.frozen.final(x)[0][positions])
     return kl(logits, target)
+
+
+def grad_norm(params) -> float:
+    """The L2 norm of the gradients of ``params`` (those that have one), before clipping."""
+    grads = [p.grad.detach().float().norm() for p in params if p.grad is not None]
+    return float(torch.stack(grads).norm()) if grads else 0.0
 
 
 def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int = 0,
@@ -1195,6 +1321,9 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     nll_total, aux_total, balance_total, teacher_total = 0.0, 0.0, 0.0, 0.0
     teacher_weight = getattr(args, 'key_teacher_weight', 0.0) \
         if ctx.key_teacher is not None else 0.0
+    align_weight = getattr(args, 'key_align_weight', 0.0) \
+        if ctx.key_teacher is not None else 0.0
+    align_total = 0.0
     negatives = batch_negatives(ctx, episodes, args.inbatch_negatives,
                                 rng or random.Random(step)) if args.inbatch_negatives else {}
     if producer is not None:
@@ -1202,7 +1331,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
     requests: list[WriteRequest] = []
     contrast_weight = 0.0 if args.retrieval_only else getattr(args, 'contrast_weight', 0.0)
     donor_of = contrast_donors(episodes) if contrast_weight > 0 else [None] * len(episodes)
-    kl_weight = 0.0 if args.retrieval_only else decoder_replay_kl(args)
+    # the parent-preservation KL also in K2: the query-formulating layers are the decoder's
+    kl_weight = decoder_replay_kl(args)
     done: dict[int, list] = {}       # episode index -> its reads (donor material)
     pending: dict[int, tuple] = {}   # episodes waiting for their donor's reads
     contrast: dict[str, list] = {}
@@ -1250,6 +1380,11 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
             aux_mean = torch.stack(aux).mean()
             terms.append(weight * aux_mean / len(episodes))
             aux_total += aux_mean.item() / len(episodes)
+        aligns = [r.teacher_align for r in reads if r.teacher_align is not None]
+        if aligns:
+            align_mean = torch.stack(aligns).mean()
+            terms.append(align_weight * align_mean / len(episodes))
+            align_total += align_mean.item() / len(episodes)
         kls = [r.teacher_kl for r in reads if r.teacher_kl is not None]
         if kls:
             kl_mean = torch.stack(kls).mean()
@@ -1299,7 +1434,17 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         out['l1b'] = producer.backward()
         out['l1b_backward_s'] = round(time.time() - t0, 3)
     params = trainable if trainable is not None else ctx.reader.trainable()
-    torch.nn.utils.clip_grad_norm_(params, args.clip)
+    out['grad_norm'] = {name: round(grad_norm(group), 4) for name, group in
+                        (('keys', ctx.reader.keys.parameters()),
+                         ('decoder', ctx.frozen.trainable_parameters()))}
+    module = ctx.reader.keys.former or ctx.reader.keys.pool   # the query module, if any
+    if module is not None:
+        out['grad_norm']['query_module'] = round(grad_norm(module.parameters()), 4)
+        outs = list(module.out.values()) if isinstance(module.out, torch.nn.ModuleDict) \
+            else [module.out]
+        out['query_module_out_norm'] = round(float(torch.stack(
+            [layer.weight.detach().float().norm() for layer in outs]).norm()), 4)
+    out['grad_norm']['total'] = round(float(torch.nn.utils.clip_grad_norm_(params, args.clip)), 4)
     optimizer.step()
     change_units = getattr(args, 'l1b_change_units', 4)
     if producer is not None and change_units >= 0:
@@ -1332,6 +1477,8 @@ def train_step(ctx: Context, episodes: list[Episode], optimizer, args, step: int
         out['balance'] = balance_total
     if ctx.key_teacher is not None:
         out['teacher_kl'] = teacher_total
+        if align_weight:
+            out['teacher_align'] = align_total
     if not args.retrieval_only:
         out['nll'] = nll_total / tokens
     return out
@@ -1435,7 +1582,7 @@ class ReadAnchor:
             if ep.episode_id not in self.texts or not ep.calls:
                 continue
             embeds = ctx.frozen.embed(ep.ids[:ep.calls[0] + 1])
-            h = ctx.frozen.mid(embeds[None])[0][ep.calls[0]]
+            h = ctx.frozen.mid(embeds[None])[0]          # the causal prefix of call 0
             with ctx.autocast():
                 read = ctx.reader.read(h, [ctx.kbs[ep.kb]], [ep.kb], ep.query_time, cache)
             kb = ctx.kbs[ep.kb]
@@ -1447,7 +1594,7 @@ class ReadAnchor:
             scales = {s: list(read.spaces[s].scales) for s in values}
             if not values:
                 continue
-            probe = {'state': h, 'values': values, 'scales': scales, 'keys': keys,
+            probe = {'state': read.state, 'values': values, 'scales': scales, 'keys': keys,
                      'ids': self.texts[ep.episode_id]}
             probe['anchored'] = self._logits(probe, read.span.detach().float())
             self.probes.append(probe)
@@ -1481,6 +1628,27 @@ class ReadAnchor:
         return {'kl': round(sum(values) / len(values), 6), 'probes': len(values)}
 
 
+def query_cosines(episodes: list[list[dict]]) -> dict:
+    """Per space: the mean cosine between the query keys of different calls of one
+    episode (``within``; calls should ask for different things) and between the first
+    calls of different episodes (``across``)."""
+    out = {}
+    spaces = sorted({s for reads in episodes for q in reads for s in q})
+    for s in spaces:
+        within, firsts = [], []
+        for reads in episodes:
+            keys = [q[s].float() for q in reads if s in q]
+            if keys:
+                firsts.append(keys[0])
+            within += [float(keys[i] @ keys[j]) for i in range(len(keys))
+                       for j in range(i + 1, len(keys))]
+        across = [float(firsts[i] @ firsts[j]) for i in range(len(firsts))
+                  for j in range(i + 1, len(firsts))]
+        out[s] = {'within': round(sum(within) / len(within), 4) if within else None,
+                  'across': round(sum(across) / len(across), 4) if across else None}
+    return out
+
+
 @torch.no_grad()
 def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
              previous: dict | None = None) -> dict:
@@ -1495,6 +1663,8 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
     stats: dict[str, list] = {}
     gold_stats: dict[str, list] = {}
     got = {'retrieved': [], 'gold': []}
+    queries_by: list[list[dict]] = []    # per episode, per retrieved read: query keys
+    drifts: list[float] = []
     per_episode: dict[str, tuple[str, float]] = {}
     gates_by: dict[str, dict[str, list]] = {}
     for ep in episodes:
@@ -1506,6 +1676,7 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
                         ctx.written if name == 'retrieved' else None, cache)
             if name == 'retrieved':
                 per_episode[ep.episode_id] = (ep.kb, nll.item() / max(n, 1))
+                queries_by.append([r.queries for r in reads if r.queries])
                 for read in reads:
                     for s, info in read.spaces.items():
                         if len(info.gates):
@@ -1514,6 +1685,9 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
         tokens += n
         empty = [torch.zeros(0, ctx.reader.config.span_width) for _ in ep.mems]
         sums['noctx'] += run_episode(ctx, ep, cache, 'fixed', empty)[0].item()
+        drift = parent_kl(ctx, ep)          # the reader decoder's drift (trained layers)
+        if drift is not None:
+            drifts.append(float(drift))
         text_ep = layout(ep.row, tok, texts, writes=ep.rendered_writes)
         if int(text_ep.targets.numel()) != n:
             raise ValueError('the text arm changes the target tokens')
@@ -1530,6 +1704,9 @@ def evaluate(ctx: Context, episodes: list[Episode], texts: dict[str, str], tok,
     report['reads'] = _mean(stats)
     report['gold_reads'] = _mean(gold_stats)
     report['span_reps'] = distribution(stats.get('n', []))
+    report['query_cos'] = query_cosines(queries_by)
+    if drifts:
+        report['parent_kl'] = round(sum(drifts) / len(drifts), 6)
     report['written_items'] = {name: len(spaces.get('D', ())) for name, spaces in ctx.written.items()
                                if spaces.get('D')}
     metrics = superposition_metrics(ctx, gates_by)
@@ -1562,7 +1739,9 @@ def load_init_reader(reader: L1Reader, path: Path, full: bool = False) -> list[s
                                             if full else ())
     wanted = {k: v for k, v in state.items() if k.startswith(prefixes)}
     own = reader.state_dict()
-    missing = [k for k in own if k.startswith('keys.') and k not in wanted]
+    # a K2 run without a query pool leaves this reader's pool at its initialization
+    missing = [k for k in own if k.startswith('keys.') and not k.startswith('keys.pool.')
+               and k not in wanted]
     if missing:
         raise ValueError(f'{path} has no key heads ({len(missing)} missing, e.g. {missing[0]})')
     for k, v in wanted.items():
@@ -1717,12 +1896,15 @@ def load_key_teacher(args, views) -> KeyTeacher:
         raise ValueError('--key-teacher needs leaf banks (items with one record each), '
                          'not superposed rows')
     teacher = KeyTeacher(TeacherKeys(args.key_teacher), args.key_teacher_tau,
-                         args.key_teacher_positives)
+                         args.key_teacher_positives,
+                         align=getattr(args, 'key_align_weight', 0.0) > 0,
+                         center=getattr(args, 'key_align_center', False))
     print(json.dumps({'key_teacher': str(args.key_teacher),
                       'model': teacher.cache.manifest.get('model'),
                       'sites': len(teacher.cache.sites), 'records': len(teacher.cache.record_ids),
                       'weight': args.key_teacher_weight, 'tau': args.key_teacher_tau,
-                      'positives': args.key_teacher_positives}), flush=True)
+                      'positives': args.key_teacher_positives,
+                      'align_weight': getattr(args, 'key_align_weight', 0.0)}), flush=True)
     return teacher
 
 
@@ -1735,7 +1917,10 @@ def train(args) -> None:
     # --decoder-train-below: the reader decoder's lower layers are its own trainable
     # copies; the writer keeps running (and keeps the weights of) the parent decoder
     frozen = Frozen(lm, args.query_layer, model.core.autocast,
-                    train_below=args.decoder_train_below,
+                    train_below=resolve_train_below(args),
+                    train=getattr(args, 'decoder_train', 'all'),
+                    lora=getattr(args, 'decoder_lora', 0),
+                    query_only=getattr(args, 'decoder_query_only', False),
                     checkpointing=args.decoder_checkpoint)
     candidates = dict(DEFAULT_CANDIDATES, **_pairs(args.candidates))
     keep = dict(DEFAULT_KEEP, **_pairs(args.keep))
@@ -1755,7 +1940,9 @@ def train(args) -> None:
                         op_hidden=dims['hidden'], layers=dims['layers'],
                         key_hidden=args.key_hidden, gate_offset=args.gate_offset,
                         max_reps=args.max_reps, checkpointing=not args.no_operator_checkpoint,
-                        read_combine=args.read_combine)
+                        read_combine=args.read_combine,
+                        query_pool=getattr(args, 'query_pool', False),
+                        query_former=getattr(args, 'query_former', False))
     banks_manifest = json.loads((args.banks / 'banks.json').read_text())
     if args.item_lr is None:     # the read phase moves free rows faster than leaf items
         args.item_lr = ROWS_ITEM_LR if 'rows' in banks_manifest and not args.rows_from_stack \
@@ -1821,7 +2008,7 @@ def train(args) -> None:
         if prefix is not None:
             prefix.load_state_dict(state['null_prefix'])
         if len(frozen.own):
-            frozen.own.load_state_dict(state['decoder_layers'])
+            frozen.load(state)
         if key_optimizer is not None:
             key_optimizer.load_state_dict(state.get('key_optimizer', {}))
         step = state['step']
@@ -1984,7 +2171,7 @@ def train(args) -> None:
                     **({'null_prefix': prefix.state_dict()} if prefix is not None else {}),
                     # the reader decoder's own layers (the writer's weights are not saved
                     # here: they are the parent decoder's, unchanged)
-                    **({'decoder_layers': frozen.own.state_dict(),
+                    **({**frozen.state(),
                         'decoder_train_below': args.decoder_train_below}
                        if len(frozen.own) else {}),
                     **({'write_ops': write_ops.state_dict(),
@@ -2012,7 +2199,12 @@ def train(args) -> None:
 
     def run_eval() -> dict:
         nonlocal previous
-        report = evaluate(ctx, eval_eps, texts, tok, previous)
+        soft = config.soft_read     # evaluations read sparsely (the target read)
+        config.soft_read = False
+        try:
+            report = evaluate(ctx, eval_eps, texts, tok, previous)
+        finally:
+            config.soft_read = soft
         previous = report.pop('_per_episode')
         if anchor is not None:
             report['read_anchor'] = anchor.drift()
@@ -2022,6 +2214,8 @@ def train(args) -> None:
         log_record({'step': 0, 'eval': run_eval()})
     order: list[int] = []
     window: dict[str, list] = {}
+    soft_items = max((st['items'] for spaces in storage.values() for st in spaces.values()),
+                     default=1)
     started = time.time()
 
     def rekey() -> None:     # the search's key cache from the current item-key heads
@@ -2039,6 +2233,12 @@ def train(args) -> None:
             if ep is not None:
                 batch.append(ep)
         phase = phase_at(schedule, step, args.read_warmup)
+        if getattr(args, 'soft_read', False):
+            set_soft(config, soft_schedule(args, step, soft_items, max(keep.values())))
+            window.setdefault('soft_read', []).append(float(config.soft_read))
+            if config.soft_read:
+                window.setdefault('soft_tau', []).append(config.soft_tau)
+                window.setdefault('soft_candidates', []).append(config.soft_candidates)
         names = phase_set(phase, args, l1b_set)
         if args.consolidate_every and views and phase in ('l1a', 'w') \
                 and (step + 1) % args.consolidate_every == 0:
@@ -2072,7 +2272,9 @@ def train(args) -> None:
         if step % args.log_every == 0:
             log_record({'step': step, 'phase': phase, **_mean(window), 'skipped': dict(skipped),
                         'usage': {k: u.stats() for k, u in usage.items()} if args.log_usage
-                        else None, 'elapsed_s': round(time.time() - started)})
+                        else None, 'elapsed_s': round(time.time() - started),
+                        **({'peak_gb': round(torch.cuda.max_memory_allocated() / 2**30, 3)}
+                           if torch.cuda.is_available() else {})})
             window = {}
         if args.export_rows_every and step % args.export_rows_every == 0:
             log_record({'step': step, **export_snapshot(ctx, reader, args.output / 'snapshots',
@@ -2226,6 +2428,47 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--key-teacher-positives', type=int, default=0,
                    help='teacher top-k records of the KB per site added as retrieval '
                         'positives at weight 0.5 (neutral records left out)')
+    t.add_argument('--key-align-weight', type=float, default=0.0,
+                   help='with --key-teacher: weight of the alignment of the query key and the '
+                        'listed items\' keys to the teacher embeddings projected on the '
+                        'records\' top 256 principal directions (1 - cos; 10 in the 29 Sep '
+                        'diagnosis); unlike the list losses it generalizes to unseen documents')
+    t.add_argument('--soft-read', action='store_true',
+                   help='soft superposed training reads (a query-training aid): gates '
+                        'softmax(--soft-tau * cos) over --soft-candidates per space, all read; '
+                        'evaluations stay sparse')
+    t.add_argument('--soft-candidates', type=int, default=256,
+                   help='--soft-read: candidates per space (0: every item of the KB)')
+    t.add_argument('--soft-tau', type=float, default=10.0,
+                   help='--soft-read: temperature on the cosine (start of the anneal)')
+    t.add_argument('--soft-tau-end', type=float, default=100.0,
+                   help='--soft-read with --soft-anneal: tau at the end of the anneal')
+    t.add_argument('--soft-anneal', type=int, default=0,
+                   help='--soft-read: steps over which candidates fall to --keep and tau '
+                        'rises to --soft-tau-end; sparse reads after (0: constant soft read)')
+    t.add_argument('--key-align-center', action='store_true',
+                   help='--key-align-weight: center the teacher queries and records (per '
+                        'tower means) before projecting; removes the common-direction '
+                        'attractor that collapsed the query keys (29 Sep)')
+    t.add_argument('--query-former', action='store_true',
+                   help='query formulation module: per space call-conditioned latents '
+                        'cross-attending over the call\'s causal prefix, then self-attention '
+                        'and MLPs; zero-initialized output (starts as the call state)')
+    t.add_argument('--decoder-train', choices=('all', 'attention'), default='all',
+                   help='--decoder-train-below: train every copied layer, or only the '
+                        'full-attention ones (the only layers that move information to the '
+                        'call position from far)')
+    t.add_argument('--decoder-query-only', action='store_true',
+                   help='--decoder-train-below: the trained layers formulate the query only; '
+                        'the task pass reads with the parent decoder (29 Sep: with the task '
+                        'loss, LoRA on all layers memorized the training answers)')
+    t.add_argument('--decoder-lora', type=int, default=0,
+                   help='--decoder-train-below: rank of LoRA adapters on the trained copies\' '
+                        'linear modules, their base weights frozen (0: train the copies)')
+    t.add_argument('--query-pool', action='store_true',
+                   help='query state = call state + a learned attention pool over the '
+                        'query-layer states of the call\'s causal prefix (starts as the call '
+                        'state; 29 Sep: the call state alone carries no request)')
     t.add_argument('--inbatch-negatives', type=int, default=64,
                    help='per space: target items of the batch\'s other slots (same KB only) '
                         'scored as negatives in the retrieval loss (0: off)')
@@ -2314,11 +2557,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--decoder-checkpoint', action='store_true',
                    help='recompute frozen decoder layers in backward')
-    t.add_argument('--decoder-train-below', type=int, default=0,
+    t.add_argument('--decoder-train-below', type=train_below, default=0,
                    help='train the reader decoder\'s layers below N (their own copies; '
                         'embeddings, the layers from N up, final norm and LM head stay frozen, '
-                        'and the writer keeps the parent decoder\'s weights) in l1a and r; '
-                        '0: frozen. Starting point for LFM2.5-350M (16 layers): 8')
+                        'and the writer keeps the parent decoder\'s weights) in l1a, r and '
+                        'K2 (--retrieval-only: the retrieval, teacher and alignment terms '
+                        'train them, so the decoder formulates the query); \'query\': the '
+                        '--query-layer (every layer below the query state); 0: frozen')
     t.add_argument('--decoder-lr', type=float, default=3e-5,
                    help='--decoder-train-below: the decoder layers\' learning rate')
     t.add_argument('--decoder-replay-kl', type=float,

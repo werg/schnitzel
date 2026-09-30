@@ -116,13 +116,115 @@ class SuperpositionOperator(nn.Module):
             max_pairs=max_pairs)
 
 
+def rms(x: torch.Tensor) -> torch.Tensor:
+    """The root mean square of a state (detached): the query modules' outputs are added
+    in units of the call state's scale, which differs by orders of magnitude between
+    layers (0.24 at layer 8 of LFM2.5-350M, about 70 at layer 16), so a zero-initialized
+    projection reaches a useful size at the same rate at any query layer."""
+    return x.detach().pow(2).mean().sqrt()
+
+
+class QueryPool(nn.Module):
+    """Attention pooling of the query state over the call's causal prefix
+    (``KeyHeads(pool=True)``; 29 September retrieval diagnosis).
+
+    The query-layer state at the closing parenthesis of ``memory_search()`` carries
+    almost nothing of the request: the call token sits at a fixed template position and
+    the frozen decoder was never trained to put a query there (recall-text r8, layer 8:
+    sites sharing a target document are no closer than unrelated ones, and heads on it
+    cannot even fit the training sites over the full KB). The request is in the earlier
+    tokens. The pool has ``heads`` learned attention queries over the normalized
+    query-layer states of every position up to and including the call (causal: nothing
+    after it); the pooled heads are projected and added to the call state in units of
+    its scale, ``h_call + rms(h_call) out(pooled)``. ``out`` starts at zero, so an untrained pool returns the
+    call state exactly (the query of earlier readers), and its attention starts uniform
+    (the prefix mean). A call-conditioned attention (query from the call state) fit the
+    training sites as well but generalized worse (held-out R@8 0.23 vs 0.48)."""
+
+    def __init__(self, width: int, heads: int = 4):
+        super().__init__()
+        self.heads = heads
+        self.norm = nn.LayerNorm(width)
+        self.score = nn.Linear(width, heads)
+        self.out = nn.Linear(heads * width, width)
+        for layer in (self.score, self.out):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, prefix: torch.Tensor) -> torch.Tensor:
+        """``prefix`` (T, width): the query-layer states of positions 0..call; the last
+        row is the call's own state. Returns the pooled query state (width,)."""
+        x = self.norm(prefix.float())
+        att = torch.softmax(self.score(x), 0)                 # (T, heads)
+        call = prefix[-1].float()
+        return call + rms(call) * self.out((att.t() @ x).reshape(-1))
+
+
+class QueryFormer(nn.Module):
+    """A query-formulation module (owner, 29 September; ``KeyHeads(former=True)``):
+    ``latents`` learned latents per space, conditioned on the call-token state,
+    cross-attend over the query-layer states of the call's causal prefix (up to and
+    including the call), then attend to each other; pre-LN blocks with MLPs. Each
+    space's latents are projected and added to the call state, so each space gets its
+    own query state (``h_call + rms(h_call) out_s(z_s)``). The projections start at zero: an
+    untrained former returns the call state exactly for every space. Unlike
+    ``QueryPool`` its attention is conditioned on the call, so the calls of one
+    episode can ask for different things."""
+
+    def __init__(self, width: int, spaces, dim: int = 512, heads: int = 8,
+                 latents: int = 1):
+        super().__init__()
+        self.spaces, self.latents = list(spaces), latents
+        n = len(self.spaces) * latents
+        self.norm = nn.LayerNorm(width)
+        self.kv = nn.Linear(width, dim)
+        self.call = nn.Linear(width, dim)
+        self.queries = nn.Parameter(torch.randn(n, dim) * 0.02)
+        self.cross_norm = nn.LayerNorm(dim)
+        self.cross = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, heads, batch_first=True)
+        self.mlps = nn.ModuleList(nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 2 * dim),
+                                                nn.SiLU(), nn.Linear(2 * dim, dim))
+                                  for _ in range(2))
+        self.out = nn.ModuleDict({s: nn.Linear(latents * dim, width) for s in self.spaces})
+        for layer in self.out.values():
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, prefix: torch.Tensor) -> dict[str, torch.Tensor]:
+        """``prefix`` (T, width), the call's state last -> {space: query state (width,)}."""
+        x = self.norm(prefix.float())
+        kv = self.kv(x)[None]                                       # (1, T, dim)
+        z = (self.queries + self.call(x[-1]))[None]                 # (1, n, dim)
+        q = self.cross_norm(z)
+        z = z + self.cross(q, kv, kv, need_weights=False)[0]
+        z = z + self.mlps[0](z)
+        q = self.self_norm(z)
+        z = z + self.self_attn(q, q, q, need_weights=False)[0]
+        z = (z + self.mlps[1](z))[0]
+        call = prefix[-1].float()
+        scale = rms(call)
+        return {s: call + scale * self.out[s](z[i * self.latents:(i + 1) * self.latents]
+                                              .reshape(-1))
+                for i, s in enumerate(self.spaces)}
+
+
 class KeyHeads(nn.Module):
     """Per-space item keys (from an item's values) and query keys (from the decoder's
     middle-layer state at a ``memory_search()`` call), unit-normalized; scores are
-    cosine times a learned scale per space."""
+    cosine times a learned scale per space. ``pool``: the query state is the call's
+    state plus a ``QueryPool`` of its causal prefix (a reference scaffold); ``former``:
+    per space the call's state plus a ``QueryFormer`` read of the prefix
+    (``query_state``)."""
 
-    def __init__(self, query_width: int, hidden: int = 512):
+    def __init__(self, query_width: int, hidden: int = 512, pool: bool = False,
+                 former: bool = False):
         super().__init__()
+        if pool and former:
+            raise ValueError('a query pool or a query former, not both')
+        self.pool = QueryPool(query_width) if pool else None
+        self.former = QueryFormer(query_width, SPACES) if former else None
         self.item = nn.ModuleDict({
             name: nn.Sequential(nn.LayerNorm(width), nn.Linear(width, hidden), nn.SiLU(),
                                 nn.Linear(hidden, KEY_WIDTH[name]))
@@ -133,6 +235,27 @@ class KeyHeads(nn.Module):
             for name in SPACES})
         self.log_scale = nn.ParameterDict({name: nn.Parameter(torch.tensor(math.log(10.0)))
                                            for name in SPACES})
+
+    def query_state(self, state: torch.Tensor) -> torch.Tensor:
+        """The query state of a call: ``state`` is the call's own query-layer state
+        (width,) or the states of its causal prefix (T, width), the call last. Without
+        a pool the call's state; with one the ``QueryPool`` output (a single state is a
+        prefix of one position). With a former: {space: query state}."""
+        prefix = state if state.ndim == 2 else state[None]
+        if self.former is not None:
+            return self.former(prefix)
+        if self.pool is None:
+            return prefix[-1]
+        return self.pool(prefix)
+
+    def load_state_dict(self, state, strict: bool = True, assign: bool = False):
+        """Heads saved without a pool or former (earlier readers, ``key_heads_init.pt``)
+        load with the module at its initialization (the call state exactly)."""
+        for name in ('pool', 'former'):
+            module = getattr(self, name)
+            if module is not None and not any(k.startswith(f'{name}.') for k in state):
+                state = {**state, **{f'{name}.{k}': v for k, v in module.state_dict().items()}}
+        return super().load_state_dict(state, strict=strict, assign=assign)
 
     def item_key(self, space: str, values: torch.Tensor) -> torch.Tensor:
         """``values`` (m, width) or (B, m, width) -> unit key(s); mean over positions."""

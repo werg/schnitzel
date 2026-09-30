@@ -2,6 +2,7 @@
 CPU, tiny models, no downloads."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -1152,6 +1153,74 @@ def test_only_reader_layers_below_n_get_gradients(tmp_path, checkpointing):
     assert all(p.grad is None for p in lm.parameters())
 
 
+@pytest.mark.parametrize('layer', [2, 3])
+def test_the_query_comes_from_the_configured_layer(tmp_path, layer):
+    lm, _ = tiny_lm()
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    ctx = l1.Context(l1.Frozen(lm, layer), reader(), {'ds': kb})
+    ep = episode(IDS, [3, 10], [6, 13])
+    with torch.no_grad():
+        _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=False))
+        x = ctx.frozen.embed(ep.ids[:4])[None]
+        hidden = lm.model(inputs_embeds=x, output_hidden_states=True).hidden_states
+    torch.testing.assert_close(reads[0].state, hidden[layer][0, 3].float())
+    assert not torch.equal(reads[0].state, hidden[layer - 1][0, 3].float())
+
+
+def test_train_below_query_is_the_query_layer():
+    from types import SimpleNamespace
+    args = SimpleNamespace(decoder_train_below='query', query_layer=12)
+    assert l1.resolve_train_below(args) == 12 and args.decoder_train_below == 12
+    assert l1.train_below('query') == 'query' and l1.train_below('8') == 8
+    assert l1.resolve_train_below(SimpleNamespace(decoder_train_below=0, query_layer=8)) == 0
+
+
+@pytest.mark.parametrize('pool', [False, True])
+def test_k2_trains_the_query_layers_not_the_parent(tmp_path, pool):
+    """Owner, 29 September: the model formulates its query. In K2 (--retrieval-only) the
+    retrieval loss, the teacher KL and the alignment reach the reader's own decoder layers
+    below the query layer; the parent (the writer's decoder) is untouched."""
+    import random
+    from schnitz.kb import teacher_keys as tk
+    from test_kb_teacher_keys import HashEmbedder, corpus, transcript
+    lm, _ = tiny_lm()
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    frozen = l1.Frozen(lm, 3, train_below=3)
+    for p in frozen.own.parameters():
+        p.requires_grad_(True)
+    ctx = l1.Context(frozen, reader(query_pool=pool), {'ds': kb})
+    d = corpus(tmp_path, [transcript('e', (['r1'], ['r2']))])
+    tk.build(tmp_path / 'teacher', HashEmbedder(), [d], {'train': None}, top=8)
+    ctx.key_teacher = l1.KeyTeacher(tk.TeacherKeys(tmp_path / 'teacher'), 0.05, align=True)
+    ep = episode(IDS, [3, 10], [6, 13])
+    ep.episode_id = 'e'
+    for term in ('aux', 'teacher_kl', 'teacher_align'):
+        ctx.frozen.own.zero_grad(set_to_none=True)
+        ctx.reader.zero_grad(set_to_none=True)
+        _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True,
+                                        teacher=True)
+        torch.stack([getattr(r, term) for r in reads]).mean().backward()
+        for layer in ctx.frozen.own:
+            assert any(p.grad is not None and p.grad.abs().sum() > 0
+                       for p in layer.parameters()), term
+        assert all(p.grad is None for p in lm.parameters())
+    ctx.frozen.own.zero_grad(set_to_none=True)
+    ctx.reader.zero_grad(set_to_none=True)
+    parent = {k: v.clone() for k, v in lm.state_dict().items()}
+    own = [p.detach().clone() for p in ctx.frozen.own.parameters()]
+    args = train_args(retrieval_only=True, retrieval_weight=1.0, key_teacher_weight=1.0,
+                      key_align_weight=10.0, decoder_train_below=3, lr=1e-3,
+                      l1b_codec_lr=1e-4, l1b_writer_lr=1e-5, decoder_lr=1e-3)
+    sets = l1.parameter_sets(ctx.reader, decoder=ctx.frozen)
+    sets.update(codecs=[], writer=[])
+    trainable = l1.set_phase(sets, l1.phase_set('l1a', args))
+    opt = torch.optim.AdamW(l1.optimizer_groups(sets, args))
+    out = l1.train_step(ctx, [ep], opt, args, 0, rng=random.Random(0), trainable=trainable)
+    assert 'decoder_kl' in out                       # parent preservation also in K2
+    assert any(not torch.equal(a, b) for a, b in zip(own, ctx.frozen.own.parameters()))
+    assert all(torch.equal(v, lm.state_dict()[k]) for k, v in parent.items())
+
+
 def test_key_optimizer_resumes_with_moments_of_any_device(tmp_path):
     kb = make_kb(tmp_path, records=tuple((f'r{i}', 1) for i in range(3)))
     opt = read_mod.KeyOptimizer(1e-2)
@@ -1164,3 +1233,294 @@ def test_key_optimizer_resumes_with_moments_of_any_device(tmp_path):
     again.load_state_dict(state)
     assert all(m.device.type == 'cpu' for m, _, _ in again.state.values())
     assert again.step(kb, 'A', ids, keys, [torch.ones_like(k) for k in keys]) == 2
+
+
+# -- the query pool (29 September retrieval diagnosis) --------------------------------------
+def test_untrained_query_pool_is_the_call_state_bit_for_bit(tmp_path):
+    kb = make_kb(tmp_path)
+    plain, pooled = reader(), reader(query_pool=True)
+    pooled.load_state_dict({**pooled.state_dict(), **plain.state_dict()})
+    prefix = torch.randn(7, HIDDEN)
+    for state in (prefix, prefix[-1]):
+        a = plain.read(state, [kb], ['ds'], 3, ItemCache(train=False))
+        b = pooled.read(state, [kb], ['ds'], 3, ItemCache(train=False))
+        assert torch.equal(a.span, b.span) and torch.equal(a.state, b.state)
+        assert torch.equal(a.state, prefix[-1])
+        assert all(a.spaces[s].refs == b.spaces[s].refs for s in SPACES)
+
+
+def test_key_heads_without_a_pool_load_into_pooled_heads():
+    from schnitz.kb.stack import KeyHeads
+    torch.manual_seed(0)
+    old = KeyHeads(HIDDEN, 16)
+    new = KeyHeads(HIDDEN, 16, pool=True)
+    pool = {k: v.clone() for k, v in new.pool.state_dict().items()}
+    new.load_state_dict(old.state_dict())
+    assert all(torch.equal(v, new.pool.state_dict()[k]) for k, v in pool.items())
+    assert torch.equal(new.query['A'][1].weight, old.query['A'][1].weight)
+    x = torch.randn(5, HIDDEN)
+    torch.testing.assert_close(new.query_state(x), x[-1], rtol=0, atol=0)
+
+
+def test_query_pool_trains_and_sees_only_the_causal_prefix(tmp_path):
+    ctx, _ = context(tmp_path, query_pool=True)
+    with torch.no_grad():                  # a trained pool: nonzero attention and output
+        for p in ctx.reader.keys.pool.parameters():
+            p.normal_(0, 0.3)
+    ep = episode(IDS, [3, 10], [6, 13])
+    early = list(IDS)
+    early[1] = 31                          # before both calls: changes both queries
+    later = list(IDS)
+    later[5] = 32                          # after call 1, before call 2: query 2 only
+    after = list(IDS)
+    after[11], after[16:] = 33, [40, 41, 42, 43]   # after call 2 and the targets: nothing
+
+    def states(ids):
+        with torch.no_grad():
+            _, _, reads, _ = l1.run_episode(ctx, episode(ids, [3, 10], [6, 13]),
+                                            ItemCache(train=False))
+        return [r.state for r in reads]
+    base, a, b, c = states(IDS), states(early), states(later), states(after)
+    assert not torch.equal(base[0], a[0]) and not torch.equal(base[1], a[1])
+    assert torch.equal(base[0], b[0]) and not torch.equal(base[1], b[1])
+    assert all(torch.equal(x, y) for x, y in zip(base, c))
+    # the pooled query is not the call state alone: an earlier state moves it
+    x = torch.randn(6, HIDDEN)
+    y = x.clone()
+    y[0] += 1.0
+    assert not torch.equal(ctx.reader.keys.query_state(x), ctx.reader.keys.query_state(y))
+    # the retrieval loss reaches the pool and the query heads
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    for p in ctx.reader.keys.pool.parameters():
+        assert p.grad is not None and p.grad.abs().sum() > 0
+    assert ctx.reader.keys.query['A'][1].weight.grad.abs().sum() > 0
+
+
+def test_fresh_pool_gets_gradients_through_its_output(tmp_path):
+    """At initialization (``out`` zero) the pool is the call state and the first
+    gradient reaches ``out``, so the pool starts training."""
+    ctx, _ = context(tmp_path, query_pool=True)
+    ep = episode(IDS, [3, 10], [6, 13])
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    assert ctx.reader.keys.pool.out.weight.grad.abs().sum() > 0
+
+
+def test_init_reader_without_a_pool_loads_into_a_pooled_reader(tmp_path):
+    k2 = reader()
+    torch.save({'reader': k2.state_dict()}, tmp_path / 'reader.pt')
+    fresh = reader(query_pool=True)
+    pool = {k: v.clone() for k, v in fresh.keys.pool.state_dict().items()}
+    l1.load_init_reader(fresh, tmp_path / 'reader.pt')
+    assert all(torch.equal(v, fresh.keys.pool.state_dict()[k]) for k, v in pool.items())
+    assert torch.equal(fresh.keys.query['A'][1].weight, k2.keys.query['A'][1].weight)
+
+
+# -- soft superposed read (owner, 29 September; --soft-read) --------------------------------
+SOFT_RECORDS = tuple((f'r{i}', 1) for i in range(1, 7)) + (('r9', 5),)
+
+
+def test_sparse_read_is_unchanged_when_soft_is_off(tmp_path):
+    kb = make_kb(tmp_path, records=SOFT_RECORDS)
+    state = torch.randn(HIDDEN)
+    a = reader().read(state, [kb], ['ds'], 3, ItemCache(train=False),
+                      targets=targets_of(kb, ['r1']))
+    b = reader(soft_candidates=0, soft_tau=3.0).read(state, [kb], ['ds'], 3,
+                                                      ItemCache(train=False),
+                                                      targets=targets_of(kb, ['r1']))
+    assert torch.equal(a.span, b.span) and torch.equal(a.aux, b.aux)
+    for s in SPACES:
+        assert a.spaces[s].refs == b.spaces[s].refs and a.spaces[s].scored == b.spaces[s].scored
+        assert torch.equal(a.spaces[s].gates, b.spaces[s].gates)
+
+
+@pytest.mark.parametrize('combine', ['r', 's_s'])
+def test_soft_read_reads_every_candidate_at_softmax_gates(tmp_path, combine):
+    kb = make_kb(tmp_path, records=SOFT_RECORDS)
+    r = reader(soft_read=True, soft_candidates=0, soft_tau=5.0, read_combine=combine,
+               max_reps=4)
+    state = torch.randn(HIDDEN)
+    cache = ItemCache(train=True)
+    read = r.read(state, [kb], ['ds'], 3, cache, targets=targets_of(kb, ['r1']))
+    for s in SPACES:
+        info = read.spaces[s]
+        assert len(info.refs) == 6 and info.refs == info.scored     # r9 is later: causal
+        q = r.keys.query_key(s, state)
+        keys = torch.stack([r.keys.item_key(s, cache.get(kb, s, [i])[0][0]) for _, i in info.refs])
+        want = torch.softmax(5.0 * (q @ keys.t()), -1).detach()
+        torch.testing.assert_close(info.gates, want)                # all nonzero, sum one
+        assert float(info.gates.min()) > 0
+        assert info.mass == pytest.approx(1.0, abs=1e-5)            # gate x stored mass 1
+    assert read.n <= 4                                              # the span stays capped
+    read.span.sum().backward()      # a task-like loss reaches the query through the gates
+    assert r.keys.query['A'][1].weight.grad.abs().sum() > 0
+
+
+def test_soft_schedule_anneals_to_the_sparse_read():
+    from types import SimpleNamespace
+    args = SimpleNamespace(soft_read=True, soft_candidates=0, soft_tau=10.0,
+                           soft_tau_end=100.0, soft_anneal=100)
+    first, mid = l1.soft_schedule(args, 0, 1000, 4), l1.soft_schedule(args, 50, 1000, 4)
+    assert first == {'candidates': 1000, 'tau': 10.0}
+    assert mid['candidates'] == round(math.sqrt(1000 * 4)) and mid['tau'] == pytest.approx(
+        math.sqrt(1000.0))
+    assert l1.soft_schedule(args, 100, 1000, 4) is None
+    args.soft_anneal = 0
+    assert l1.soft_schedule(args, 10 ** 6, 1000, 4) == {'candidates': 0, 'tau': 10.0}
+    assert l1.soft_schedule(SimpleNamespace(soft_read=False), 0, 1000, 4) is None
+    config = ReadConfig()
+    l1.set_soft(config, mid)
+    assert config.soft_read and config.soft_candidates == mid['candidates']
+    l1.set_soft(config, None)
+    assert not config.soft_read
+
+
+# -- query formulation: the former and the trained backbone (owner, 29 September) ----------
+def test_untrained_query_former_is_the_call_state_bit_for_bit(tmp_path):
+    kb = make_kb(tmp_path)
+    plain, former = reader(), reader(query_former=True)
+    former.load_state_dict({**former.state_dict(), **plain.state_dict()})
+    prefix = torch.randn(7, HIDDEN)
+    a = plain.read(prefix, [kb], ['ds'], 3, ItemCache(train=False))
+    b = former.read(prefix, [kb], ['ds'], 3, ItemCache(train=False))
+    assert torch.equal(a.span, b.span)
+    assert all(torch.equal(b.state[s], prefix[-1]) for s in SPACES)
+    assert all(a.spaces[s].refs == b.spaces[s].refs for s in SPACES)
+    assert all(torch.equal(a.queries[s], b.queries[s]) for s in SPACES)
+
+
+def test_query_former_is_causal_call_conditioned_and_trains(tmp_path):
+    ctx, _ = context(tmp_path, query_former=True)
+    with torch.no_grad():                  # a trained former: nonzero output projections
+        for p in ctx.reader.keys.former.out.parameters():
+            p.normal_(0, 0.3)
+    early, later, after = list(IDS), list(IDS), list(IDS)
+    early[1] = 31                          # before both calls
+    later[5] = 32                          # between the calls
+    after[11], after[16:] = 33, [40, 41, 42, 43]   # after call 2 and the targets
+
+    def queries(ids):
+        with torch.no_grad():
+            _, _, reads, _ = l1.run_episode(ctx, episode(ids, [3, 10], [6, 13]),
+                                            ItemCache(train=False))
+        return [r.queries for r in reads]
+    base, a, b, c = queries(IDS), queries(early), queries(later), queries(after)
+    for s in SPACES:
+        assert not torch.equal(base[0][s], a[0][s]) and not torch.equal(base[1][s], a[1][s])
+        assert torch.equal(base[0][s], b[0][s]) and not torch.equal(base[1][s], b[1][s])
+        assert torch.equal(base[0][s], c[0][s]) and torch.equal(base[1][s], c[1][s])
+    # conditioned on the call: the same prefix with another call state gives another query
+    x = torch.randn(6, HIDDEN)
+    y = x.clone()
+    y[-1] = torch.randn(HIDDEN)
+    fx, fy = ctx.reader.keys.query_state(x), ctx.reader.keys.query_state(y)
+    assert all(not torch.allclose(fx[s] - x[-1], fy[s] - y[-1]) for s in SPACES)
+    # per space queries; the retrieval loss reaches the former
+    ep = episode(IDS, [3, 10], [6, 13])
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    former = ctx.reader.keys.former
+    for module in (former.cross, former.self_attn, former.kv, former.call):
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    # a reread from the read's per-space states is the read's span
+    cache = ItemCache(train=False)
+    with torch.no_grad():
+        read = ctx.reader.read(torch.randn(5, HIDDEN), [ctx.kbs['ds']], ['ds'], 3, cache)
+        values = {s: list(read.spaces[s].values) for s in SPACES if read.spaces[s].refs}
+        scales = {s: list(read.spaces[s].scales) for s in values}
+        torch.testing.assert_close(ctx.reader.reread(read.state, values, scales), read.span)
+
+
+@pytest.mark.parametrize('module', ['pool', 'former'])
+def test_query_modules_act_in_units_of_the_call_state(module):
+    """Scaling the prefix scales the query state: the module's output is added in units
+    of the call state's RMS, so it matters as much at layer 16 (RMS ~ 2) as at 8 (0.01)."""
+    from schnitz.kb.stack import KeyHeads
+    torch.manual_seed(0)
+    heads = KeyHeads(HIDDEN, 16, **{module: True})
+    with torch.no_grad():
+        for p in getattr(heads, module).parameters():
+            p.normal_(0, 0.3)
+    x = torch.randn(6, HIDDEN)
+    small, large = heads.query_state(x), heads.query_state(100.0 * x)
+    for s in (SPACES if module == 'former' else [None]):
+        a, b = (small[s], large[s]) if s else (small, large)
+        torch.testing.assert_close(b, 100.0 * a, rtol=1e-2, atol=1e-2)
+        assert not torch.allclose(a, x[-1], atol=1e-3)
+
+
+def test_heads_without_a_former_load_into_a_former_reader():
+    from schnitz.kb.stack import KeyHeads
+    torch.manual_seed(0)
+    old, new = KeyHeads(HIDDEN, 16), KeyHeads(HIDDEN, 16, former=True)
+    before = {k: v.clone() for k, v in new.former.state_dict().items()}
+    new.load_state_dict(old.state_dict())
+    assert all(torch.equal(v, new.former.state_dict()[k]) for k, v in before.items())
+    with pytest.raises(ValueError):
+        KeyHeads(HIDDEN, 16, pool=True, former=True)
+
+
+@pytest.mark.parametrize('train', ['all', 'attention'])
+def test_decoder_lora_starts_as_the_parent_and_trains_only_adapters(tmp_path, train):
+    lm, _ = tiny_lm()
+    frozen = l1.Frozen(lm, 4, train_below=4, train=train, lora=4)
+    trained = frozen.trained_layers
+    assert trained == ([0, 1, 2, 3] if train == 'all' else [1, 3])   # attention at 1, 3
+    params = frozen.trainable_parameters()
+    assert params and all(any(p is q for q in frozen.lora.parameters()) for p in params)
+    for p in params:
+        p.requires_grad_(True)
+    x = frozen.embed(torch.tensor(IDS))[None]
+    with torch.no_grad():
+        torch.testing.assert_close(frozen.mid(x), frozen.parent.mid(x), rtol=0, atol=0)
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    ctx = l1.Context(frozen, reader(), {'ds': kb})
+    _, _, reads, _ = l1.run_episode(ctx, episode(IDS, [3, 10], [6, 13]), ItemCache(train=True),
+                                    retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
+    assert all(p.grad is None for p in frozen.own.parameters() if not p.requires_grad)
+    assert all(p.grad is None for p in lm.parameters())
+    names = {k.split('__')[0] for k in frozen.lora}
+    assert names == {str(i) for i in trained}
+    state = frozen.state()
+    assert set(state) == {'decoder_lora'}
+    again = l1.Frozen(lm, 4, train_below=4, train=train, lora=4)
+    again.load(state)
+    for a, b in zip(again.lora.parameters(), frozen.lora.parameters()):
+        assert torch.equal(a, b)
+
+
+def test_decoder_train_attention_trains_only_attention_copies(tmp_path):
+    lm, _ = tiny_lm()
+    frozen = l1.Frozen(lm, 4, train_below=4, train='attention')
+    ids = {id(p) for p in frozen.trainable_parameters()}
+    assert ids == {id(p) for i in (1, 3) for p in frozen.own[i].parameters()}
+    assert set(frozen.state()) == {'decoder_layers'}
+
+
+def test_decoder_query_only_reads_with_the_parent(tmp_path):
+    """--decoder-query-only: the trained layers shape the queries (the retrieval loss
+    reaches them) but the task pass reads with the parent decoder, so the task loss
+    reaches them only through the queries and the reader cannot learn the answers."""
+    lm, _ = tiny_lm()
+    frozen = l1.Frozen(lm, 4, train_below=4, lora=4, query_only=True)
+    for p in frozen.trainable_parameters():
+        p.requires_grad_(True)
+    with torch.no_grad():
+        for p in frozen.lora.parameters():
+            p.normal_(0, 0.1)
+    x = frozen.embed(torch.tensor(IDS))[None]
+    with torch.no_grad():
+        torch.testing.assert_close(frozen.final(x), frozen.parent.final(x), rtol=0, atol=0)
+        assert not torch.equal(frozen.mid(x), frozen.parent.mid(x))
+    kb = make_kb(tmp_path, records=(('r1', 1), ('r2', 1), ('r3', 1), ('r4', 5)))
+    ctx = l1.Context(frozen, reader(), {'ds': kb})
+    ep = episode(IDS, [3, 10], [6, 13])
+    assert l1.parent_kl(ctx, ep) is None
+    _, _, reads, _ = l1.run_episode(ctx, ep, ItemCache(train=True), retrieval_only=True)
+    torch.stack([r.aux for r in reads]).mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in frozen.trainable_parameters())
+    assert all(p.grad is None for p in lm.parameters())
